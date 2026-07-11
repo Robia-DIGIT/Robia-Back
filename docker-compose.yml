@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: robia-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: robia
+      POSTGRES_PASSWORD: robia1234
+      POSTGRES_DB: robia_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - robia_postgres_data:/var/lib/postgresql/data
+
+volumes:
+  robia_postgres_data:
