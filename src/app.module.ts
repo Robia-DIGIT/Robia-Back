@@ -9,6 +9,7 @@ import { WebsitesModule } from './websites/websites.module';
 import { AuditsModule } from './audits/audits.module';
 import { OpportunitiesModule } from './opportunities/opportunities.module';
 import { DocumentsModule } from './documents/documents.module';
+import { ValidationLogsModule } from './validation-logs/validation-logs.module';
 
 @Module({
   imports: [
@@ -23,6 +24,7 @@ import { DocumentsModule } from './documents/documents.module';
     AuditsModule,
     OpportunitiesModule,
     DocumentsModule,
+    ValidationLogsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
