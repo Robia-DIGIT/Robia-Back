@@ -8,6 +8,7 @@ import { OrganizationsModule } from './organizations/organizations.module';
 import { WebsitesModule } from './websites/websites.module';
 import { AuditsModule } from './audits/audits.module';
 import { OpportunitiesModule } from './opportunities/opportunities.module';
+import { DocumentsModule } from './documents/documents.module';
 
 @Module({
   imports: [
@@ -21,6 +22,7 @@ import { OpportunitiesModule } from './opportunities/opportunities.module';
     WebsitesModule,
     AuditsModule,
     OpportunitiesModule,
+    DocumentsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
