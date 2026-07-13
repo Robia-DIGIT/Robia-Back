@@ -7,6 +7,7 @@ import { AuthModule } from './auth/auth.module';
 import { OrganizationsModule } from './organizations/organizations.module';
 import { WebsitesModule } from './websites/websites.module';
 import { AuditsModule } from './audits/audits.module';
+import { OpportunitiesModule } from './opportunities/opportunities.module';
 
 @Module({
   imports: [
@@ -19,6 +20,7 @@ import { AuditsModule } from './audits/audits.module';
     OrganizationsModule,
     WebsitesModule,
     AuditsModule,
+    OpportunitiesModule,
   ],
   controllers: [AppController],
   providers: [AppService],
