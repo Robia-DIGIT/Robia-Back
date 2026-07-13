@@ -10,6 +10,7 @@ import { AuditsModule } from './audits/audits.module';
 import { OpportunitiesModule } from './opportunities/opportunities.module';
 import { DocumentsModule } from './documents/documents.module';
 import { ValidationLogsModule } from './validation-logs/validation-logs.module';
+import { ActionItemsModule } from './action-items/action-items.module';
 
 @Module({
   imports: [
@@ -25,6 +26,7 @@ import { ValidationLogsModule } from './validation-logs/validation-logs.module';
     OpportunitiesModule,
     DocumentsModule,
     ValidationLogsModule,
+    ActionItemsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
