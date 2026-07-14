@@ -66,6 +66,13 @@ export class AuditsService {
     return audit;
   }
 
+  async findAllForWebsite(organizationId: string, websiteId: string) {
+    return this.prisma.audit.findMany({
+      where: { organizationId, websiteId },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
   async findOne(organizationId: string, auditId: string) {
     const audit = await this.prisma.audit.findFirst({
       where: { id: auditId, organizationId },
