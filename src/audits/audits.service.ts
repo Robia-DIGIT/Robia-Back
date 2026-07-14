@@ -9,10 +9,9 @@ export class AuditsService {
     private readonly auditRunner: AuditRunnerService,
   ) {}
 
-  async run(organizationId: string) {
+  async run(organizationId: string, websiteId: string) {
     const website = await this.prisma.website.findFirst({
-      where: { organizationId },
-      orderBy: { createdAt: 'desc' },
+      where: { id: websiteId, organizationId },
     });
 
     if (!website) {
@@ -54,9 +53,9 @@ export class AuditsService {
     }
   }
 
-  async findLatest(organizationId: string) {
+  async findLatestForWebsite(organizationId: string, websiteId: string) {
     const audit = await this.prisma.audit.findFirst({
-      where: { organizationId },
+      where: { organizationId, websiteId },
       orderBy: { createdAt: 'desc' },
     });
 

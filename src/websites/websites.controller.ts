@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Req, UseGuards } from '@nestjs/common';
 import { WebsitesService } from './websites.service';
 import { CreateWebsiteDto } from './dto/create-website.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
@@ -19,8 +19,13 @@ export class WebsitesController {
     return this.websitesService.create(req.organizationId, dto);
   }
 
-  @Get('current')
-  findCurrent(@Req() req: ScopedRequest) {
-    return this.websitesService.findCurrent(req.organizationId);
+  @Get()
+  findAll(@Req() req: ScopedRequest) {
+    return this.websitesService.findAll(req.organizationId);
+  }
+
+  @Get(':id')
+  findOne(@Req() req: ScopedRequest, @Param('id') id: string) {
+    return this.websitesService.findOne(req.organizationId, id);
   }
 }

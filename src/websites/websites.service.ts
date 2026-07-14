@@ -19,10 +19,16 @@ export class WebsitesService {
     });
   }
 
-  async findCurrent(organizationId: string) {
-    const website = await this.prisma.website.findFirst({
+  async findAll(organizationId: string) {
+    return this.prisma.website.findMany({
       where: { organizationId },
       orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  async findOne(organizationId: string, websiteId: string) {
+    const website = await this.prisma.website.findFirst({
+      where: { id: websiteId, organizationId },
     });
 
     if (!website) {
@@ -37,16 +43,7 @@ export class WebsitesService {
     websiteId: string,
     status: 'pending' | 'valid' | 'unreachable',
   ) {
-    // on vérifie que le site appartient bien à l'organisation avant modification
-    const website = await this.prisma.website.findFirst({
-      where: { id: websiteId, organizationId },
-    });
-
-    if (!website) {
-      throw new NotFoundException('Site non trouvé pour cette organisation');
-    }
-
-    return this.prisma.website.update({
+    await this.prisma.website.update({
       where: { id: websiteId },
       data: { status, lastCheckedAt: new Date() },
     });

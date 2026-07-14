@@ -9,15 +9,14 @@ export class OpportunitiesService {
     private readonly generator: OpportunityGeneratorService,
   ) {}
 
-  async generateFromLatestAudit(organizationId: string) {
+  async generateFromAudit(organizationId: string, auditId: string) {
     const audit = await this.prisma.audit.findFirst({
-      where: { organizationId, status: 'completed' },
-      orderBy: { createdAt: 'desc' },
+      where: { id: auditId, organizationId, status: 'completed' },
     });
 
     if (!audit) {
       throw new NotFoundException(
-        "Aucun audit terminé trouvé. Lancez d'abord un audit avant de générer des opportunités.",
+        "Aucun audit non trouvé ou non terminé. Vérifiez l'auditId fourni.",
       );
     }
 
@@ -37,7 +36,7 @@ export class OpportunitiesService {
       where: { auditId: audit.id },
     });
 
-    const created = await this.prisma.$transaction(
+    return this.prisma.$transaction(
       generated.map((opp) =>
         this.prisma.opportunity.create({
           data: {
@@ -55,13 +54,11 @@ export class OpportunitiesService {
         }),
       ),
     );
-
-    return created;
   }
 
-  async findAll(organizationId: string) {
+  async findAllForAudit(organizationId: string, auditId: string) {
     return this.prisma.opportunity.findMany({
-      where: { organizationId },
+      where: { organizationId, auditId },
       orderBy: { impactScore: 'desc' },
       take: 5,
     });
