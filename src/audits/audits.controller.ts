@@ -19,6 +19,14 @@ export class AuditsController {
     return this.auditsService.run(req.organizationId, dto.websiteId);
   }
 
+  @Get()
+  findAllForWebsite(
+    @Req() req: ScopedRequest,
+    @Query('website_id') websiteId: string,
+  ) {
+    return this.auditsService.findAllForWebsite(req.organizationId, websiteId);
+  }
+
   @Get('latest')
   findLatest(@Req() req: ScopedRequest, @Query('website_id') websiteId: string) {
     return this.auditsService.findLatestForWebsite(req.organizationId, websiteId);
