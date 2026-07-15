@@ -65,4 +65,12 @@ export class ActionItemsService {
       data: { status: dto.status },
     });
   }
+
+  async getActionsForExport(organizationId: string) {
+    return this.prisma.actionItem.findMany({
+      where: { organizationId },
+        orderBy: { createdAt: 'desc' },
+        select: { title: true, status: true, dueDate: true },
+  });
+  }
 }
