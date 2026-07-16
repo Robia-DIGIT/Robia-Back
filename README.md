@@ -1,98 +1,146 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# ROBIA — Backend API
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+Backend NestJS pour ROBIA, un outil de visibilité SEO locale pour PME et entreprises multi-sites.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+## Stack technique
 
-## Description
+- NestJS + TypeScript
+- Prisma 7 + PostgreSQL (extension pgvector)
+- JWT (auth stateless)
+- Docker (PostgreSQL en local)
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+## Setup local
 
-## Project setup
-
-```bash
-$ npm install
+```powershell
+git clone https://github.com/Nirina-fifalin/Robia-Back.git
+cd Robia-Back
+npm install
+copy .env.example .env
 ```
 
-## Compile and run the project
+Édite `.env` et renseigne tes propres valeurs (voir section Variables d'environnement ci-dessous).
 
-```bash
-# development
-$ npm run start
-
-# watch mode
-$ npm run start:dev
-
-# production mode
-$ npm run start:prod
+```powershell
+docker compose up -d
+npx prisma migrate dev
+npm run start:dev
 ```
 
-## Run tests
+Le serveur démarre sur `http://localhost:3001`.
 
-```bash
-# unit tests
-$ npm run test
+## Variables d'environnement
 
-# e2e tests
-$ npm run test:e2e
+| Variable | Description |
+|---|---|
+| `DATABASE_URL` | Connexion PostgreSQL (doit correspondre aux identifiants dans `docker-compose.yml`) |
+| `JWT_SECRET` | Clé secrète pour signer les tokens JWT |
+| `JWT_EXPIRES_IN` | Durée de validité du token (ex: `7d`) |
+| `FRONTEND_URL` | Origine autorisée pour CORS (ex: `http://localhost:3000`) |
 
-# test coverage
-$ npm run test:cov
+## Authentification
+
+Toutes les routes protégées attendent un header :
+
+```
+Authorization: Bearer <accessToken>
 ```
 
-## Deployment
+Le token est obtenu via `POST /auth/register` ou `POST /auth/login`.
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
+La plupart des routes nécessitent aussi qu'une **organisation** existe pour l'utilisateur connecté (créée via `POST /organizations`) — sinon elles renvoient une erreur 404 explicite.
 
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+## Endpoints
 
-```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
+### Auth (`/auth`)
+
+| Méthode | Route | Protégée | Body | Description |
+|---|---|---|---|---|
+| POST | `/auth/register` | Non | `{ email, password }` | Inscription |
+| POST | `/auth/login` | Non | `{ email, password }` | Connexion |
+| GET | `/auth/me` | Oui | — | Profil de l'utilisateur connecté |
+| POST | `/auth/logout` | Oui | — | Déconnexion (côté client uniquement, JWT stateless) |
+
+### Organizations (`/organizations`)
+
+| Méthode | Route | Protégée | Body | Description |
+|---|---|---|---|---|
+| POST | `/organizations` | Oui | `{ name, sector?, city?, country? }` | Créer l'organisation (1 par utilisateur) |
+| GET | `/organizations/current` | Oui | — | Récupérer l'organisation de l'utilisateur |
+| PATCH | `/organizations/current` | Oui | Champs partiels | Modifier l'organisation |
+
+### Websites (`/websites`)
+
+| Méthode | Route | Protégée | Body | Description |
+|---|---|---|---|---|
+| POST | `/websites` | Oui | `{ url }` | Connecter un nouveau site |
+| GET | `/websites` | Oui | — | Lister tous les sites de l'organisation |
+| GET | `/websites/:id` | Oui | — | Détail d'un site |
+
+### Audits (`/audits`)
+
+| Méthode | Route | Protégée | Body / Query | Description |
+|---|---|---|---|---|
+| POST | `/audits/run` | Oui | `{ websiteId }` | Lancer un audit sur un site précis |
+| GET | `/audits?website_id=` | Oui | Query: `website_id` | Historique des audits d'un site |
+| GET | `/audits/latest?website_id=` | Oui | Query: `website_id` | Dernier audit d'un site |
+| GET | `/audits/:id` | Oui | — | Détail d'un audit |
+
+### Opportunities (`/opportunities`)
+
+| Méthode | Route | Protégée | Body / Query | Description |
+|---|---|---|---|---|
+| POST | `/opportunities/generate` | Oui | `{ auditId }` | Générer les opportunités depuis un audit terminé (max 5) |
+| GET | `/opportunities?audit_id=` | Oui | Query: `audit_id` | Lister les opportunités d'un audit |
+| GET | `/opportunities/:id` | Oui | — | Détail d'une opportunité |
+
+### Documents (`/documents`)
+
+| Méthode | Route | Protégée | Body / Query | Description |
+|---|---|---|---|---|
+| POST | `/documents/generate` | Oui | `{ opportunityId, type }` | Générer un document depuis une opportunité |
+| GET | `/documents?opportunity_id=` | Oui | Query: `opportunity_id` | Lister les documents d'une opportunité |
+| GET | `/documents/:id` | Oui | — | Détail d'un document |
+| PATCH | `/documents/:id` | Oui | `{ content }` | Modifier le contenu d'un document (passe en `edited`) |
+
+`type` accepte : `local_page`, `faq`, `meta`, `gbp_post`, `review_reply`, `dev_brief`, `checklist`
+
+### ValidationLogs (`/validations`)
+
+| Méthode | Route | Protégée | Body | Description |
+|---|---|---|---|---|
+| POST | `/validations` | Oui | `{ documentId, actionType, platform?, status }` | Approuver/rejeter un document |
+| GET | `/validations` | Oui | — | Historique des validations |
+
+`actionType` accepte : `publish`, `update`, `reply`
+`status` accepte : `approved`, `rejected`
+
+### ActionItems (`/actions`)
+
+| Méthode | Route | Protégée | Body / Query | Description |
+|---      |---    |---       |---           |---          |
+| POST    | `/actions/generate?opportunity_id=` | Oui | Query: `opportunity_id` | Générer une action depuis une opportunité |
+| GET     | `/actions` | Oui | — | Lister toutes les actions |
+| GET     | `/actions/export` | Oui | — | Exporter le plan d'action en PDF |
+| PATCH   | `/actions/:id/status` | Oui | `{ status }` | Changer le statut d'une action |
+
+`status` accepte : `todo`, `in_progress`, `done`, `blocked`, `ignored`
+
+## Parcours type (pour tester l'API dans l'ordre)
+
+```
+1. POST /auth/register
+2. POST /organizations
+3. POST /websites
+4. POST /audits/run          (avec le websiteId de l'étape 3)
+5. POST /opportunities/generate  (avec l'auditId de l'étape 4)
+6. POST /documents/generate  (avec l'opportunityId de l'étape 5)
+7. POST /validations         (avec le documentId de l'étape 6)
+8. POST /actions/generate    (avec l'opportunityId de l'étape 5)
+9. GET /actions/export        (télécharge le PDF)
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+## Notes importantes
 
-## Resources
-
-Check out a few resources that may come in handy when working with NestJS:
-
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
-
-## Support
-
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
-
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
-
-## License
-
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+- **Isolation multi-tenant** : chaque utilisateur ne voit que les données de sa propre organisation.
+- **Multi-sites** : une organisation peut avoir plusieurs sites (`websites`), chacun avec son propre historique d'audits et d'opportunités, totalement isolés les uns des autres.
+- **IA mockée (temporaire)** : les modules Audits, Opportunities, Documents et ActionItems utilisent actuellement des générateurs simulés (`*-generator` / `*-runner`). Un vrai service Python remplacera ces mocks (voir dossier `python-service/` à venir).
