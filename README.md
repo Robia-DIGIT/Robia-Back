@@ -7,7 +7,7 @@ Backend NestJS pour ROBIA, un outil de visibilité SEO locale pour PME et entrep
 - NestJS + TypeScript
 - Prisma 7 + PostgreSQL (extension pgvector)
 - JWT (auth stateless)
-- Docker (PostgreSQL en local)
+- Supabase (PostgreSQL en ligne)
 
 ## Setup local
 
@@ -21,7 +21,6 @@ copy .env.example .env
 Édite `.env` et renseigne tes propres valeurs (voir section Variables d'environnement ci-dessous).
 
 ```powershell
-docker compose up -d
 npx prisma migrate dev
 npm run start:dev
 ```
