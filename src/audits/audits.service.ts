@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditRunnerService } from './audit-runner/audit-runner.service';
+//import { Prisma } from '@prisma/client';
 
 @Injectable()
 export class AuditsService {
@@ -20,6 +21,11 @@ export class AuditsService {
       );
     }
 
+    const organization = await this.prisma.organization.findUnique({
+      where: { id: organizationId },
+      select: { city: true},
+    });
+
     const audit = await this.prisma.audit.create({
       data: {
         organizationId,
@@ -30,13 +36,17 @@ export class AuditsService {
 
     // Exécution "synchrone" pour le MVP (pas de queue async pour l'instant)
     try {
-      const result = await this.auditRunner.runAudit(website.url);
+      const result = await this.auditRunner.runAudit(
+        website.url,
+        organization?.city,
+      );
 
       return this.prisma.audit.update({
         where: { id: audit.id },
         data: {
           status: 'completed',
           globalScore: result.global_score,
+          //resultJson: result as Prisma.InputJsonValue,
           resultJson: result as any,
           completedAt: new Date(),
         },
