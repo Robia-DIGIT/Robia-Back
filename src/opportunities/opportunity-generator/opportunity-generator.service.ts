@@ -29,7 +29,7 @@ export class OpportunityGeneratorService {
     auditResult: Record<string, any>,
     organizationCity?: string | null,
   ): Promise<GeneratedOpportunity[]> {
-    const response = await fetch (`${this.aiEngineUrl}/generate-opportunities`, {
+    const response = await fetch (`${this.aiEngineUrl}/opportunities`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
