@@ -50,6 +50,7 @@ class GeneratedDocument(BaseModel):
 
 class ActionRequest(BaseModel):
     opportunity_title: str
+    opportunity_description: str
 
 
 class GeneratedAction(BaseModel):

@@ -1,6 +1,9 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI
-from app.schemas import AuditRequest, AuditResult, OpportunityRequest, GeneratedOpportunity
-from app.orchestrator import run_audit, run_opportunity_generation
+from app.schemas import AuditRequest, AuditResult, OpportunityRequest, GeneratedOpportunity, DocumentRequest, GeneratedDocument, ActionRequest, GeneratedAction
+from app.orchestrator import run_audit, run_opportunity_generation, run_document_generation, run_action_generation
 
 app = FastAPI(title="Robia AI Engine")
 
@@ -19,4 +22,23 @@ def audit(request: AuditRequest):
 @app.post("/opportunities", response_model=list[GeneratedOpportunity])
 def generate_opportunities(request: OpportunityRequest):
     result = run_opportunity_generation(request.audit_result, request.city)
+    return result
+
+
+@app.post("/documents", response_model=GeneratedDocument)
+def generate_document(request: DocumentRequest):
+    result = run_document_generation(
+        request.type,
+        request.opportunity_title,
+        request.opportunity_description
+    )
+    return result
+
+
+@app.post("/actions", response_model=list[GeneratedAction])
+def actions(request: ActionRequest):
+    result = run_action_generation(
+        request.opportunity_title,
+        request.opportunity_description,
+    )
     return result
