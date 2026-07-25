@@ -74,4 +74,56 @@ export class ActionItemsService {
         select: { title: true, status: true, dueDate: true },
   });
   }
+
+  async generatePlan(organizationId: string) {
+    const actions = await this.prisma.actionItem.findMany({
+      where: { organizationId, status: 'todo', dueDate: null },
+      include: {
+        opportunity: {
+          select: { impactScore: true, effortScore: true },
+        },
+      },
+    });
+
+    if (actions.length === 0) {
+      return [];
+    }
+
+    // Priorité : fort impact, faible effort en premier (quick wins)
+    const sorted = actions.sort((a, b) => {
+      const scoreA = (a.opportunity?.impactScore ?? 5) - (a.opportunity?.effortScore ?? 3);
+      const scoreB = (b.opportunity?.impactScore ?? 5) - (b.opportunity?.effortScore ?? 3);
+      return scoreB - scoreA;
+    });
+
+    const daysSpan = 30;
+    const intervalDays = Math.max(1, Math.floor(daysSpan / sorted.length));
+
+    const updates = sorted.map((action, index) => {
+      const dueDate = new Date();
+      dueDate.setDate(dueDate.getDate() + Math.min(index * intervalDays, daysSpan));
+
+      return this.prisma.actionItem.update({
+        where: { id: action.id },
+        data: { dueDate },
+      });
+    });
+
+    return this.prisma.$transaction(updates);
+  }
+
+  async updateDueDate(organizationId: string, actionId: string, dueDate: Date) {
+    const action = await this.prisma.actionItem.findFirst({
+      where: { id: actionId, organizationId },
+    });
+
+    if (!action) {
+      throw new NotFoundException('Action non trouvée');
+    }
+
+    return this.prisma.actionItem.update({
+      where: { id: actionId },
+      data: { dueDate },
+    });
+  }
 }

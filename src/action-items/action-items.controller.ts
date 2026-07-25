@@ -2,6 +2,7 @@ import { Body, Controller, Get, Param, Patch, Post, Query, Req, Res, UseGuards} 
 import type { Response } from 'express';
 import { ActionItemsService } from './action-items.service';
 import { UpdateActionStatusDto } from './dto/update-action-status.dto';
+import { UpdateDueDateDto } from './dto/update-due-date.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { OrgScopeGuard } from '../common/guards/org-scope.guard';
 import { PdfExportService } from './pdf-export/pdf-export.service';
@@ -71,6 +72,24 @@ export class ActionItemsController {
       req.organizationId,
       id,
       dto,
+    );
+  }
+
+  @Post('plan')
+  generatePlan(@Req() req: ScopedRequest) {
+    return this.actionItemsService.generatePlan(req.organizationId);
+  }
+
+  @Patch(':id/due-date')
+  updateDueDate(
+    @Req() req: ScopedRequest,
+    @Param('id') id: string,
+    @Body() dto: UpdateDueDateDto,
+  ) {
+    return this.actionItemsService.updateDueDate(
+      req.organizationId,
+      id,
+      new Date(dto.dueDate),
     );
   }
 }

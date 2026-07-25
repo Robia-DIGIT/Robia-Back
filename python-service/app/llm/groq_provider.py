@@ -4,7 +4,7 @@ from app.llm.base import LLMProvider
 
 
 class GroqProvider(LLMProvider):
-    def __init__(self, model: str = "llama-3.3-70b-versatile"):
+    def __init__(self, model: str = "qwen/qwen3.6-27b"):
         api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
             raise ValueError("GROQ_API_KEY is not defined in environment variables")
