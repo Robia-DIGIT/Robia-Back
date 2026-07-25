@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 
 export interface GeneratedAction {
   title: string;
@@ -6,15 +7,33 @@ export interface GeneratedAction {
 
 @Injectable()
 export class ActionGeneratorService {
-  /**
-   * TODO: remplacer ce mock par un vrai appel IA suggérant un ordre logique d'exécution.
-   * Le contrat de retour (GeneratedAction) ne doit pas changer.
-   */
+  private readonly aiEngineUrl: string;
+
+  constructor(private readonly configService: ConfigService) {
+    this.aiEngineUrl =
+      this.configService.get<string>('AI_ENGINE_URL') ??
+      'http://localhost:8000';
+  }
+
   async generateFromOpportunity(
     opportunityTitle: string,
+    opportunityDescription: string,
   ): Promise<GeneratedAction[]> {
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    const response = await fetch(`${this.aiEngineUrl}/actions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        opportunity_title: opportunityTitle,
+        opportunity_description: opportunityDescription,
+      }),
+    });
 
-    return [{ title: `Mettre en œuvre : ${opportunityTitle}` }];
+    if (!response.ok) {
+      throw new Error(
+        `AI engine /actions failed with status ${response.status}`,
+      );
+    }
+
+    return response.json();
   }
 }

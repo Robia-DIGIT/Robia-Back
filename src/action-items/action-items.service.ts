@@ -24,6 +24,7 @@ export class ActionItemsService {
 
     const generated = await this.generator.generateFromOpportunity(
       opportunity.title,
+      opportunity.description,
     );
 
     return this.prisma.$transaction(
