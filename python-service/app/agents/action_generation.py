@@ -1,10 +1,13 @@
 import json
+import logging
 import re
 from app.llm.groq_provider import GroqProvider
 from app.prompts.action_generation import (
     ACTION_SYSTEM_PROMPT,
     build_action_user_prompt,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _extract_json_array(text: str) -> list[str]:
@@ -42,7 +45,8 @@ def generate_actions(
         titles = _extract_json_array(raw_response)
         if not titles:
             raise ValueError("Liste vide")
-    except (ValueError, json.JSONDecodeError):
+    except (ValueError, json.JSONDecodeError) as e:
+        logger.warning(f"PARSING FAILED: {e}")
         titles = [f"Mettre en œuvre : {opportunity_title}"]
 
     return [{"title": title} for title in titles[:3]]
