@@ -9,22 +9,29 @@ from app.prompts.action_generation import (
 
 logger = logging.getLogger(__name__)
 
-
 def _extract_json_array(text: str) -> list[str]:
     """
-    Extrait une liste JSON de chaînes depuis la réponse du LLM,
-    même si elle est entourée de texte parasite ou de blocs markdown.
+    Extrait la liste JSON de chaînes depuis la réponse du LLM.
+    Les modèles de raisonnement (comme qwen) génèrent souvent plusieurs
+    brouillons de tableaux JSON dans leur réflexion avant la réponse finale.
+    On teste tous les candidats et on garde le DERNIER qui parse correctement
+    (la réponse finale arrive toujours en dernier).
     """
-    match = re.search(r"\[.*\]", text, re.DOTALL)
-    if not match:
-        raise ValueError("Aucun tableau JSON trouvé dans la réponse du LLM")
+    candidates = re.findall(r"\[.*?\]", text, re.DOTALL)
 
-    parsed = json.loads(match.group(0))
-    if not isinstance(parsed, list):
-        raise ValueError("La réponse du LLM n'est pas une liste")
+    for candidate in reversed(candidates):
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, list) and all(
+                isinstance(item, str) for item in parsed
+            ):
+                cleaned = [item.strip() for item in parsed if item.strip()]
+                if cleaned:
+                    return cleaned
+        except json.JSONDecodeError:
+            continue
 
-    return [str(item).strip() for item in parsed if str(item).strip()]
-
+    raise ValueError("Aucun tableau JSON valide trouvé dans la réponse du LLM")
 
 def generate_actions(
     opportunity_title: str,
