@@ -40,13 +40,14 @@ def generate_actions(
     user_prompt = build_action_user_prompt(opportunity_title, opportunity_description)
 
     raw_response = provider.generate(ACTION_SYSTEM_PROMPT, user_prompt)
+    print(f"RAW LLM RESPONSE: {raw_response}", flush=True)
 
     try:
         titles = _extract_json_array(raw_response)
         if not titles:
             raise ValueError("Liste vide")
     except (ValueError, json.JSONDecodeError) as e:
-        logger.warning(f"PARSING FAILED: {e}")
+        print(f"PARSING FAILED: {e}", flush=True)
         titles = [f"Mettre en œuvre : {opportunity_title}"]
 
     return [{"title": title} for title in titles[:3]]
