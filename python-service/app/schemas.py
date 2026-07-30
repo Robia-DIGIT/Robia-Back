@@ -13,7 +13,7 @@ class Subscores(BaseModel):
     technical: int
     content: int
     performance: int
-
+    ai_readiness: int
 
 class AuditResult(BaseModel):
     global_score: int
