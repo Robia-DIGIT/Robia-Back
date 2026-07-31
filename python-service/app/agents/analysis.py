@@ -132,8 +132,6 @@ def _extract_json_object(text: str) -> dict:
     Extrait le dernier objet JSON valide et complet de la réponse du LLM,
     en gérant les accolades imbriquées (contrairement à un simple regex).
     """
-    # Retire d'éventuels fences markdown ```json ... ```
-    text = re.sub(r"```(?:json)?", "", text)
 
     start_indices = [i for i, c in enumerate(text) if c == "{"]
     for start in reversed(start_indices):
