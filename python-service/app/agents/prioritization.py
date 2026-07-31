@@ -75,6 +75,31 @@ def generate_opportunities(audit_result: dict, city: str | None) -> list[dict]:
             }
         )
 
-    # Toujours garder entre 3 et 5, triées par impact décroissant
+    ai_readiness_score = subscores.get("ai_readiness", 100)
+    if ai_readiness_score < 60:
+        ai_related_gaps = [
+            m for m in missing_data
+            if any(keyword in m.lower() for keyword in [
+                "date de publication", "source", "auteur", "expertise",
+                "q&a", "question", "schema.org", "sémantique", "formatage",
+            ])
+        ]
+        gaps_text = ", ".join(ai_related_gaps) if ai_related_gaps else "structure et signaux d'autorité insuffisants"
+
+        opportunities.append(
+            {
+                "title": "Optimiser le contenu pour les moteurs de réponse IA",
+                "description": (
+                    "Votre contenu manque de structure et de signaux d'autorité "
+                    "exploitables par les IA génératives (ChatGPT, Perplexity, Google AI Overviews)."
+                ),
+                "category": "ai_readiness",
+                "impact_score": 7,
+                "effort_score": 4,
+                "confidence_score": 0.8,
+                "source_data": f"Sous-score ai_readiness : {ai_readiness_score}/100. Lacunes identifiées : {gaps_text}.",
+            }
+        )
+
     opportunities.sort(key=lambda o: o["impact_score"], reverse=True)
     return opportunities[:5] if len(opportunities) >= 3 else opportunities
