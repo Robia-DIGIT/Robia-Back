@@ -1,4 +1,5 @@
 import json
+import re
 from app.agents.ingestion import ScrapedPage
 from app.llm.groq_provider import GroqProvider
 
@@ -128,22 +129,30 @@ Réponds UNIQUEMENT avec un objet JSON valide, rien d'autre, respectant ce sché
 
 def _extract_json_object(text: str) -> dict:
     """
-    Extrait le dernier objet JSON valide de la réponse du LLM.
-    Nécessaire car les modèles de raisonnement (qwen) génèrent
-    plusieurs brouillons avant leur réponse finale.
+    Extrait le dernier objet JSON valide et complet de la réponse du LLM,
+    en gérant les accolades imbriquées (contrairement à un simple regex).
     """
-    import re
+    # Retire d'éventuels fences markdown ```json ... ```
+    text = re.sub(r"```(?:json)?", "", text)
 
-    candidates = re.findall(r"\{.*?\}", text, re.DOTALL)
-    for candidate in reversed(candidates):
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict) and "ai_readiness_score" in parsed:
-                return parsed
-        except json.JSONDecodeError:
-            continue
+    start_indices = [i for i, c in enumerate(text) if c == "{"]
+    for start in reversed(start_indices):
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:i + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                        if isinstance(parsed, dict) and "ai_readiness_score" in parsed:
+                            return parsed
+                    except json.JSONDecodeError:
+                        break  # objet mal formé depuis ce start, essaie le précédent
+                    break
     raise ValueError("Aucun objet JSON valide trouvé dans la réponse du LLM")
-
 
 def _analyze_ai_readiness(page: ScrapedPage, sector: str | None) -> dict:
     """
@@ -170,6 +179,9 @@ Extrait du contenu principal :
     try:
         provider = GroqProvider()
         raw_response = provider.generate(AI_READINESS_SYSTEM_PROMPT, user_content)
+        print("=== RAW LLM RESPONSE ===")
+        print(raw_response)
+        print("=== END ===")
         result = _extract_json_object(raw_response)
     except (ValueError, Exception) as e:
         return {
