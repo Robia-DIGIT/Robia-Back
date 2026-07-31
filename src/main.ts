@@ -17,7 +17,7 @@ async function bootstrap() {
 
   const allowedOrigins = (
     process.env.ALLOWED_ORIGINS ??
-    'http://localhost:3000,https://robia-copilot-front.vercel.app'
+    'http://localhost:3000,https://app.robia.digital'
   ).split(',');
 
   app.enableCors({
