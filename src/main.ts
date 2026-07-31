@@ -15,10 +15,25 @@ async function bootstrap() {
   //  'https://app.robia.digital',
   // ];
 
-  const allowedOrigins = (
-    process.env.ALLOWED_ORIGINS ??
-    'http://localhost:3000,https://app.robia.digital'
-  ).split(',');
+const allowedOrigins = [
+  'http://localhost:3000',
+  'https://app.robia.digital',
+];
+
+app.enableCors({
+  origin: (origin, callback) => {
+    if (!origin) {
+      return callback(null, true);
+    }
+
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+});
 
   app.enableCors({
     origin: allowedOrigins,
