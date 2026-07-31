@@ -114,8 +114,16 @@ Critères à évaluer pour le score ai_readiness (0-100) :
 3. Clarté de la réponse directe à une intention de recherche probable
 4. Cohérence entre titre, headings et contenu réel
 
-Réponds UNIQUEMENT avec un objet JSON valide, rien d'autre, au format exact :
-{"ai_readiness_score": 0, "reasoning": "texte", "missing_data": []}"""
+IMPORTANT : le format ci-dessous est un GABARIT, pas une réponse à recopier.
+Remplace chaque valeur par ton analyse RÉELLE du contenu fourni. Un score de 0
+et un texte vide ne sont valides QUE si la page est vraiment vide ou illisible.
+
+Réponds UNIQUEMENT avec un objet JSON valide, rien d'autre, respectant ce schéma :
+{
+  "ai_readiness_score": <un entier entre 0 et 100, reflétant ton évaluation réelle>,
+  "reasoning": "<2 à 3 phrases précises et spécifiques au contenu analysé, jamais un texte générique>",
+  "missing_data": [<liste des critères que tu n'as pas pu évaluer faute de données, peut être vide>]
+}"""
 
 
 def _extract_json_object(text: str) -> dict:
