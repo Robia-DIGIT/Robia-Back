@@ -1,17 +1,19 @@
 from app.agents.ingestion import scrape_website
-from app.agents.analysis import compute_audit_result
+from app.agents.analysis import compute_audit_result, _analyze_ai_readiness
 from app.agents.prioritization import generate_opportunities
 from app.agents.generation import generate_document_content
 from app.agents.action_generation import generate_actions
 
 
-def run_audit(url: str, city: str | None = None) -> dict:
+def run_audit(url: str, sector: str | None = None, city: str | None = None) -> dict:
     """
-    Point d'entrée unique pour l'audit : scrape puis analyse.
+    Point d'entrée unique pour l'audit : scrape, raisonne sur l'AI-readiness,
+    puis calcule le score global.
     Retourne un dict respectant exactement le contrat AuditResult.
     """
     page = scrape_website(url)
-    return compute_audit_result(page, city)
+    ai_readiness = _analyze_ai_readiness(page, sector)
+    return compute_audit_result(page, city, ai_readiness)
 
 
 def run_opportunity_generation(audit_result: dict, city: str | None = None) -> list[dict]:

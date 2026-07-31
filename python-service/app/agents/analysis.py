@@ -1,13 +1,12 @@
 import json
-import os
-import requests
 from app.agents.ingestion import ScrapedPage
+from app.llm.groq_provider import GroqProvider
 
 
-def compute_audit_result(page: ScrapedPage, city: str | None) -> dict:
+def compute_audit_result(page: ScrapedPage, city: str | None, ai_readiness: dict) -> dict:
     """
     Calcule un score global et des sous-scores à partir de règles simples
-    et vérifiables, sans jamais inventer de données absentes.
+    et vérifiables, enrichi du score ai_readiness (raisonnement LLM).
     """
     missing_data: list[str] = []
 
@@ -19,6 +18,7 @@ def compute_audit_result(page: ScrapedPage, city: str | None) -> dict:
                 "technical": 0,
                 "content": 0,
                 "performance": 0,
+                "ai_readiness": 0,
             },
             "missing_data": [
                 f"Site inaccessible : {page.error or 'raison inconnue'}",
@@ -69,16 +69,22 @@ def compute_audit_result(page: ScrapedPage, city: str | None) -> dict:
     missing_data.append("Avis clients non disponibles")
 
     # --- Sous-score performance (placeholder simple) ---
-    performance_score = 60  # sans mesure réelle de vitesse pour l'instant
+    performance_score = 60
+
+    # --- Sous-score ai_readiness (raisonnement LLM) ---
+    ai_readiness_score = ai_readiness.get("ai_readiness_score", 0)
+    missing_data.extend(ai_readiness.get("missing_data", []))
 
     global_score = round(
-        (local_score + technical_score + content_score + performance_score) / 4
+        (local_score + technical_score + content_score + performance_score + ai_readiness_score) / 5
     )
 
-    summary = (
-        f"Le site est accessible (HTTP {page.status_code}). "
-        f"{'Il manque des informations locales visibles.' if local_score < 50 else 'Les informations locales semblent correctes.'}"
-    )
+    summary_parts = [
+        f"Le site est accessible (HTTP {page.status_code}).",
+        "Il manque des informations locales visibles." if local_score < 50 else "Les informations locales semblent correctes.",
+    ]
+    if ai_readiness.get("reasoning"):
+        summary_parts.append(ai_readiness["reasoning"])
 
     return {
         "global_score": global_score,
@@ -87,9 +93,10 @@ def compute_audit_result(page: ScrapedPage, city: str | None) -> dict:
             "technical": technical_score,
             "content": content_score,
             "performance": performance_score,
+            "ai_readiness": ai_readiness_score,
         },
         "missing_data": missing_data,
-        "summary": summary,
+        "summary": " ".join(summary_parts),
     }
 
 AI_READINESS_SYSTEM_PROMPT = """Tu es un auditeur SEO spécialisé en optimisation pour les moteurs de réponse IA (ChatGPT, Perplexity, Google AI Overviews).
@@ -107,13 +114,27 @@ Critères à évaluer pour le score ai_readiness (0-100) :
 3. Clarté de la réponse directe à une intention de recherche probable
 4. Cohérence entre titre, headings et contenu réel
 
-Réponds UNIQUEMENT avec un objet JSON valide, rien d'autre :
-{
-  "ai_readiness_score": <entier 0-100>,
-  "reasoning": "<2-3 phrases factuelles justifiant le score>",
-  "missing_data": ["<donnée manquante empêchant une évaluation complète>", ...]
-}
-"""
+Réponds UNIQUEMENT avec un objet JSON valide, rien d'autre, au format exact :
+{"ai_readiness_score": 0, "reasoning": "texte", "missing_data": []}"""
+
+
+def _extract_json_object(text: str) -> dict:
+    """
+    Extrait le dernier objet JSON valide de la réponse du LLM.
+    Nécessaire car les modèles de raisonnement (qwen) génèrent
+    plusieurs brouillons avant leur réponse finale.
+    """
+    import re
+
+    candidates = re.findall(r"\{.*?\}", text, re.DOTALL)
+    for candidate in reversed(candidates):
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict) and "ai_readiness_score" in parsed:
+                return parsed
+        except json.JSONDecodeError:
+            continue
+    raise ValueError("Aucun objet JSON valide trouvé dans la réponse du LLM")
 
 
 def _analyze_ai_readiness(page: ScrapedPage, sector: str | None) -> dict:
@@ -136,28 +157,13 @@ H3 : {page.h3 or "aucun"}
 Extrait du contenu principal :
 ---
 {page.main_content}
----
-"""
+---"""
+
     try:
-        response = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": os.environ["ANTHROPIC_API_KEY"],
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-6",
-                "max_tokens": 500,
-                "system": AI_READINESS_SYSTEM_PROMPT,
-                "messages": [{"role": "user", "content": user_content}],
-            },
-            timeout=20,
-        )
-        response.raise_for_status()
-        raw_text = response.json()["content"][0]["text"]
-        result = json.loads(raw_text)
-    except (requests.RequestException, KeyError, json.JSONDecodeError, IndexError) as e:
+        provider = GroqProvider()
+        raw_response = provider.generate(AI_READINESS_SYSTEM_PROMPT, user_content)
+        result = _extract_json_object(raw_response)
+    except (ValueError, Exception) as e:
         return {
             "ai_readiness_score": 0,
             "reasoning": "Analyse IA indisponible (erreur technique).",
