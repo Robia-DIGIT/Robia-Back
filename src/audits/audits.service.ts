@@ -23,7 +23,7 @@ export class AuditsService {
 
     const organization = await this.prisma.organization.findUnique({
       where: { id: organizationId },
-      select: { city: true},
+      select: { city: true, sector: true },
     });
 
     const audit = await this.prisma.audit.create({
@@ -36,10 +36,11 @@ export class AuditsService {
 
     // Exécution "synchrone" pour le MVP (pas de queue async pour l'instant)
     try {
-      const result = await this.auditRunner.runAudit(
-        website.url,
-        organization?.city,
-      );
+      const result = await this.auditRunner.runAudit({
+        websiteUrl: website.url,
+        sector: organization?.sector,
+        city: organization?.city,
+      });
 
       return this.prisma.audit.update({
         where: { id: audit.id },

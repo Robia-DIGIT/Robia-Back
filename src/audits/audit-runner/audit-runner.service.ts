@@ -9,9 +9,16 @@ export interface AuditResult {
     technical: number;
     content: number;
     performance: number;
+    ai_readiness: number;
   };
   missing_data: string[];
   summary: string;
+}
+
+interface RunAuditParams {
+  websiteUrl: string;
+  sector?: string | null;
+  city?: string | null;
 }
 
 @Injectable()
@@ -23,14 +30,11 @@ export class AuditRunnerService {
     'http://localhost:8000';
   }
 
-  async runAudit(
-    websiteUrl: string, 
-    city?: string | null,
-  ): Promise<AuditResult> {
+  async runAudit({ websiteUrl, sector, city }: RunAuditParams): Promise<AuditResult> {
     const response = await fetch(`${this.aiEngineUrl}/audit`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: websiteUrl, city }),
+      body: JSON.stringify({ url: websiteUrl, sector, city }),
     });
 
     if (!response.ok) {
