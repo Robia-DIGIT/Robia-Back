@@ -12,7 +12,7 @@ async function bootstrap() {
   
   //const allowedOrigins = [
   //  'http://localhost:3000',
-  //  'https://robia-copilot-front.vercel.app',
+  //  'https://app.robia.digital',
   // ];
 
   const allowedOrigins = (
