@@ -10,6 +10,7 @@ generator client {
 datasource db {
   provider = "postgresql"
   //url      = env("DATABASE_URL")
+  //directUrl = env("DIRECT_URL")
 }
 
 model User {
@@ -17,6 +18,9 @@ model User {
   email        String   @unique
   passwordHash String?  @map("password_hash")
   provider     String   @default("email")
+  phone        String?
+  company      String?
+  bio          String?
   createdAt    DateTime @default(now()) @map("created_at")
 
   organizations Organization[]

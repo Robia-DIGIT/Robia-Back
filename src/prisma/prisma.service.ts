@@ -10,6 +10,7 @@ export class PrismaService
   constructor() {
     const adapter = new PrismaPg({
       connectionString: process.env.DATABASE_URL,
+      max: 5,
     });
     super({ adapter });
   }
