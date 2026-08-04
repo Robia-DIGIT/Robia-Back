@@ -21,5 +21,6 @@ class GroqProvider(LLMProvider):
             ],
             temperature=0.7,
             max_tokens=2000,
+            reasoning_effort="none",             
         )
         return response.choices[0].message.content or ""

@@ -4,7 +4,12 @@ from app.agents.ingestion import ScrapedPage
 from app.llm.groq_provider import GroqProvider
 
 
-def compute_audit_result(page: ScrapedPage, city: str | None, ai_readiness: dict) -> dict:
+def compute_audit_result(
+    page: ScrapedPage,
+    city: str | None,
+    country: str | None,
+    ai_readiness: dict,
+) -> dict:
     """
     Calcule un score global et des sous-scores à partir de règles simples
     et vérifiables, enrichi du score ai_readiness (raisonnement LLM).
@@ -57,10 +62,28 @@ def compute_audit_result(page: ScrapedPage, city: str | None, ai_readiness: dict
     else:
         missing_data.append("Aucun contenu principal détecté")
 
-    if city and page.main_content and city.lower() in page.main_content.lower():
-        content_score += 30
+    if city and page.main_content:
+        # Gère les formats "Ville, Pays" en testant chaque partie séparément,
+        # évite un faux négatif si city="Antananarivo, Madagascar" et que
+        # seule "Antananarivo" apparaît réellement sur la page.
+        city_parts = [part.strip() for part in city.split(",") if part.strip()]
+        content_lower = page.main_content.lower()
+        city_mentioned = any(part.lower() in content_lower for part in city_parts)
+
+        if city_mentioned:
+            content_score += 20
+        else:
+            missing_data.append(f"Aucune mention de la ville '{city}' détectée sur la page")
     elif city:
         missing_data.append(f"Aucune mention de la ville '{city}' détectée sur la page")
+
+    if country and page.main_content:
+        if country.lower() in page.main_content.lower():
+            content_score += 10
+        else:
+            missing_data.append(f"Aucune mention du pays '{country}' détectée sur la page")
+    elif country:
+        missing_data.append(f"Aucune mention du pays '{country}' détectée sur la page")
 
     content_score = min(content_score, 100)
 
@@ -152,7 +175,7 @@ def _extract_json_object(text: str) -> dict:
                     break
     raise ValueError("Aucun objet JSON valide trouvé dans la réponse du LLM")
 
-def _analyze_ai_readiness(page: ScrapedPage, sector: str | None) -> dict:
+def _analyze_ai_readiness(page: ScrapedPage, sector: str | None, country: str | None) -> dict:
     """
     Raisonnement qualitatif (LLM) sur l'optimisation du contenu pour les IA.
     Isolé de compute_audit_result pour garder cette dernière déterministe.

@@ -6,6 +6,7 @@ class AuditRequest(BaseModel):
     url: str
     sector: Optional[str] = None
     city: Optional[str] = None
+    country: Optional[str] = None
 
 
 class Subscores(BaseModel):

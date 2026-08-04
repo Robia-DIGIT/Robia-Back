@@ -15,7 +15,7 @@ def health_check():
 
 @app.post("/audit", response_model=AuditResult)
 def audit(request: AuditRequest):
-    return run_audit(url=request.url, sector=request.sector, city=request.city)
+    return run_audit(url=request.url, sector=request.sector, city=request.city, country=request.country)
 
 
 @app.post("/opportunities", response_model=list[GeneratedOpportunity])
