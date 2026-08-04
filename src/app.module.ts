@@ -11,6 +11,7 @@ import { OpportunitiesModule } from './opportunities/opportunities.module';
 import { DocumentsModule } from './documents/documents.module';
 import { ValidationLogsModule } from './validation-logs/validation-logs.module';
 import { ActionItemsModule } from './action-items/action-items.module';
+import { UsersModule } from './users/users.module';
 
 @Module({
   imports: [
@@ -27,6 +28,7 @@ import { ActionItemsModule } from './action-items/action-items.module';
     DocumentsModule,
     ValidationLogsModule,
     ActionItemsModule,
+    UsersModule,
   ],
   controllers: [AppController],
   providers: [AppService],
