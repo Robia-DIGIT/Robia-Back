@@ -1,4 +1,15 @@
-import { Body, Controller, Get, Param, Post, Req, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Param,
+  Patch,
+  Post,
+  Query,
+  Req,
+  UseGuards,
+} from '@nestjs/common';
 import { WebsitesService } from './websites.service';
 import { CreateWebsiteDto } from './dto/create-website.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
@@ -20,12 +31,28 @@ export class WebsitesController {
   }
 
   @Get()
-  findAll(@Req() req: ScopedRequest) {
-    return this.websitesService.findAll(req.organizationId);
+  findAll(
+    @Req() req: ScopedRequest,
+    @Query('include_archived') includeArchived?: string,
+  ) {
+    return this.websitesService.findAll(
+      req.organizationId,
+      includeArchived === 'true',
+    );
   }
 
   @Get(':id')
   findOne(@Req() req: ScopedRequest, @Param('id') id: string) {
     return this.websitesService.findOne(req.organizationId, id);
+  }
+
+  @Delete(':id')
+  archive(@Req() req: ScopedRequest, @Param('id') id: string) {
+    return this.websitesService.archive(req.organizationId, id);
+  }
+
+  @Patch(':id/restore')
+  restore(@Req() req: ScopedRequest, @Param('id') id: string) {
+    return this.websitesService.restore(req.organizationId, id);
   }
 }
