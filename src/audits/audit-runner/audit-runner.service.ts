@@ -19,6 +19,7 @@ interface RunAuditParams {
   websiteUrl: string;
   sector?: string | null;
   city?: string | null;
+  country?: string | null;
 }
 
 @Injectable()
@@ -30,11 +31,11 @@ export class AuditRunnerService {
     'http://localhost:8000';
   }
 
-  async runAudit({ websiteUrl, sector, city }: RunAuditParams): Promise<AuditResult> {
+  async runAudit({ websiteUrl, sector, city, country }: RunAuditParams): Promise<AuditResult> {
     const response = await fetch(`${this.aiEngineUrl}/audit`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: websiteUrl, sector, city }),
+      body: JSON.stringify({ url: websiteUrl, sector, city, country }),
     });
 
     if (!response.ok) {

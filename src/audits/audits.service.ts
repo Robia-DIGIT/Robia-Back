@@ -23,7 +23,7 @@ export class AuditsService {
 
     const organization = await this.prisma.organization.findUnique({
       where: { id: organizationId },
-      select: { city: true, sector: true },
+      select: { city: true, sector: true, country: true },
     });
 
     const audit = await this.prisma.audit.create({
@@ -40,6 +40,7 @@ export class AuditsService {
         websiteUrl: website.url,
         sector: organization?.sector,
         city: organization?.city,
+        country: organization?.country,
       });
 
       return this.prisma.audit.update({
