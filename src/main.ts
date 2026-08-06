@@ -5,19 +5,19 @@ import { AppModule } from './app.module';
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
-  // Origines autorisées à accéder à l'API depuis un navigateur.
-  // IMPORTANT :
-  // - localhost:5173 n'est PAS autorisé
-  // - localhost:3000 n'est PAS autorisé
-  // - seul le frontend officiel est autorisé
   const allowedOrigins = [
+    // Frontends de développement
+    'http://localhost:3000',
+    'http://localhost:5173',
+
+    // Frontend de production
     'https://app.robia.digital',
   ];
 
   app.enableCors({
     origin: (origin, callback) => {
-      // Autoriser les requêtes sans Origin
-      // (ex: Postman, curl, requêtes serveur-à-serveur).
+      // Autorise les requêtes sans Origin
+      // (Postman, curl, server-to-server, etc.)
       if (!origin) {
         return callback(null, true);
       }
@@ -26,8 +26,7 @@ async function bootstrap() {
         return callback(null, true);
       }
 
-      // Refuse les autres origines.
-      return callback(new Error('Not allowed by CORS'), false);
+      return callback(new Error(`Origin ${origin} not allowed by CORS`), false);
     },
 
     credentials: true,
@@ -48,8 +47,6 @@ async function bootstrap() {
       'Accept',
       'Authorization',
     ],
-
-    exposedHeaders: [],
 
     optionsSuccessStatus: 204,
   });
