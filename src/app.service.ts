@@ -76,7 +76,7 @@ export class AppService {
           
           <div class="card">
               <h1>Backend NestJS</h1>
-              <p>Tous les systèmes sont opérationnels.</p>
+              <p>Tous les systèmes sont opérationnels niggas.</p>
               <div class="status">● Online</div>
           </div>
       </body>
