@@ -21,20 +21,20 @@ const allowedOrigins = [
   'https://app.robia.digital',
 ];
 
-app.enableCors({
-  origin: (origin, callback) => {
-    if (!origin) {
-      return callback(null, true);
-    }
+// app.enableCors({
+//  origin: (origin, callback) => {
+//    if (!origin) {
+//      return callback(null, true);
+//    }
 
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
+//    if (allowedOrigins.includes(origin)) {
+//      return callback(null, true);
+//    }
 
-    callback(new Error('Not allowed by CORS'));
-  },
-  credentials: true,
-});
+//    callback(new Error('Not allowed by CORS'));
+//  },
+//  credentials: true,
+//});
 
   app.enableCors({
     origin: allowedOrigins,
