@@ -16,9 +16,29 @@ class Subscores(BaseModel):
     performance: int
     ai_readiness: int
 
+
+class AiReadinessBreakdown(BaseModel):
+    structure: int
+    authority: int
+    clarity: int
+    coherence: int
+
+
+class TechnicalDetails(BaseModel):
+    schema_org_types: list[str]
+    og_tags_present: list[str]
+    viewport_present: bool
+    response_time_ms: Optional[float] = None
+    redirect_count: int
+    html_lang: Optional[str] = None
+
+
 class AuditResult(BaseModel):
     global_score: int
     subscores: Subscores
+    ai_readiness_breakdown: AiReadinessBreakdown
+    technical_details: TechnicalDetails
+    strengths: list[str]
     missing_data: list[str]
     summary: str
 
@@ -56,3 +76,4 @@ class ActionRequest(BaseModel):
 
 class GeneratedAction(BaseModel):
     title: str
+
