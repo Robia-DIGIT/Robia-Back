@@ -1,7 +1,8 @@
+import json
 import requests
 from bs4 import BeautifulSoup
 from bs4.element import Tag
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 
@@ -30,6 +31,14 @@ class ScrapedPage:
 
     main_content: str | None
 
+    response_time_ms: float | None = None
+    final_url: str | None = None
+    redirect_count: int = 0
+    viewport_present: bool = False
+    structured_data_types: list[str] = field(default_factory=list)
+    og_tags_present: list[str] = field(default_factory=list)
+    html_lang: str | None = None
+
     error: str | None = None
 
 
@@ -50,6 +59,13 @@ def _empty_page(status_code, error) -> ScrapedPage:
         external_links_count=0,
         word_count=0,
         main_content=None,
+        response_time_ms=None,
+        final_url=None,
+        redirect_count=0,
+        viewport_present=False,
+        structured_data_types=[],
+        og_tags_present=[],
+        html_lang=None,
         error=error,
     )
 
@@ -67,6 +83,44 @@ def _attr_to_str(value) -> str | None:
     return str(value)
 
 
+def _extract_structured_data_types(soup: BeautifulSoup) -> list[str]:
+    """
+    Extrait les types schema.org déclarés en JSON-LD (le format le plus courant
+    et le plus fiable à détecter, contrairement au microdata dispersé dans le HTML).
+    """
+    types: list[str] = []
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            data = json.loads(script.string or "")
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        entries = data if isinstance(data, list) else [data]
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            graph = entry.get("@graph", [entry])
+            for item in graph:
+                if isinstance(item, dict) and "@type" in item:
+                    item_type = item["@type"]
+                    if isinstance(item_type, list):
+                        types.extend(item_type)
+                    else:
+                        types.append(item_type)
+    return list(set(types))
+
+
+def _extract_og_tags(soup: BeautifulSoup) -> list[str]:
+    """Retourne la liste des propriétés Open Graph présentes (og:title, og:image...)."""
+    og_tags: list[str] = []
+    for tag in soup.find_all("meta"):
+        if isinstance(tag, Tag):
+            prop = _attr_to_str(tag.get("property"))
+            if prop and prop.startswith("og:"):
+                og_tags.append(prop)
+    return og_tags
+
+
 def scrape_website(url: str) -> ScrapedPage:
     """
     Récupère une page web et en extrait les informations basiques.
@@ -78,16 +132,24 @@ def scrape_website(url: str) -> ScrapedPage:
             url,
             timeout=10,
             headers={"User-Agent": "RobiaAuditBot/1.0"},
+            allow_redirects=True,
         )
     except requests.RequestException as e:
         return _empty_page(None, str(e))
 
+    response_time_ms = response.elapsed.total_seconds() * 1000
+    final_url = response.url if response.url != url else None
+    redirect_count = len(response.history)
+
     if response.status_code >= 400:
-        return _empty_page(response.status_code, f"HTTP {response.status_code}")
+        page = _empty_page(response.status_code, f"HTTP {response.status_code}")
+        page.response_time_ms = response_time_ms
+        page.final_url = final_url
+        page.redirect_count = redirect_count
+        return page
 
     soup = BeautifulSoup(response.text, "html.parser")
 
-    # Titre : get_text() gère aussi le cas de sous-balises dans <title>
     title = soup.title.get_text(strip=True) if soup.title else None
     title = title or None
 
@@ -104,7 +166,16 @@ def scrape_website(url: str) -> ScrapedPage:
     robots_tag = soup.find("meta", attrs={"name": "robots"})
     meta_robots = _attr_to_str(robots_tag.get("content")) if isinstance(robots_tag, Tag) else None
 
-    # Comptage des liens internes / externes, basé sur le domaine réel
+    viewport_tag = soup.find("meta", attrs={"name": "viewport"})
+    viewport_present = isinstance(viewport_tag, Tag)
+
+    structured_data_types = _extract_structured_data_types(soup)
+    og_tags_present = _extract_og_tags(soup)
+
+    html_lang = None
+    if soup.html and isinstance(soup.html, Tag):
+        html_lang = _attr_to_str(soup.html.get("lang"))
+
     base_netloc = urlparse(url).netloc
     internal_links_count = 0
     external_links_count = 0
@@ -133,7 +204,6 @@ def scrape_website(url: str) -> ScrapedPage:
     h2 = [h.get_text(strip=True) for h in soup.find_all("h2")]
     h3 = [h.get_text(strip=True) for h in soup.find_all("h3")]
 
-    # Contenu principal : texte visible complet, utilisé pour le comptage de mots
     for tag in soup(["script", "style", "nav", "footer"]):
         tag.decompose()
     full_text = soup.get_text(separator=" ", strip=True)
@@ -156,4 +226,11 @@ def scrape_website(url: str) -> ScrapedPage:
         external_links_count=external_links_count,
         word_count=word_count,
         main_content=main_content,
+        response_time_ms=response_time_ms,
+        final_url=final_url,
+        redirect_count=redirect_count,
+        viewport_present=viewport_present,
+        structured_data_types=structured_data_types,
+        og_tags_present=og_tags_present,
+        html_lang=html_lang,
     )
