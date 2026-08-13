@@ -77,9 +77,6 @@ def generate_opportunities(audit_result: dict, city: str | None) -> list[dict]:
             }
         )
 
-    # --- ai_readiness : découpé en règles ciblées grâce au breakdown ---
-    # Plutôt qu'une seule opportunité vague "optimiser pour l'IA", on cible
-    # précisément le sous-critère le plus faible.
     authority_score = breakdown.get("authority", 100)
     if authority_score < 60:
         authority_gaps = [
@@ -119,7 +116,6 @@ def generate_opportunities(audit_result: dict, city: str | None) -> list[dict]:
             }
         )
 
-    # --- Nouvelle règle : données structurées absentes ou incomplètes ---
     schema_types = technical_details.get("schema_org_types", [])
     if not schema_types:
         opportunities.append(
@@ -153,7 +149,6 @@ def generate_opportunities(audit_result: dict, city: str | None) -> list[dict]:
             }
         )
 
-    # --- Nouvelle règle : performance basée sur le temps de réponse réel ---
     response_time = technical_details.get("response_time_ms")
     if response_time is not None and response_time > 2000:
         opportunities.append(
@@ -171,8 +166,6 @@ def generate_opportunities(audit_result: dict, city: str | None) -> list[dict]:
             }
         )
 
-    # --- Fallback générique si aucun critère ai_readiness spécifique n'a matché ---
-    # (garde l'ancienne règle globale comme filet de sécurité)
     ai_readiness_score = subscores.get("ai_readiness", 100)
     has_ai_opportunity = any(o["category"] == "ai_readiness" for o in opportunities)
     if ai_readiness_score < 60 and not has_ai_opportunity:
