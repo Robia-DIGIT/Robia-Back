@@ -11,26 +11,29 @@ logger = logging.getLogger(__name__)
 
 def _extract_json_array(text: str) -> list[str]:
     """
-    Extrait la liste JSON de chaînes depuis la réponse du LLM.
-    Les modèles de raisonnement (comme qwen) génèrent souvent plusieurs
-    brouillons de tableaux JSON dans leur réflexion avant la réponse finale.
-    On teste tous les candidats et on garde le DERNIER qui parse correctement
-    (la réponse finale arrive toujours en dernier).
+    Extrait le dernier tableau JSON valide et complet de la réponse du LLM,
+    en gérant les crochets imbriqués ou les crochets littéraux dans le texte
+    (contrairement à un simple regex non-greedy).
     """
-    candidates = re.findall(r"\[.*?\]", text, re.DOTALL)
-
-    for candidate in reversed(candidates):
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, list) and all(
-                isinstance(item, str) for item in parsed
-            ):
-                cleaned = [item.strip() for item in parsed if item.strip()]
-                if cleaned:
-                    return cleaned
-        except json.JSONDecodeError:
-            continue
-
+    start_indices = [i for i, c in enumerate(text) if c == "["]
+    for start in reversed(start_indices):
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == "[":
+                depth += 1
+            elif text[i] == "]":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:i + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                        if isinstance(parsed, list) and all(isinstance(item, str) for item in parsed):
+                            cleaned = [item.strip() for item in parsed if item.strip()]
+                            if cleaned:
+                                return cleaned
+                    except json.JSONDecodeError:
+                        break
+                    break
     raise ValueError("Aucun tableau JSON valide trouvé dans la réponse du LLM")
 
 def generate_actions(

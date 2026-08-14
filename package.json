@@ -1,5 +1,5 @@
 {
-  "$schema": "https://json.schemastore.org/package.json",
+  "$schema": "https://json.schemastore.org/package",
   "name": "robia-backend",
   "version": "0.0.3b2",
   "description": "",
