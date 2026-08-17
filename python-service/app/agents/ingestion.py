@@ -1,5 +1,6 @@
 import json
 import requests
+import re
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 from dataclasses import dataclass, field
@@ -41,6 +42,9 @@ class ScrapedPage:
 
     error: str | None = None
 
+    business_address: str | None = None
+    business_latitude: float | None = None
+    business_longitude: float | None = None
 
 def _empty_page(status_code, error) -> ScrapedPage:
     return ScrapedPage(
@@ -67,6 +71,9 @@ def _empty_page(status_code, error) -> ScrapedPage:
         og_tags_present=[],
         html_lang=None,
         error=error,
+        business_address=None,
+        business_latitude=None,
+        business_longitude=None,
     )
 
 
@@ -121,6 +128,69 @@ def _extract_og_tags(soup: BeautifulSoup) -> list[str]:
     return og_tags
 
 
+def _extract_business_location(soup: BeautifulSoup) -> tuple[str | None, float | None, float | None]:
+    """
+    Tente d'extraire l'adresse et les coordonnées de l'entreprise depuis :
+    1. Les données structurées schema.org (LocalBusiness et sous-types)
+    2. Une iframe Google Maps intégrée, en dernier recours
+    Retourne (address, latitude, longitude), chaque valeur pouvant être None.
+    """
+    # --- 1. Schema.org ---
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            data = json.loads(script.string or "")
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        entries = data if isinstance(data, list) else [data]
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            graph = entry.get("@graph", [entry])
+            for item in graph:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("@type", "")
+                types = item_type if isinstance(item_type, list) else [item_type]
+                if not any("business" in t.lower() or "store" in t.lower()
+                           or "restaurant" in t.lower() for t in types if isinstance(t, str)):
+                    continue
+
+                address = None
+                addr_data = item.get("address")
+                if isinstance(addr_data, dict):
+                    parts = [
+                        addr_data.get("streetAddress", ""),
+                        addr_data.get("addressLocality", ""),
+                        addr_data.get("addressCountry", ""),
+                    ]
+                    address = ", ".join(p for p in parts if p) or None
+                elif isinstance(addr_data, str):
+                    address = addr_data
+
+                geo = item.get("geo")
+                if isinstance(geo, dict):
+                    lat = geo.get("latitude")
+                    lng = geo.get("longitude")
+                    if lat is not None and lng is not None:
+                        try:
+                            return address, float(lat), float(lng)
+                        except (TypeError, ValueError):
+                            pass
+
+                if address:
+                    return address, None, None
+
+    # --- 2. Iframe Google Maps, en dernier recours ---
+    for iframe in soup.find_all("iframe", src=True):
+        src = _attr_to_str(iframe.get("src")) or ""
+        if "google.com/maps" in src:
+            match = re.search(r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)", src)
+            if match:
+                return None, float(match.group(1)), float(match.group(2))
+
+    return None, None, None
+
 def scrape_website(url: str) -> ScrapedPage:
     """
     Récupère une page web et en extrait les informations basiques.
@@ -171,6 +241,7 @@ def scrape_website(url: str) -> ScrapedPage:
 
     structured_data_types = _extract_structured_data_types(soup)
     og_tags_present = _extract_og_tags(soup)
+    business_address, business_latitude, business_longitude = _extract_business_location(soup)
 
     html_lang = None
     if soup.html and isinstance(soup.html, Tag):
@@ -233,4 +304,7 @@ def scrape_website(url: str) -> ScrapedPage:
         structured_data_types=structured_data_types,
         og_tags_present=og_tags_present,
         html_lang=html_lang,
+        business_address=business_address,
+        business_latitude=business_latitude,
+        business_longitude=business_longitude,
     )
