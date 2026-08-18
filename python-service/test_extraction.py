@@ -1,28 +1,46 @@
-from app.agents.ingestion import scrape_website
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
+from app.agents.ingestion import _extract_business_location
 
-def test_site_reel():
+def test_playwright_reel():
     url_a_tester = "https://www.carlton-madagascar.com/contact"
     
-    print("="*50)
-    print(f"🌍 Lancement du robot d'audit sur : {url_a_tester}")
-    print("⏳ Connexion en cours (simulation du navigateur Chrome)...")
-    print("="*50)
+    print("=" * 50)
+    print(f"🚀 Lancement de Playwright sur : {url_a_tester}")
+    print("=" * 50)
     
-    resultat = scrape_website(url_a_tester)
+    with sync_playwright() as p:
+        # Lancement du navigateur en arrière-plan (headless=True)
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        
+        try:
+            # Navigation et attente que le réseau soit calme
+            page.goto(url_a_tester, timeout=30000, wait_until="networkidle")
+            
+            # Récupération de tout le code HTML rendu par le JavaScript
+            html_content = page.content()
+            print(f"✅ Page chargée ! ({len(html_content)} caractères récupérés)")
+            
+        except Exception as e:
+            print(f"❌ Erreur lors de la navigation : {e}")
+            browser.close()
+            return
+            
+        browser.close()
     
-    if resultat.error:
-        print(f"❌ Impossible d'analyser le site : {resultat.error}")
-    else:
-        print("✅ Code source téléchargé et analysé avec succès !")
-        print(f"📊 Données Schema.org trouvées : {resultat.structured_data_types}")
-        print("-" * 50)
-        print("📍 RÉSULTATS GÉOGRAPHIQUES EXTRAITS :")
-        print(f"🏢 Adresse   : {resultat.business_address}")
-        print(f"🌍 Latitude  : {resultat.business_latitude}")
-        print(f"🌍 Longitude : {resultat.business_longitude}")
-        print(f"Nombre de mots détectés : {resultat.word_count}")
-        print(f"'Pierre Stibbe' dans le contenu : {'Pierre Stibbe' in (resultat.main_content or '')}")
-    print("="*50)
+    # On passe le HTML récupéré par Playwright à votre BeautifulSoup et votre extracteur
+    soup = BeautifulSoup(html_content, "html.parser")
+    
+    print("\n🔍 Analyse des données géographiques...")
+    address, lat, lng = _extract_business_location(soup)
+    
+    print("-" * 50)
+    print("📍 RÉSULTATS DE L'EXTRACTION :")
+    print(f"🏢 Adresse   : {address}")
+    print(f"🌍 Latitude  : {lat}")
+    print(f"🌍 Longitude : {lng}")
+    print("=" * 50)
 
 if __name__ == "__main__":
-    test_site_reel()
+    test_playwright_reel()
