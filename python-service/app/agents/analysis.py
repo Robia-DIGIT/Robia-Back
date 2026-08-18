@@ -26,6 +26,10 @@ def compute_audit_result(
         "response_time_ms": page.response_time_ms,
         "redirect_count": page.redirect_count,
         "html_lang": page.html_lang,
+        "business_address": page.business_address,
+        "business_latitude": page.business_latitude,
+        "business_longitude": page.business_longitude,
+        "js_rendering_used": page.js_rendering_used,        
     }
 
     if not page.accessible:
@@ -83,7 +87,18 @@ def compute_audit_result(
     else:
         missing_data.append("Aucune donnée structurée (schema.org) détectée")
 
+    if page.business_address or (page.business_latitude and page.business_longitude):
+        strengths.append(f"Localisation de l'entreprise détectée : {page.business_address or 'coordonnées GPS trouvées'}")
+    else:
+        missing_data.append("Aucune localisation (adresse ou coordonnées) détectée sur le site")
+
     technical_score = max(0, min(technical_score, 100))
+
+    if page.js_rendering_used:
+        missing_data.append(
+            "Ce site utilise un rendu JavaScript côté client — un rendu complet "
+            "a été nécessaire pour analyser son contenu réel."
+        )
 
     # --- Sous-score contenu ---
     content_score = 30

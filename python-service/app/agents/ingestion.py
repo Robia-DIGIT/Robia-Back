@@ -4,7 +4,8 @@ import re
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 from dataclasses import dataclass, field
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 
 @dataclass
@@ -40,11 +41,15 @@ class ScrapedPage:
     og_tags_present: list[str] = field(default_factory=list)
     html_lang: str | None = None
 
-    error: str | None = None
-
     business_address: str | None = None
     business_latitude: float | None = None
     business_longitude: float | None = None
+
+    js_rendering_suspected: bool = False
+    js_rendering_used: bool = False
+
+    error: str | None = None
+
 
 def _empty_page(status_code, error) -> ScrapedPage:
     return ScrapedPage(
@@ -70,10 +75,12 @@ def _empty_page(status_code, error) -> ScrapedPage:
         structured_data_types=[],
         og_tags_present=[],
         html_lang=None,
-        error=error,
         business_address=None,
         business_latitude=None,
         business_longitude=None,
+        js_rendering_suspected=False,
+        js_rendering_used=False,
+        error=error,
     )
 
 
@@ -128,14 +135,31 @@ def _extract_og_tags(soup: BeautifulSoup) -> list[str]:
     return og_tags
 
 
+def _extract_from_maps_directions_link(soup: BeautifulSoup) -> str | None:
+    """
+    Cherche un lien 'Obtenir l'itinéraire' / 'Get directions' vers Google Maps,
+    très courant sur les sites d'hôtels/restaurants/commerces. L'adresse est
+    directement lisible dans le paramètre 'destination' de l'URL.
+    """
+    for a in soup.find_all("a", href=True):
+        href = _attr_to_str(a.get("href")) or ""
+        if "google.com/maps/dir" in href:
+            parsed = urlparse(href)
+            params = parse_qs(parsed.query)
+            destination = params.get("destination", [None])[0]
+            if destination:
+                return destination
+    return None
+
+
 def _extract_business_location(soup: BeautifulSoup) -> tuple[str | None, float | None, float | None]:
     """
     Tente d'extraire l'adresse et les coordonnées de l'entreprise depuis :
-    1. Les données structurées schema.org (LocalBusiness et sous-types)
-    2. Une iframe Google Maps intégrée, en dernier recours
+    1. Les données structurées schema.org (address/geo)
+    2. Une iframe Google Maps intégrée
+    3. Un lien "Obtenir l'itinéraire" vers Google Maps
     Retourne (address, latitude, longitude), chaque valeur pouvant être None.
     """
-    # --- 1. Schema.org ---
     for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
         try:
             data = json.loads(script.string or "")
@@ -150,10 +174,7 @@ def _extract_business_location(soup: BeautifulSoup) -> tuple[str | None, float |
             for item in graph:
                 if not isinstance(item, dict):
                     continue
-                item_type = item.get("@type", "")
-                types = item_type if isinstance(item_type, list) else [item_type]
-                if not any("business" in t.lower() or "store" in t.lower()
-                           or "restaurant" in t.lower() for t in types if isinstance(t, str)):
+                if "address" not in item and "geo" not in item:
                     continue
 
                 address = None
@@ -181,7 +202,6 @@ def _extract_business_location(soup: BeautifulSoup) -> tuple[str | None, float |
                 if address:
                     return address, None, None
 
-    # --- 2. Iframe Google Maps, en dernier recours ---
     for iframe in soup.find_all("iframe", src=True):
         src = _attr_to_str(iframe.get("src")) or ""
         if "google.com/maps" in src:
@@ -189,37 +209,19 @@ def _extract_business_location(soup: BeautifulSoup) -> tuple[str | None, float |
             if match:
                 return None, float(match.group(1)), float(match.group(2))
 
+    directions_address = _extract_from_maps_directions_link(soup)
+    if directions_address:
+        return directions_address, None, None
+
     return None, None, None
 
-def scrape_website(url: str) -> ScrapedPage:
+
+def _parse_soup(soup: BeautifulSoup, url: str) -> dict:
     """
-    Récupère une page web et en extrait les informations basiques.
-    Ne lève jamais d'exception : retourne toujours un ScrapedPage,
-    avec accessible=False et error rempli en cas de problème.
+    Extrait l'ensemble des signaux SEO/techniques à partir d'un objet BeautifulSoup
+    déjà construit. Réutilisée que le HTML vienne d'une requête statique ou d'un
+    rendu Playwright, pour éviter toute duplication de la logique d'extraction.
     """
-    try:
-        response = requests.get(
-            url,
-            timeout=10,
-            headers={"User-Agent": "RobiaAuditBot/1.0"},
-            allow_redirects=True,
-        )
-    except requests.RequestException as e:
-        return _empty_page(None, str(e))
-
-    response_time_ms = response.elapsed.total_seconds() * 1000
-    final_url = response.url if response.url != url else None
-    redirect_count = len(response.history)
-
-    if response.status_code >= 400:
-        page = _empty_page(response.status_code, f"HTTP {response.status_code}")
-        page.response_time_ms = response_time_ms
-        page.final_url = final_url
-        page.redirect_count = redirect_count
-        return page
-
-    soup = BeautifulSoup(response.text, "html.parser")
-
     title = soup.title.get_text(strip=True) if soup.title else None
     title = title or None
 
@@ -281,30 +283,125 @@ def scrape_website(url: str) -> ScrapedPage:
     word_count = len(full_text.split()) if full_text else 0
     main_content = full_text[:2000] or None
 
+    return {
+        "title": title,
+        "meta_description": meta_description,
+        "canonical": canonical,
+        "meta_robots": meta_robots,
+        "viewport_present": viewport_present,
+        "structured_data_types": structured_data_types,
+        "og_tags_present": og_tags_present,
+        "business_address": business_address,
+        "business_latitude": business_latitude,
+        "business_longitude": business_longitude,
+        "html_lang": html_lang,
+        "internal_links_count": internal_links_count,
+        "external_links_count": external_links_count,
+        "images_count": images_count,
+        "images_without_alt": images_without_alt,
+        "h1": h1,
+        "h2": h2,
+        "h3": h3,
+        "word_count": word_count,
+        "main_content": main_content,
+    }
+
+
+def _fetch_rendered_html(url: str, timeout_ms: int = 15000) -> str | None:
+    """
+    Récupère le HTML après exécution du JavaScript, via un navigateur headless
+    local (Playwright/Chromium). Utilisé uniquement en fallback, quand le
+    scraping statique laisse suspecter une SPA (React/Next.js/Vue).
+    Ne lève jamais d'exception : retourne None en cas d'échec.
+    """
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            page.goto(url, timeout=timeout_ms, wait_until="networkidle")
+            html = page.content()
+            browser.close()
+            return html
+    except Exception as e:
+        return None
+
+
+def scrape_website(url: str) -> ScrapedPage:
+    """
+    Récupère une page web et en extrait les informations basiques.
+    Tente d'abord un scraping HTTP statique (rapide). Si le contenu détecté
+    est anormalement faible par rapport à la taille du HTML brut, retente
+    avec un rendu JavaScript complet (Playwright) en fallback.
+    Ne lève jamais d'exception : retourne toujours un ScrapedPage,
+    avec accessible=False et error rempli en cas de problème.
+    """
+    try:
+        response = requests.get(
+            url,
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+            allow_redirects=True,
+        )
+    except requests.RequestException as e:
+        return _empty_page(None, str(e))
+
+    response_time_ms = response.elapsed.total_seconds() * 1000
+    final_url = response.url if response.url != url else None
+    redirect_count = len(response.history)
+
+    if response.status_code >= 400:
+        page = _empty_page(response.status_code, f"HTTP {response.status_code}")
+        page.response_time_ms = response_time_ms
+        page.final_url = final_url
+        page.redirect_count = redirect_count
+        return page
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    parsed = _parse_soup(soup, url)
+
+    js_rendering_suspected = parsed["word_count"] < 20
+    js_rendering_used = False
+
+    if js_rendering_suspected:
+        rendered_html = _fetch_rendered_html(url)
+        if rendered_html:
+            rendered_soup = BeautifulSoup(rendered_html, "html.parser")
+            rendered_parsed = _parse_soup(rendered_soup, url)
+            # On ne garde le rendu Playwright que s'il a réellement trouvé plus de contenu
+            if rendered_parsed["word_count"] > parsed["word_count"]:
+                parsed = rendered_parsed
+                js_rendering_used = True
+
     return ScrapedPage(
         accessible=True,
         status_code=response.status_code,
-        title=title,
-        meta_description=meta_description,
-        h1=h1,
-        h2=h2,
-        h3=h3,
-        canonical=canonical,
-        meta_robots=meta_robots,
-        images_count=images_count,
-        images_without_alt=images_without_alt,
-        internal_links_count=internal_links_count,
-        external_links_count=external_links_count,
-        word_count=word_count,
-        main_content=main_content,
+        title=parsed["title"],
+        meta_description=parsed["meta_description"],
+        h1=parsed["h1"],
+        h2=parsed["h2"],
+        h3=parsed["h3"],
+        canonical=parsed["canonical"],
+        meta_robots=parsed["meta_robots"],
+        images_count=parsed["images_count"],
+        images_without_alt=parsed["images_without_alt"],
+        internal_links_count=parsed["internal_links_count"],
+        external_links_count=parsed["external_links_count"],
+        word_count=parsed["word_count"],
+        main_content=parsed["main_content"],
         response_time_ms=response_time_ms,
         final_url=final_url,
         redirect_count=redirect_count,
-        viewport_present=viewport_present,
-        structured_data_types=structured_data_types,
-        og_tags_present=og_tags_present,
-        html_lang=html_lang,
-        business_address=business_address,
-        business_latitude=business_latitude,
-        business_longitude=business_longitude,
+        viewport_present=parsed["viewport_present"],
+        structured_data_types=parsed["structured_data_types"],
+        og_tags_present=parsed["og_tags_present"],
+        html_lang=parsed["html_lang"],
+        business_address=parsed["business_address"],
+        business_latitude=parsed["business_latitude"],
+        business_longitude=parsed["business_longitude"],
+        js_rendering_suspected=js_rendering_suspected,
+        js_rendering_used=js_rendering_used,
     )

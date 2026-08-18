@@ -31,6 +31,10 @@ class TechnicalDetails(BaseModel):
     response_time_ms: Optional[float] = None
     redirect_count: int
     html_lang: Optional[str] = None
+    business_address: Optional[str] = None
+    business_latitude: Optional[float] = None
+    business_longitude: Optional[float] = None
+    js_rendering_used: bool = False
 
 
 class AuditResult(BaseModel):
