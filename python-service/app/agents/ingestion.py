@@ -45,6 +45,8 @@ class ScrapedPage:
     business_latitude: float | None = None
     business_longitude: float | None = None
 
+    social_links: dict = field(default_factory=dict)
+
     js_rendering_suspected: bool = False
     js_rendering_used: bool = False
 
@@ -78,6 +80,7 @@ def _empty_page(status_code, error) -> ScrapedPage:
         business_address=None,
         business_latitude=None,
         business_longitude=None,
+        social_links={},
         js_rendering_suspected=False,
         js_rendering_used=False,
         error=error,
@@ -215,6 +218,34 @@ def _extract_business_location(soup: BeautifulSoup) -> tuple[str | None, float |
 
     return None, None, None
 
+def _extract_social_links(soup: BeautifulSoup) -> dict:
+    """
+    Scanne tous les liens de la page pour détecter les réseaux sociaux.
+    Retourne un dictionnaire ex: {'facebook': 'url', 'whatsapp': 'url'}
+    """
+    social_links = {}
+    networks = {
+        "facebook": ["facebook.com", "fb.com"],
+        "instagram": ["instagram.com"],
+        "twitter": ["twitter.com", "x.com"],
+        "linkedin": ["linkedin.com"],
+        "whatsapp": ["wa.me", "api.whatsapp.com", "whatsapp.com/send"],
+        "youtube": ["youtube.com", "youtu.be"],
+        "tiktok": ["tiktok.com"]
+    }
+
+    for a in soup.find_all("a", href=True):
+        href = _attr_to_str(a.get("href"))
+        if not href:
+            continue
+        
+        href_lower = href.lower()
+        for network, domains in networks.items():
+            if network not in social_links:
+                if any(domain in href_lower for domain in domains):
+                    social_links[network] = href.strip()
+                    
+    return social_links
 
 def _parse_soup(soup: BeautifulSoup, url: str) -> dict:
     """
@@ -244,6 +275,8 @@ def _parse_soup(soup: BeautifulSoup, url: str) -> dict:
     structured_data_types = _extract_structured_data_types(soup)
     og_tags_present = _extract_og_tags(soup)
     business_address, business_latitude, business_longitude = _extract_business_location(soup)
+
+    social_links = _extract_social_links(soup)
 
     html_lang = None
     if soup.html and isinstance(soup.html, Tag):
@@ -294,6 +327,7 @@ def _parse_soup(soup: BeautifulSoup, url: str) -> dict:
         "business_address": business_address,
         "business_latitude": business_latitude,
         "business_longitude": business_longitude,
+        "social_links": social_links,
         "html_lang": html_lang,
         "internal_links_count": internal_links_count,
         "external_links_count": external_links_count,
@@ -402,6 +436,7 @@ def scrape_website(url: str) -> ScrapedPage:
         business_address=parsed["business_address"],
         business_latitude=parsed["business_latitude"],
         business_longitude=parsed["business_longitude"],
+        social_links=parsed.get("social_links", {}),
         js_rendering_suspected=js_rendering_suspected,
         js_rendering_used=js_rendering_used,
     )

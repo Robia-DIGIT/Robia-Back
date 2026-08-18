@@ -1,6 +1,6 @@
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
-from app.agents.ingestion import _extract_business_location
+from app.agents.ingestion import _extract_business_location, _extract_social_links
 
 def test_playwright_reel():
     url_a_tester = "https://www.carlton-madagascar.com/contact"
@@ -34,12 +34,14 @@ def test_playwright_reel():
     
     print("\n🔍 Analyse des données géographiques...")
     address, lat, lng = _extract_business_location(soup)
+    socials = _extract_social_links(soup)
     
     print("-" * 50)
     print("📍 RÉSULTATS DE L'EXTRACTION :")
     print(f"🏢 Adresse   : {address}")
     print(f"🌍 Latitude  : {lat}")
     print(f"🌍 Longitude : {lng}")
+    print(f"📱 Réseaux   : {socials}")
     print("=" * 50)
 
 if __name__ == "__main__":
