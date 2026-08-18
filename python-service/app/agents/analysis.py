@@ -100,7 +100,6 @@ def compute_audit_result(
             "a été nécessaire pour analyser son contenu réel."
         )
 
-    # --- Sous-score contenu ---
     content_score = 30
     if page.main_content:
         content_length = len(page.main_content)
@@ -142,12 +141,10 @@ def compute_audit_result(
 
     content_score = max(0, min(content_score, 100))
 
-    # --- Sous-score local (placeholder tant que GBP n'est pas connecté) ---
     local_score = 30
     missing_data.append("Google Business Profile non connecté")
     missing_data.append("Avis clients non disponibles")
 
-    # --- Sous-score performance, basé sur le temps de réponse réel ---
     if page.response_time_ms is not None:
         if page.response_time_ms < 1000:
             performance_score = 90
@@ -161,7 +158,6 @@ def compute_audit_result(
         performance_score = 50
         missing_data.append("Temps de réponse non mesurable")
 
-    # --- ai_readiness décomposé en 4 sous-critères (raisonnement LLM) ---
     breakdown = {
         "structure": ai_readiness.get("structure_score", 0),
         "authority": ai_readiness.get("authority_score", 0),
