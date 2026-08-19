@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Dict
 
 
 class AuditRequest(BaseModel):
@@ -35,6 +35,7 @@ class TechnicalDetails(BaseModel):
     business_latitude: Optional[float] = None
     business_longitude: Optional[float] = None
     js_rendering_used: bool = False
+    social_links: Dict[str, str] = {}
 
 
 class AuditResult(BaseModel):

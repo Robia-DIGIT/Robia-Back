@@ -29,7 +29,8 @@ def compute_audit_result(
         "business_address": page.business_address,
         "business_latitude": page.business_latitude,
         "business_longitude": page.business_longitude,
-        "js_rendering_used": page.js_rendering_used,        
+        "js_rendering_used": page.js_rendering_used, 
+        "social_links": page.social_links,       
     }
 
     if not page.accessible:
@@ -91,6 +92,12 @@ def compute_audit_result(
         strengths.append(f"Localisation de l'entreprise détectée : {page.business_address or 'coordonnées GPS trouvées'}")
     else:
         missing_data.append("Aucune localisation (adresse ou coordonnées) détectée sur le site")
+
+    if page.social_links:
+        networks = ", ".join(page.social_links.keys())
+        strengths.append(f"Réseaux sociaux détectés et liés : {networks}")
+    else:
+        missing_data.append("Aucun lien vers un réseau social détecté sur le site")
 
     technical_score = max(0, min(technical_score, 100))
 
