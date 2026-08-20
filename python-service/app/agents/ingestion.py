@@ -1,6 +1,7 @@
 import json
 import requests
 import re
+import os
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 from dataclasses import dataclass, field
@@ -348,6 +349,11 @@ def _fetch_rendered_html(url: str, timeout_ms: int = 15000) -> str | None:
     scraping statique laisse suspecter une SPA (React/Next.js/Vue).
     Ne lève jamais d'exception : retourne None en cas d'échec.
     """
+
+    if os.getenv("DISABLE_JS_RENDERING", "false").lower() == "true":
+            print(f"Playwright désactivé via variable d'environnement pour {url}")
+            return None
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch()
@@ -360,6 +366,7 @@ def _fetch_rendered_html(url: str, timeout_ms: int = 15000) -> str | None:
             browser.close()
             return html
     except Exception as e:
+        print(f"Erreur lors du rendu JavaScript pour {url}: {e}")
         return None
 
 
