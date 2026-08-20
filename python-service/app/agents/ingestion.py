@@ -361,7 +361,8 @@ def _fetch_rendered_html(url: str, timeout_ms: int = 15000) -> str | None:
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
-            page.goto(url, timeout=timeout_ms, wait_until="networkidle")
+            page.goto(url, timeout=30000, wait_until="load")
+            page.wait_for_timeout(3000)
             html = page.content()
             browser.close()
             return html
@@ -404,7 +405,7 @@ def scrape_website(url: str) -> ScrapedPage:
     soup = BeautifulSoup(response.text, "html.parser")
     parsed = _parse_soup(soup, url)
 
-    js_rendering_suspected = parsed["word_count"] < 20
+    js_rendering_suspected = parsed["word_count"] < 150 or not parsed["h1"]
     js_rendering_used = False
 
     if js_rendering_suspected:
