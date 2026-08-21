@@ -7,6 +7,7 @@ from bs4.element import Tag
 from dataclasses import dataclass, field
 from urllib.parse import urlparse, parse_qs
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from collections import Counter
 
 
 @dataclass
@@ -51,6 +52,8 @@ class ScrapedPage:
     js_rendering_suspected: bool = False
     js_rendering_used: bool = False
 
+    top_keywords: list[str] = field(default_factory=list)
+
     error: str | None = None
 
 
@@ -84,6 +87,7 @@ def _empty_page(status_code, error) -> ScrapedPage:
         social_links={},
         js_rendering_suspected=False,
         js_rendering_used=False,
+        top_keywords=[],
         error=error,
     )
 
@@ -248,6 +252,39 @@ def _extract_social_links(soup: BeautifulSoup) -> dict:
                     
     return social_links
 
+_STOPWORDS = {
+    # Français
+    "le", "la", "les", "de", "des", "du", "un", "une", "et", "à", "en",
+    "pour", "avec", "sur", "dans", "est", "sont", "vous", "nous", "notre",
+    "votre", "nos", "vos", "ce", "ces", "cette", "que", "qui", "au", "aux",
+    "par", "plus", "ne", "pas", "être", "avoir", "tout", "tous", "toute",
+    "toutes", "il", "elle", "ils", "elles", "leur", "leurs", "son", "sa",
+    "ses", "vers", "chez", "sans", "sous", "entre", "comme", "ainsi",
+    # Anglais (utile pour les sites bilingues comme carlton-madagascar.com)
+    "the", "and", "for", "with", "you", "your", "our", "are", "this",
+    "that", "from", "have", "has", "will", "can", "all", "not", "but",
+    "was", "were", "been", "being", "into", "than", "then", "them", "their",
+}
+
+
+def _extract_top_keywords(text: str, top_n: int = 10) -> list[str]:
+    """
+    Extrait les termes les plus fréquents du contenu textuel de la page,
+    après filtrage des mots vides (stopwords FR/EN) et des mots trop courts.
+    Purement déterministe (comptage de fréquence), aucune dépendance externe.
+    """
+    if not text:
+        return []
+
+    words = re.findall(r"[a-zà-öø-ÿ]+", text.lower())
+    filtered = [w for w in words if len(w) > 3 and w not in _STOPWORDS]
+
+    if not filtered:
+        return []
+
+    counts = Counter(filtered)
+    return [word for word, _ in counts.most_common(top_n)]
+
 def _parse_soup(soup: BeautifulSoup, url: str) -> dict:
     """
     Extrait l'ensemble des signaux SEO/techniques à partir d'un objet BeautifulSoup
@@ -316,6 +353,7 @@ def _parse_soup(soup: BeautifulSoup, url: str) -> dict:
     full_text = soup.get_text(separator=" ", strip=True)
     word_count = len(full_text.split()) if full_text else 0
     main_content = full_text[:2000] or None
+    top_keywords = _extract_top_keywords(full_text, top_n=10)
 
     return {
         "title": title,
@@ -339,6 +377,7 @@ def _parse_soup(soup: BeautifulSoup, url: str) -> dict:
         "h3": h3,
         "word_count": word_count,
         "main_content": main_content,
+        "top_keywords": top_keywords,
     }
 
 
@@ -445,6 +484,7 @@ def scrape_website(url: str) -> ScrapedPage:
         business_latitude=parsed["business_latitude"],
         business_longitude=parsed["business_longitude"],
         social_links=parsed.get("social_links", {}),
+        top_keywords=parsed.get("top_keywords", []),
         js_rendering_suspected=js_rendering_suspected,
         js_rendering_used=js_rendering_used,
     )

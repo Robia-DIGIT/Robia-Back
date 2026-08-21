@@ -31,6 +31,7 @@ def compute_audit_result(
         "business_longitude": page.business_longitude,
         "js_rendering_used": page.js_rendering_used, 
         "social_links": page.social_links,       
+        "top_keywords": page.top_keywords,
     }
 
     if not page.accessible:
@@ -119,6 +120,17 @@ def compute_audit_result(
             missing_data.append("Contenu principal très limité")
     else:
         missing_data.append("Aucun contenu principal détecté")
+
+    if page.top_keywords:
+        strengths.append(f"Termes dominants identifiés sur la page : {', '.join(page.top_keywords[:5])}")
+
+        if city:
+            city_lower = city.split(",")[0].strip().lower()
+            if city_lower not in [k.lower() for k in page.top_keywords]:
+                missing_data.append(
+                    f"La ville '{city}' ne fait pas partie des termes dominants de la page "
+                    "(mentionnée mais pas mise en avant)"
+                )
 
     if city and page.main_content:
         city_parts = [part.strip() for part in city.split(",") if part.strip()]
