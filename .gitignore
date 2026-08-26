@@ -63,3 +63,6 @@ python-service/__pycache__/
 python-service/**/__pycache__/
 python-service/*.pyc
 python-service/.env
+
+# Local test outputs
+site_result.json
