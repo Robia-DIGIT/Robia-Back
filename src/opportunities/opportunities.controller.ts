@@ -21,6 +21,13 @@ export class OpportunitiesController {
     );
   }
 
+  @Post('generate-site')
+  generateSite(@Req() req: ScopedRequest, @Body() dto: GenerateOpportunitiesDto) {
+    return this.opportunitiesService.generateFromSiteAudit(
+      req.organizationId, dto.auditId
+    );
+  }
+
   @Get()
   findAll(@Req() req: ScopedRequest, @Query('audit_id') auditId: string) {
     return this.opportunitiesService.findAllForAudit(req.organizationId, auditId);

@@ -59,9 +59,64 @@ model Website {
   createdAt     DateTime @default(now()) @map("created_at")
 
   audits Audit[]
+  pages WebPage[]
 
   @@unique([organizationId, url])
   @@map("websites")  
+}
+
+model WebPage {
+  id          String   @id @default(cuid())
+  websiteId   String   @map("website_id")
+  website     Website  @relation(fields: [websiteId], references: [id])
+
+  url         String
+  path        String?
+  status      String   @default("pending") // pending | crawled | failed | excluded
+  httpStatus  Int?     @map("http_status")
+
+  title       String?
+  metaDescription String? @map("meta_description")
+
+  h1          Json?
+  h2          Json?
+  h3          Json?
+
+  canonical   String?
+  metaRobots  String? @map("meta_robots")
+
+  wordCount   Int?     @map("word_count")
+
+  imagesCount      Int? @map("images_count")
+  imagesWithoutAlt Int? @map("images_without_alt")
+
+  internalLinksCount Int? @map("internal_links_count")
+  externalLinksCount Int? @map("external_links_count")
+
+  structuredDataTypes Json? @map("structured_data_types")
+  ogTagsPresent      Json? @map("og_tags_present")
+  topKeywords        Json? @map("top_keywords")
+
+  businessAddress   String? @map("business_address")
+  businessLatitude  Float?  @map("business_latitude")
+  businessLongitude Float?  @map("business_longitude")
+
+  socialLinks Json? @map("social_links")
+
+  jsRenderingUsed      Boolean @default(false) @map("js_rendering_used")
+  jsRenderingSuspected Boolean @default(false) @map("js_rendering_suspected")
+
+  mainContent String? @map("main_content")
+
+  errorMessage String? @map("error_message")
+
+  crawledAt DateTime? @map("crawled_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  @@unique([websiteId, url])
+  @@index([websiteId])
+  @@map("web_pages")
 }
 
 model Audit {
@@ -93,7 +148,7 @@ model Opportunity {
   impactScore      Int      @map("impact_score")
   effortScore      Int      @map("effort_score")
   confidenceScore  Float    @map("confidence_score")
-  sourceData       String?  @map("source_data")
+  sourceData       Json?    @map("source_data")
   status           String   @default("open") // open | in_progress | done | ignored
   createdAt        DateTime @default(now()) @map("created_at")
 

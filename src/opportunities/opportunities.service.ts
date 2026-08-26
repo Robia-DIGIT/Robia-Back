@@ -56,6 +56,54 @@ export class OpportunitiesService {
     );
   }
 
+  async generateFromSiteAudit(organizationId: string, auditId: string) {
+    const audit = await this.prisma.audit.findFirst({
+      where: { id: auditId, organizationId, status: 'completed' },
+    });
+
+    if (!audit) {
+      throw new NotFoundException(
+        "Aucun audit non trouvé ou non terminé. Vérifiez l'auditId fourni.",
+      );
+    }
+
+    const organization = await this.prisma.organization.findUnique({
+      where: { id: organizationId },
+      select: { city: true, country: true },
+    });
+
+    const generated = await this.generator.generateForSite({
+      siteAuditResult: audit.resultJson as Record<string, any>,
+      city: organization?.city,
+      country: organization?.country,
+    });
+
+    // Même logique de remplacement que generateFromAudit() : on évite
+    // l'accumulation si la génération est relancée sur le même audit.
+    await this.prisma.opportunity.deleteMany({
+      where: { auditId: audit.id },
+    });
+
+    return this.prisma.$transaction(
+      generated.map((opp) =>
+        this.prisma.opportunity.create({
+          data: {
+            organizationId,
+            auditId: audit.id,
+            title: opp.title,
+            description: opp.description,
+            category: opp.category,
+            impactScore: opp.impact_score,
+            effortScore: opp.effort_score,
+            confidenceScore: opp.confidence_score,
+            sourceData: opp.source_data,
+            status: 'open',
+          },
+        }),
+      ),
+    );
+  }
+
   async findAllForAudit(organizationId: string, auditId: string) {
     return this.prisma.opportunity.findMany({
       where: { organizationId, auditId },

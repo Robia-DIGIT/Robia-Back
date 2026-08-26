@@ -11,6 +11,12 @@ export interface GeneratedOpportunity {
   source_data: string;
 }
 
+export interface GenerateForSiteParams {
+  siteAuditResult: Record<string, any>;
+  city?: string | null;
+  country?: string | null;
+}
+
 @Injectable()
 export class OpportunityGeneratorService {
   private readonly aiEngineUrl: string;
@@ -18,7 +24,7 @@ export class OpportunityGeneratorService {
   constructor(private readonly configService: ConfigService) {
     this.aiEngineUrl = 
       this.configService.get<string>('AI_ENGINE_URL') ??
-      'http://localhost:8000';
+      'http://localhost:8001';
   }
 
   /**
@@ -47,5 +53,37 @@ export class OpportunityGeneratorService {
     }
 
     return response.json();
-  } 
+  }
+  
+  /**
+   * Équivalent de generate() pour un audit multi-pages (SiteAuditResult).
+   * Même contrat de retour (GeneratedOpportunity[]) — les opportunités sont
+   * déjà groupées côté moteur Python (une opportunité par type de problème,
+   * pas une par page).
+   */
+  async generateForSite({
+    siteAuditResult,
+    city,
+    country,
+  }: GenerateForSiteParams): Promise<GeneratedOpportunity[]> {
+    const response = await fetch(`${this.aiEngineUrl}/opportunities/site`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        site_audit_result: siteAuditResult,
+        city,
+        country,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `AI engine /opportunities/site failed with status: ${response.status}`,
+      );
+    }
+
+    return response.json();
+  }
 }

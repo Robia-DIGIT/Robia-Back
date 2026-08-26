@@ -3,6 +3,7 @@ import { AuditsService } from './audits.service';
 import { RunAuditDto } from './dto/run-audit.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { OrgScopeGuard } from '../common/guards/org-scope.guard';
+import { RunSiteAuditDto } from './dto/run-site-audit.dto';
 
 interface ScopedRequest extends Request {
   user: { userId: string; email: string };
@@ -17,6 +18,16 @@ export class AuditsController {
   @Post('run')
   run(@Req() req: ScopedRequest, @Body() dto: RunAuditDto) {
     return this.auditsService.run(req.organizationId, dto.websiteId);
+  }
+
+  @Post('run-site')
+  runSite(@Req() req: ScopedRequest, @Body() dto: RunSiteAuditDto) {
+    return this.auditsService.runSite(
+      req.organizationId,
+      dto.websiteId,
+      dto.maxPages,
+      dto.maxDepth,
+    );
   }
 
   @Get()
