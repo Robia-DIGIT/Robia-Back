@@ -1,0 +1,4 @@
+api.robiacopilot.site {
+    encode zstd gzip
+    reverse_proxy robia-api:3001
+}

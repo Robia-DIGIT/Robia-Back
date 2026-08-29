@@ -1,0 +1,11 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+!.env.production.example
+coverage
+dist
+node_modules
+npm-debug.log*
+python-service

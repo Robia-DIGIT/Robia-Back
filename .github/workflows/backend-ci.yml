@@ -20,6 +20,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
+      - run: npm test -- --runInBand src/app.controller.spec.ts
 
   python-llm-tests:
     runs-on: ubuntu-latest
@@ -30,3 +31,12 @@ jobs:
           python-version: "3.12"
       - run: python -m compileall -q python-service/app python-service/main.py
       - run: PYTHONPATH=python-service python -m unittest discover -s python-service/tests -p "test_*.py"
+
+  production-containers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.production.example .env.production
+      - run: docker compose --env-file .env.production -f docker-compose.production.yml config --quiet
+      - run: docker build --target runtime --tag robia-backend:test .
+      - run: docker build --tag robia-ai-engine:test ./python-service

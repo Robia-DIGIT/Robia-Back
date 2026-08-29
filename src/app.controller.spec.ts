@@ -16,8 +16,15 @@ describe('AppController', () => {
   });
 
   describe('root', () => {
-    it('should return "Hello World!"', () => {
-      expect(appController.getHello()).toBe('Hello World!');
+    it('should return the status page', () => {
+      expect(appController.getWelcomePage()).toContain('Backend NestJS');
+    });
+
+    it('should return the health status', () => {
+      expect(appController.getHealth()).toEqual({
+        status: 'ok',
+        service: 'robia-backend',
+      });
     });
   });
 });
