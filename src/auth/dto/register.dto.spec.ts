@@ -1,9 +1,10 @@
+import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
 import { RegisterDto } from './register.dto';
 
 describe('RegisterDto', () => {
   it('accepts and normalizes the complete registration payload', async () => {
-    const dto = Object.assign(new RegisterDto(), {
+    const dto = plainToInstance(RegisterDto, {
       name: '  Johnatan Razafindratsara  ',
       company: '  ROBIA  ',
       email: '  HELLO@ROBIA.DIGITAL  ',
@@ -19,7 +20,7 @@ describe('RegisterDto', () => {
   });
 
   it('rejects a payload without name and company', async () => {
-    const dto = Object.assign(new RegisterDto(), {
+    const dto = plainToInstance(RegisterDto, {
       email: 'hello@robia.digital',
       password: 'password-secure',
     });
