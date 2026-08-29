@@ -1,6 +1,6 @@
 # Déploiement du backend ROBIA
 
-Cette configuration utilise le PostgreSQL du Supabase auto-hébergé et le réseau Docker `supabase_default`. Aucun port NestJS, FastAPI ou PostgreSQL n'est publié sur Internet.
+Cette configuration utilise le PostgreSQL du Supabase auto-hébergé et le réseau Docker `supabase_default`. Aucun port NestJS, FastAPI ou PostgreSQL n'est publié sur Internet. Le moteur FastAPI dispose d'un réseau `egress` dédié pour joindre les sites publics à auditer, tout en restant inaccessible depuis Internet.
 
 ## Pré-requis VPS
 
@@ -51,6 +51,12 @@ Vérifiez les conteneurs :
 Testez NestJS depuis son conteneur :
 
 `docker compose --env-file .env.production -f docker-compose.production.yml exec backend node -e "fetch('http://127.0.0.1:3001/health').then(async r=>{console.log(r.status,await r.text());process.exit(r.ok?0:1)}).catch(e=>{console.error(e);process.exit(1)})"`
+
+Testez la résolution DNS et la sortie HTTPS du moteur d'audit :
+
+`docker compose --env-file .env.production -f docker-compose.production.yml exec ai-engine python -c "import requests; r=requests.get('https://example.com', timeout=15); print(r.status_code)"`
+
+Résultat attendu : `200`.
 
 Testez FastAPI depuis son conteneur :
 
