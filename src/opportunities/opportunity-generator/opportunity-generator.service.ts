@@ -24,7 +24,7 @@ export class OpportunityGeneratorService {
   constructor(private readonly configService: ConfigService) {
     this.aiEngineUrl = 
       this.configService.get<string>('AI_ENGINE_URL') ??
-      'http://localhost:8001';
+      'http://localhost:8000';
   }
 
   /**

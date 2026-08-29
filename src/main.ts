@@ -5,14 +5,14 @@ import { AppModule } from './app.module';
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
-  const allowedOrigins = [
-    // Frontends de développement
-    'http://localhost:3000',
-    'http://localhost:5173',
-
-    // Frontend de production
-    'https://app.robia.digital',
-  ];
+  const configuredOrigins =
+    process.env.FRONTEND_URLS ??
+    process.env.FRONTEND_URL ??
+    'http://localhost:3000,http://localhost:5173';
+  const allowedOrigins = configuredOrigins
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
 
   app.enableCors({
     origin: (origin, callback) => {

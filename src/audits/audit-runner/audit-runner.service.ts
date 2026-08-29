@@ -93,7 +93,7 @@ export class AuditRunnerService {
 
   constructor(private readonly configService: ConfigService) {
     this.aiEngineUrl = this.configService.get<string>('AI_ENGINE_URL') ??
-    'http://localhost:8001';
+    'http://localhost:8000';
   }
 
   async runAudit({ websiteUrl, sector, city, country }: RunAuditParams): Promise<AuditResult> {
