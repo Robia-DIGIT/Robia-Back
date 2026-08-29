@@ -1,4 +1,4 @@
-from app.llm.groq_provider import GroqProvider
+from app.llm.provider_factory import get_llm_provider
 from app.prompts.document_generation import (
     DOCUMENT_SYSTEM_PROMPT,
     build_document_user_prompt,
@@ -15,7 +15,7 @@ def generate_document_content(
     Retourne un dict {"title": str, "content": str} respectant
     le contrat GeneratedDocument.
     """
-    provider = GroqProvider()
+    provider = get_llm_provider()
 
     user_prompt = build_document_user_prompt(
         document_type, opportunity_title, opportunity_description
