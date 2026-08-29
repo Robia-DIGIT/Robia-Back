@@ -1,5 +1,8 @@
-import { ConflictException,Injectable,UnauthorizedException } from '@nestjs/common';
-
+import {
+  ConflictException,
+  Injectable,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcryptjs';
 import { PrismaService } from '../prisma/prisma.service';
@@ -13,7 +16,7 @@ export class AuthService {
     private readonly jwtService: JwtService,
   ) {}
 
-  async register (dto: RegisterDto) {
+  async register(dto: RegisterDto) {
     const existingUser = await this.prisma.user.findUnique({
       where: { email: dto.email },
     });
@@ -25,14 +28,21 @@ export class AuthService {
     const passwordHash = await bcrypt.hash(dto.password, 10);
 
     const user = await this.prisma.user.create({
-        data: {
-            email: dto.email,
-            passwordHash,
-            provider: 'email',
-        },
+      data: {
+        name: dto.name,
+        email: dto.email,
+        passwordHash,
+        provider: 'email',
+        company: dto.company,
+      },
     });
 
-    return  this.buildAuthResponse(user.id, user.email);
+    return this.buildAuthResponse(
+      user.id,
+      user.email,
+      user.name,
+      user.company,
+    );
   }
 
   async login(dto: LoginDto) {
@@ -41,19 +51,24 @@ export class AuthService {
     });
 
     if (!user || !user.passwordHash) {
-        throw new UnauthorizedException('Identifiants invalides');
+      throw new UnauthorizedException('Identifiants invalides');
     }
 
     const isPasswordValid = await bcrypt.compare(
-        dto.password, 
-        user.passwordHash,
+      dto.password,
+      user.passwordHash,
     );
 
     if (!isPasswordValid) {
-        throw new UnauthorizedException('Identifiants invalides');
+      throw new UnauthorizedException('Identifiants invalides');
     }
 
-    return this.buildAuthResponse(user.id, user.email);
+    return this.buildAuthResponse(
+      user.id,
+      user.email,
+      user.name,
+      user.company,
+    );
   }
 
   async getProfile(userId: string) {
@@ -61,7 +76,9 @@ export class AuthService {
       where: { id: userId },
       select: {
         id: true,
+        name: true,
         email: true,
+        company: true,
         provider: true,
         createdAt: true,
       },
@@ -74,11 +91,16 @@ export class AuthService {
     return user;
   }
 
-  private buildAuthResponse(userId: string, email: string) {
+  private buildAuthResponse(
+    userId: string,
+    email: string,
+    name: string,
+    company: string | null,
+  ) {
     const payload = { sub: userId, email };
     return {
       accessToken: this.jwtService.sign(payload),
-      user: { id: userId, email },
+      user: { id: userId, name, email, company },
     };
   }
 }
