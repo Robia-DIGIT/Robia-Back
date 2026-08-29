@@ -13,6 +13,7 @@ async function main() {
   console.log('Creating test user...');
   const user = await prisma.user.create({
     data: {
+      name: 'Utilisateur Test',
       email: 'test@robia.dev',
       passwordHash: 'fake_hash_for_test',
     },
