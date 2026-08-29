@@ -21,6 +21,7 @@ services:
     expose:
       - "8000"
     networks:
+      - egress
       - internal
     restart: unless-stopped
     init: true
@@ -75,6 +76,8 @@ services:
           memory: 1g
 
 networks:
+  egress:
+    driver: bridge
   internal:
     internal: true
   supabase:
