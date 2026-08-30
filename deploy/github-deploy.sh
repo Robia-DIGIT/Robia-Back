@@ -78,9 +78,10 @@ compose config --quiet
 compose config --format json | jq -e 'all(.services[]; ((.ports // []) | length) == 0)' >/dev/null || fail 'Application ports must not be published'
 compose build
 if [ "$target" = backend ]; then
-  # The existing backup routine must run as robia and return nonzero on failure.
+  # The backup uses Bash (including pipefail), even though this dispatcher is POSIX sh.
+  # It must run as robia and return nonzero on failure; never weaken its strict options.
   [ -r /srv/robia/scripts/backup-supabase.sh ] || fail 'Backup script is unavailable'
-  sh /srv/robia/scripts/backup-supabase.sh || fail 'Backup failed; containers have not been updated'
+  bash /srv/robia/scripts/backup-supabase.sh || fail 'Backup failed; containers have not been updated'
 fi
 compose up -d --no-build
 if [ "$target" = backend ]; then

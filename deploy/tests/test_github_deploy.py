@@ -63,7 +63,7 @@ class DeploymentTests(unittest.TestCase):
         self.srv = self.root / "srv"
         (self.srv / "scripts").mkdir(parents=True)
         self.backup = self.srv / "scripts/backup-supabase.sh"
-        self.backup.write_text('#!/bin/sh\nprintf \'["backup"]\\n\' >> "$FAKE_LOG"\nexit "${FAKE_BACKUP_EXIT:-0}"\n')
+        self.backup.write_text('#!/bin/bash\nset -euo pipefail\nprintf \'["backup"]\\n\' >> "$FAKE_LOG"\nexit "${FAKE_BACKUP_EXIT:-0}"\n')
         self.runner = self.root / "dispatcher.sh"
         self.runner.write_text(SCRIPT.read_text().replace("/srv/robia", str(self.srv)))
         self.source = self.root / "source"
@@ -180,6 +180,15 @@ class DeploymentTests(unittest.TestCase):
     def test_backup_failure_keeps_running_containers(self):
         result = self.run_deploy(FAKE_BACKUP_EXIT="1")
         self.assertNotEqual(result.returncode, 0)
+        self.assert_no_up()
+
+    def test_backup_pipefail_failure_keeps_running_containers(self):
+        self.backup.write_text('#!/bin/bash\nset -euo pipefail\nfalse | true\nprintf \'["backup-unexpected-success"]\\n\' >> "$FAKE_LOG"\n')
+        result = self.run_deploy()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Backup failed", result.stderr)
+        self.assertNotIn("Illegal option", result.stderr)
+        self.assertNotIn(["backup-unexpected-success"], self.calls())
         self.assert_no_up()
 
     def test_missing_backup_keeps_running_containers(self):
