@@ -25,7 +25,7 @@ Le workflow impose `StrictHostKeyChecking=yes`, utilise cette identité pré-enr
 
 ## Installation VPS, après fusion autorisée de la PR backend
 
-Exécuter comme `robia`, garder la connexion SSH personnelle ouverte. Le serveur doit disposer de Git, Docker Compose, `flock`, `jq`, curl et du script de sauvegarde déjà testé.
+Exécuter comme `robia`, garder la connexion SSH personnelle ouverte. Le serveur doit disposer de Bash, Git, Docker Compose, `flock`, `jq`, curl et du script de sauvegarde déjà testé.
 
 `cd /srv/robia/robia-back && git status --short`
 
@@ -33,7 +33,13 @@ Si la sortie est vide :
 
 `git pull --ff-only origin main`
 
-`test -r /srv/robia/scripts/backup-supabase.sh && sh -n /srv/robia/scripts/backup-supabase.sh && echo BACKUP_SCRIPT=READY`
+`test -r /srv/robia/scripts/backup-supabase.sh && bash -n /srv/robia/scripts/backup-supabase.sh && echo BACKUP_SCRIPT=READY`
+
+Le script de sauvegarde utilise Bash, notamment `set -euo pipefail` : ne pas le lancer avec `sh` et ne pas supprimer `pipefail`. La validation de syntaxe ne prouve pas que la sauvegarde fonctionne. Effectuer un test réel, sans `sudo`, avant activation :
+
+`bash /srv/robia/scripts/backup-supabase.sh && echo BACKUP_AS_ROBIA=OK`
+
+Ne contrôler le manifeste le plus récent qu'après la réussite de ce test : un manifeste ancien intact ne valide pas une tentative échouée.
 
 Le script de sauvegarde doit réellement fonctionner comme `robia`, retourner une erreur si une étape échoue, vérifier ses archives, et produire les sauvegardes PostgreSQL et des rôles sans afficher de secrets. Ne pas accorder de sudo général si cette vérification échoue : corriger précisément les permissions nécessaires.
 
