@@ -1,0 +1,90 @@
+name: Backend CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  nest-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test -- --runInBand src/app.controller.spec.ts
+      - run: npm test -- --runInBand src/auth/dto/register.dto.spec.ts
+
+  python-llm-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m compileall -q python-service/app python-service/main.py
+      - run: PYTHONPATH=python-service python -m unittest discover -s python-service/tests -p "test_*.py"
+
+  production-containers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.production.example .env.production
+      - run: docker compose --env-file .env.production -f docker-compose.production.yml config --quiet
+      - run: docker build --target runtime --tag robia-backend:test .
+      - run: docker build --tag robia-ai-engine:test ./python-service
+
+  deployment-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh -n deploy/github-deploy.sh
+      - run: python3 -m unittest discover -s deploy/tests -p "test_*.py"
+
+  deploy:
+    name: Deploy production over restricted SSH
+    needs: [nest-build, python-llm-tests, production-containers, deployment-tests]
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      github.repository == 'Robia-DIGIT/Robia-Back' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      vars.VPS_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    concurrency:
+      group: production-backend
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - name: Deploy the tested commit
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          for name in VPS_HOST VPS_USER VPS_SSH_KEY VPS_KNOWN_HOSTS; do
+            test -n "${!name}" || { echo "::error::Missing secret: $name"; exit 1; }
+          done
+          umask 077
+          robia_ssh_dir=$(mktemp -d)
+          trap 'rm -f -- "$robia_ssh_dir/id_ed25519" "$robia_ssh_dir/known_hosts"; rmdir -- "$robia_ssh_dir"' EXIT
+          printf '%s\n' "$VPS_SSH_KEY" | tr -d '\r' > "$robia_ssh_dir/id_ed25519"
+          printf '%s\n' "$VPS_KNOWN_HOSTS" | tr -d '\r' > "$robia_ssh_dir/known_hosts"
+          unset VPS_SSH_KEY VPS_KNOWN_HOSTS
+          ssh-keygen -y -P '' -f "$robia_ssh_dir/id_ed25519" >/dev/null
+          ssh-keygen -F "$VPS_HOST" -f "$robia_ssh_dir/known_hosts" >/dev/null
+          ssh -F /dev/null -T -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o StrictHostKeyChecking=yes -o HostKeyAlgorithms=ssh-ed25519 -o GlobalKnownHostsFile=/dev/null -o UserKnownHostsFile="$robia_ssh_dir/known_hosts" -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -i "$robia_ssh_dir/id_ed25519" "${VPS_USER}@${VPS_HOST}" "deploy-backend ${GITHUB_SHA}"

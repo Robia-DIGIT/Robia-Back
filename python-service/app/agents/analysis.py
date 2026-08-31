@@ -2,7 +2,7 @@ import json
 import os
 import requests
 from app.agents.ingestion import ScrapedPage
-from app.llm.groq_provider import GroqProvider
+from app.llm.provider_factory import get_llm_provider
 
 
 def compute_audit_result(
@@ -310,7 +310,7 @@ Extrait du contenu principal :
 ---"""
 
     try:
-        provider = GroqProvider()
+        provider = get_llm_provider()
         raw_response = provider.generate(AI_READINESS_SYSTEM_PROMPT, user_content)
         result = _extract_json_object(raw_response)
     except (ValueError, Exception) as e:

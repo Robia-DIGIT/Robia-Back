@@ -10,4 +10,9 @@ export class AppController {
   getWelcomePage() {
     return this.appService.getBeautifulPage();
   }
+
+  @Get('health')
+  getHealth() {
+    return { status: 'ok', service: 'robia-backend' };
+  }
 }

@@ -32,9 +32,15 @@ Le serveur démarre sur `http://localhost:3001`.
 | Variable | Description |
 |---|---|
 | `DATABASE_URL` | Connexion PostgreSQL (doit correspondre aux identifiants dans `docker-compose.yml`) |
+| `DIRECT_URL` | Connexion PostgreSQL directe utilisée par les migrations Prisma |
 | `JWT_SECRET` | Clé secrète pour signer les tokens JWT |
 | `JWT_EXPIRES_IN` | Durée de validité du token (ex: `7d`) |
-| `FRONTEND_URL` | Origine autorisée pour CORS (ex: `http://localhost:3000`) |
+| `FRONTEND_URLS` | Origines CORS séparées par des virgules |
+| `AI_ENGINE_URL` | URL interne du moteur FastAPI |
+
+## Production
+
+Le déploiement Docker de production n'expose directement ni NestJS, ni FastAPI, ni PostgreSQL. Consultez [DEPLOYMENT.md](DEPLOYMENT.md) pour la procédure VPS et la connexion au Caddy/Supabase existant.
 
 ## Authentification
 
@@ -142,4 +148,4 @@ La plupart des routes nécessitent aussi qu'une **organisation** existe pour l'u
 
 - **Isolation multi-tenant** : chaque utilisateur ne voit que les données de sa propre organisation.
 - **Multi-sites** : une organisation peut avoir plusieurs sites (`websites`), chacun avec son propre historique d'audits et d'opportunités, totalement isolés les uns des autres.
-- **IA mockée (temporaire)** : les modules Audits, Opportunities, Documents et ActionItems utilisent actuellement des générateurs simulés (`*-generator` / `*-runner`). Un vrai service Python remplacera ces mocks (voir dossier `python-service/` à venir).
+- **Moteur IA** : les modules Audits, Opportunities, Documents et ActionItems utilisent le service FastAPI du dossier `python-service/`, avec Groq ou Claude sélectionnable par configuration.

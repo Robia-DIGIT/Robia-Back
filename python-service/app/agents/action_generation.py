@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from app.llm.groq_provider import GroqProvider
+from app.llm.provider_factory import get_llm_provider
 from app.prompts.action_generation import (
     ACTION_SYSTEM_PROMPT,
     build_action_user_prompt,
@@ -46,7 +46,7 @@ def generate_actions(
     En cas d'échec de parsing, retombe sur une action générique unique
     plutôt que de faire échouer tout le pipeline.
     """
-    provider = GroqProvider()
+    provider = get_llm_provider()
     user_prompt = build_action_user_prompt(opportunity_title, opportunity_description)
 
     raw_response = provider.generate(ACTION_SYSTEM_PROMPT, user_prompt)
