@@ -3,12 +3,14 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { LocationPlacesService } from './location-places/location-places.service';
 import { CreateLocationDto } from './dto/create-location.dto';
+import { LocationWeatherService } from './location-weather/location-weather.service';
 
 @Injectable()
 export class LocationsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly places: LocationPlacesService,
+    private readonly weather: LocationWeatherService,
   ) {}
 
   async searchPlaces(query: string) {
@@ -66,4 +68,16 @@ export class LocationsService {
 
     return location;
   }
+
+  async getWeather(organizationId: string, id: string) {
+    const location = await this.findOne(organizationId, id);
+
+    if (location.latitude === null || location.longitude === null) {
+      throw new Error(
+        `Le lieu "${location.name}" n'a pas de coordonnées enregistrées — impossible de récupérer la météo.`,
+      );
+    }
+
+    return this.weather.getCurrentWeather(location.latitude, location.longitude);
+  }  
 }

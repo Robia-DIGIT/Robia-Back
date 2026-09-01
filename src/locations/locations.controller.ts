@@ -34,4 +34,9 @@ export class LocationsController {
   findOne(@Req() req: ScopedRequest, @Param('id') id: string) {
     return this.locationsService.findOne(req.organizationId, id);
   }
+
+  @Get(':id/weather')
+  getWeather(@Req() req: ScopedRequest, @Param('id') id: string) {
+    return this.locationsService.getWeather(req.organizationId, id);
+  }
 }

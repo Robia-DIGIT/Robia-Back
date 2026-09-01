@@ -628,7 +628,12 @@ def _discover_from_sitemap(base_url: str) -> list[str]:
 
 
 def _discover_from_links(soup: BeautifulSoup, current_url: str, base_netloc: str) -> list[str]:
-    """Extrait et normalise les liens internes d'une page déjà parsée (fallback BFS)."""
+    """
+    Extrait et normalise les liens internes d'une page déjà parsée (fallback BFS).
+    Ne filtre PAS les URLs à exclure ici — laisse crawl_website() décider et
+    comptabiliser correctement les exclusions dans site.excluded_urls, pour
+    que le compteur soit fiable aussi bien en mode sitemap qu'en mode fallback.
+    """
     found = []
     for a in soup.find_all("a", href=True):
         href = _attr_to_str(a.get("href"))
@@ -639,10 +644,9 @@ def _discover_from_links(soup: BeautifulSoup, current_url: str, base_netloc: str
             continue
         absolute = urljoin(current_url, href)
         normalized = _normalize_url(absolute, base_netloc)
-        if normalized and not _should_exclude(normalized):
+        if normalized:
             found.append(normalized)
     return found
-
 
 def _fetch_soup_for_discovery(url: str, browser=None) -> BeautifulSoup | None:
     """
@@ -776,7 +780,14 @@ def crawl_website(url: str, max_pages: int = 30, max_depth: int = 2) -> ScrapedS
                 continue
 
             for link in _discover_from_links(soup, current_url, base_netloc):
-                if link not in visited and len(visited) < max_pages * 3:
+                if link in visited:
+                    continue
+                if _should_exclude(link):
+                    if link not in site.excluded_urls:
+                        site.excluded_urls.append(link)
+                    visited.add(link)
+                    continue
+                if len(visited) < max_pages * 3:
                     visited.add(link)
                     queue.append((link, depth + 1))
 
@@ -1002,7 +1013,7 @@ def _geocode_address(address: str, city: str | None = None, country: str | None 
         if google_result:
             return google_result
 
-    # Fallback Nominatim (gratuit, sans clé) : adresse complète, puis ville/pays
+    # Fallback Nominatim opensource ny openstreetmap ito (gratuit, sans clé) : adresse complète, puis ville/pays ( activé si manao échec ilay module google Geocoding)
     def _query_nominatim(q: str) -> tuple[float, float] | None:
         try:
             response = requests.get(
