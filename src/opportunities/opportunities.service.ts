@@ -22,13 +22,24 @@ export class OpportunitiesService {
 
     const organization = await this.prisma.organization.findUnique({
       where: { id: organizationId },
-      select: { city: true },
+      select: { city: true, country: true },
     });
 
-    const generated = await this.generator.generate(
-      audit.resultJson as Record<string, any>,
-      organization?.city,
-    );
+    const auditResult = audit.resultJson as Record<string, any>;
+    const siteAuditResult = auditResult?.site_audit;
+    const hasSiteEvidence =
+      siteAuditResult &&
+      typeof siteAuditResult === 'object' &&
+      Number(siteAuditResult.pages_analyzed) > 0 &&
+      Array.isArray(siteAuditResult.pages);
+
+    const generated = hasSiteEvidence
+      ? await this.generator.generateForSite({
+          siteAuditResult,
+          city: organization?.city,
+          country: organization?.country,
+        })
+      : await this.generator.generate(auditResult, organization?.city);
 
     // On supprime les anciennes opportunités liées à cet audit avant d'en générer de nouvelles
     // (évite l'accumulation si on relance la génération plusieurs fois sur le même audit)
