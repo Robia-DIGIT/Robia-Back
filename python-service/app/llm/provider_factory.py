@@ -9,7 +9,7 @@ def get_llm_provider() -> LLMProvider:
     if provider_name == "groq":
         from app.llm.groq_provider import GroqProvider
 
-        model = os.getenv("GROQ_MODEL", "qwen/qwen3.6-27b")
+        model = os.getenv("GROQ_MODEL", "qwen/Qwen3.8-27B")
         return GroqProvider(model=model)
 
     if provider_name in {"claude", "anthropic"}:
