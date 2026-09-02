@@ -285,7 +285,7 @@ def generate_site_opportunities(site_audit_result: dict, city: str | None = None
             "confidence_score": 0.85,
             "source_data": "Aucune adresse trouvée (schema.org, iframe Maps, ou lien itinéraire).",
         })
-    elif site_audit_result.get("location_precision") == "approximate":
+    elif site_audit_result.get("location_precision") in ("approximate", "street"):
         opportunities.append({
             "title": "Préciser l'adresse en données structurées",
             "description": (

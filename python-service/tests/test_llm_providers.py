@@ -25,7 +25,7 @@ class ProviderFactoryTests(unittest.TestCase):
             provider = self.factory.get_llm_provider()
 
         self.assertIsInstance(provider, FakeGroqProvider)
-        self.assertEqual(provider.model, "qwen/qwen3.6-27b")
+        self.assertEqual(provider.model, "qwen/Qwen3.8-27B")
 
     def test_claude_provider_uses_configured_model(self):
         fake_module = types.ModuleType("app.llm.claude_provider")

@@ -628,7 +628,12 @@ def _discover_from_sitemap(base_url: str) -> list[str]:
 
 
 def _discover_from_links(soup: BeautifulSoup, current_url: str, base_netloc: str) -> list[str]:
-    """Extrait et normalise les liens internes d'une page déjà parsée (fallback BFS)."""
+    """
+    Extrait et normalise les liens internes d'une page déjà parsée (fallback BFS).
+    Ne filtre PAS les URLs à exclure ici — laisse crawl_website() décider et
+    comptabiliser correctement les exclusions dans site.excluded_urls, pour
+    que le compteur soit fiable aussi bien en mode sitemap qu'en mode fallback.
+    """
     found = []
     for a in soup.find_all("a", href=True):
         href = _attr_to_str(a.get("href"))
@@ -639,10 +644,9 @@ def _discover_from_links(soup: BeautifulSoup, current_url: str, base_netloc: str
             continue
         absolute = urljoin(current_url, href)
         normalized = _normalize_url(absolute, base_netloc)
-        if normalized and not _should_exclude(normalized):
+        if normalized:
             found.append(normalized)
     return found
-
 
 def _fetch_soup_for_discovery(url: str, browser=None) -> BeautifulSoup | None:
     """
@@ -776,7 +780,14 @@ def crawl_website(url: str, max_pages: int = 30, max_depth: int = 2) -> ScrapedS
                 continue
 
             for link in _discover_from_links(soup, current_url, base_netloc):
-                if link not in visited and len(visited) < max_pages * 3:
+                if link in visited:
+                    continue
+                if _should_exclude(link):
+                    if link not in site.excluded_urls:
+                        site.excluded_urls.append(link)
+                    visited.add(link)
+                    continue
+                if len(visited) < max_pages * 3:
                     visited.add(link)
                     queue.append((link, depth + 1))
 
@@ -937,20 +948,73 @@ def aggregate_site(site: ScrapedSite, city: str | None = None, country: str | No
         page_summaries=page_summaries,
     )
 
+def _map_google_precision(location_type: str, partial_match: bool) -> str:
+    """Traduit le niveau de précision Google Geocoding vers nos 3 tiers internes."""
+    if location_type in ("ROOFTOP", "RANGE_INTERPOLATED"):
+        return "exact"
+    if location_type == "GEOMETRIC_CENTER":
+        return "street"
+    return "approximate"  # APPROXIMATE, ou résultat de type locality/ville uniquement
+
+
+def _geocode_address_google(query: str, api_key: str) -> tuple[float, float, str] | None:
+    """
+    Géocode via l'API Google Geocoding. Retourne (lat, lng, precision) ou None
+    en cas d'échec/absence de résultat. Precision : "exact" (bâtiment précis),
+    "street" (rue identifiée mais pas le numéro exact), "approximate" (ville
+    uniquement, aucune correspondance de rue trouvée).
+    """
+    try:
+        response = requests.get(
+            "https://maps.googleapis.com/maps/api/geocode/json",
+            params={"address": query, "key": api_key},
+            timeout=10,
+        )
+        if response.status_code != 200:
+            return None
+        data = response.json()
+        if data.get("status") != "OK" or not data.get("results"):
+            return None
+
+        result = data["results"][0]
+        geometry = result.get("geometry", {})
+        location = geometry.get("location", {})
+        lat, lng = location.get("lat"), location.get("lng")
+        if lat is None or lng is None:
+            return None
+
+        location_type = geometry.get("location_type", "APPROXIMATE")
+        partial_match = result.get("partial_match", False)
+        precision = _map_google_precision(location_type, partial_match)
+
+        return float(lat), float(lng), precision
+    except (requests.RequestException, ValueError, KeyError, IndexError):
+        return None
+
+
 def _geocode_address(address: str, city: str | None = None, country: str | None = None) -> tuple[float | None, float | None, str]:
     """
-    Géocode une adresse texte en (latitude, longitude, precision) via Nominatim
-    (OpenStreetMap, gratuit, pas de clé requise).
+    Géocode une adresse texte en (latitude, longitude, precision).
 
-    Stratégie en 2 temps, car la couverture OSM des adresses précises est
-    faible dans certains pays (constaté sur Madagascar : les noms de rue
-    ne remontent souvent aucun résultat, alors que la ville seule fonctionne) :
-    1. Tente l'adresse complète telle quelle → precision="exact" si trouvé.
-    2. Si échec et que city/country sont fournis, retente sur "ville, pays"
-       → precision="approximate" (centre-ville, pas l'adresse réelle).
-    Retourne (lat, lng, precision), avec precision="none" si rien n'est trouvé.
+    Priorité à Google Geocoding si GOOGLE_MAPS_API_KEY est configurée (bien
+    meilleure couverture constatée sur Madagascar : identifie au moins la rue
+    là où Nominatim ne trouve parfois rien du tout). Fallback sur Nominatim
+    (gratuit, sans clé) si Google échoue ou si aucune clé n'est configurée —
+    garde le système fonctionnel même sans configuration Google.
+
+    Retourne (lat, lng, precision), avec precision parmi :
+    "exact" (bâtiment précis), "street" (rue identifiée), "approximate"
+    (ville uniquement), "none" (rien trouvé).
     """
-    def _query(q: str) -> tuple[float, float] | None:
+    google_api_key = os.getenv("GOOGLE_MAPS_API_KEY")
+
+    if google_api_key:
+        google_result = _geocode_address_google(address, google_api_key)
+        if google_result:
+            return google_result
+
+    # Fallback Nominatim opensource ny openstreetmap ito (gratuit, sans clé) : adresse complète, puis ville/pays ( activé si manao échec ilay module google Geocoding)
+    def _query_nominatim(q: str) -> tuple[float, float] | None:
         try:
             response = requests.get(
                 "https://nominatim.openstreetmap.org/search",
@@ -967,13 +1031,13 @@ def _geocode_address(address: str, city: str | None = None, country: str | None 
         except (requests.RequestException, ValueError, KeyError, IndexError):
             return None
 
-    exact = _query(address)
+    exact = _query_nominatim(address)
     if exact:
         return exact[0], exact[1], "exact"
 
     if city or country:
         fallback_query = ", ".join(part for part in [city, country] if part)
-        approximate = _query(fallback_query)
+        approximate = _query_nominatim(fallback_query)
         if approximate:
             return approximate[0], approximate[1], "approximate"
 

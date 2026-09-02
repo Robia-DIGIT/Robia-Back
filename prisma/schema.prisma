@@ -15,7 +15,7 @@ datasource db {
 
 model User {
   id           String   @id @default(cuid())
-  name         String
+  name         String?
   email        String   @unique
   passwordHash String?  @map("password_hash")
   provider     String   @default("email")
@@ -44,6 +44,7 @@ model Organization {
   documents     Document[]
   validationLogs ValidationLog[]
   actionItems    ActionItem[]
+  locations Location[] 
   createdAt DateTime @default(now()) @map("created_at")
 
   @@map("organizations")
@@ -126,6 +127,8 @@ model Audit {
   organization   Organization @relation(fields: [organizationId], references: [id])
   websiteId      String    @map("website_id")
   website        Website   @relation(fields: [websiteId], references: [id])
+  locationId     String?   @map("location_id")
+  location       Location? @relation(fields: [locationId], references: [id])
   status         String    @default("pending") // pending | running | completed | failed
   opportunities Opportunity[]
   globalScore    Int?      @map("global_score")
@@ -143,6 +146,8 @@ model Opportunity {
   organization     Organization @relation(fields: [organizationId], references: [id])
   auditId          String   @map("audit_id")
   audit            Audit    @relation(fields: [auditId], references: [id])
+  locationId       String?  @map("location_id")
+  location         Location? @relation(fields: [locationId], references: [id])
   title            String
   description      String
   category         String?
@@ -211,4 +216,32 @@ model ActionItem {
   createdAt      DateTime  @default(now()) @map("created_at")
 
   @@map("action_items")
+}
+
+model Location {
+  id             String   @id @default(cuid())
+  organizationId String   @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  name           String   // ex: "Orange Analakely"
+  address        String?
+  city           String?
+  country        String?
+  latitude       Float?
+  longitude      Float?
+
+  // Horaires normaux + exceptions (jours fériés, fermetures ponctuelles)
+  // structure libre en JSON pour l'instant, à typer plus tard si besoin
+  openingHours   Json?    @map("opening_hours")
+
+  isPrimary      Boolean  @default(true) @map("is_primary")
+  status         String   @default("active") // active | inactive
+
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  audits         Audit[]
+  opportunities  Opportunity[]
+
+  @@map("locations")
 }
