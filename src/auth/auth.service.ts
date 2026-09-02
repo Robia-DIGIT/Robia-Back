@@ -94,7 +94,7 @@ export class AuthService {
   private buildAuthResponse(
     userId: string,
     email: string,
-    name: string,
+    name: string | null,
     company: string | null,
   ) {
     const payload = { sub: userId, email };
