@@ -22,7 +22,7 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test -- --runInBand src/app.controller.spec.ts
-      - run: npm test -- --runInBand src/auth/dto/register.dto.spec.ts
+      - run: npm test -- --runInBand src/auth/dto/register.dto.spec.ts src/auth/auth.service.spec.ts
       - run: npm test -- --runInBand src/audits/audits.service.spec.ts src/opportunities/opportunities.service.spec.ts src/organization-isolation.spec.ts
 
   python-llm-tests:
