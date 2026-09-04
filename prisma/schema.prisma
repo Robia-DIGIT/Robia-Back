@@ -45,6 +45,7 @@ model Organization {
   validationLogs ValidationLog[]
   actionItems    ActionItem[]
   locations Location[] 
+  posts     Post[]
   createdAt DateTime @default(now()) @map("created_at")
 
   @@map("organizations")
@@ -242,6 +243,28 @@ model Location {
 
   audits         Audit[]
   opportunities  Opportunity[]
+  posts          Post[]
 
   @@map("locations")
+}
+
+model Post {
+  id             String   @id @default(cuid())
+  organizationId String   @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  locationId     String   @map("location_id")
+  location       Location @relation(fields: [locationId], references: [id])
+
+  angle          String   // "Angle direct" | "Angle convivial" | "Angle opportunité"
+  content        String
+  status         String   @default("draft") // draft | scheduled | published | archived
+
+  // Contexte utilisé pour la génération (météo, horaires, mots-clés), gardé
+  // pour traçabilité — permet de comprendre a posteriori pourquoi ce post
+  // a été suggéré.
+  sourceData     Json?    @map("source_data")
+
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@map("posts")
 }

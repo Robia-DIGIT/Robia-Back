@@ -2,8 +2,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI
-from app.schemas import AuditRequest, AuditResult, SiteAuditRequest, SiteAuditResult, OpportunityRequest, GeneratedOpportunity, DocumentRequest, GeneratedDocument, ActionRequest, GeneratedAction, SiteOpportunityRequest
-from app.orchestrator import run_audit, run_site_audit, run_opportunity_generation, run_site_opportunity_generation, run_document_generation, run_action_generation
+from app.schemas import AuditRequest, AuditResult, SiteAuditRequest, SiteAuditResult, OpportunityRequest, GeneratedOpportunity, DocumentRequest, GeneratedDocument, ActionRequest, GeneratedAction, SiteOpportunityRequest, SocialPostResponse, SocialPostRequest
+from app.orchestrator import run_audit, run_site_audit, run_opportunity_generation, run_site_opportunity_generation, run_document_generation, run_action_generation, run_social_post_generation
 
 app = FastAPI(title="Robia AI Engine")
 
@@ -50,3 +50,16 @@ def actions(request: ActionRequest):
         request.opportunity_description,
     )
     return result
+
+
+@app.post("/content/social-post", response_model=SocialPostResponse)
+def generate_social_post(request: SocialPostRequest):
+    return run_social_post_generation(
+        business_name=request.business_name,
+        sector=request.sector,
+        city=request.city,
+        weather_description=request.weather_description,
+        temperature_c=request.temperature_c,
+        opening_hours_today=request.opening_hours_today,
+        top_keywords=request.top_keywords,
+    )

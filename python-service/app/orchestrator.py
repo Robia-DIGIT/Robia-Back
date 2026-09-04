@@ -3,6 +3,7 @@ from app.agents.analysis import compute_audit_result, _analyze_ai_readiness
 from app.agents.prioritization import generate_opportunities, generate_site_opportunities
 from app.agents.generation import generate_document_content
 from app.agents.action_generation import generate_actions
+from app.agents.generation import generate_document_content, generate_social_post_suggestions
 
 
 def run_audit(url: str, sector: str | None = None, city: str | None = None, country: str | None = None) -> dict:
@@ -125,3 +126,29 @@ def run_site_audit(url: str, max_pages: int = 20, max_depth: int = 2, city: str 
         "pages": pages_detail,
         "failed_urls": site.failed_urls,
     }
+
+
+def run_social_post_generation(
+    business_name: str,
+    sector: str | None,
+    city: str | None,
+    weather_description: str,
+    temperature_c: float,
+    opening_hours_today: str | None,
+    top_keywords: list[str],
+) -> dict:
+    """
+    Point d'entrée pour la génération de suggestions de post contextualisées
+    (météo + horaires + thématiques du site). Retourne un dict respectant
+    le contrat SocialPostResponse.
+    """
+    variants = generate_social_post_suggestions(
+        business_name=business_name,
+        sector=sector,
+        city=city,
+        weather_description=weather_description,
+        temperature_c=temperature_c,
+        opening_hours_today=opening_hours_today,
+        top_keywords=top_keywords,
+    )
+    return {"variants": variants}

@@ -159,3 +159,21 @@ class ActionRequest(BaseModel):
 class GeneratedAction(BaseModel):
     title: str
 
+
+class SocialPostRequest(BaseModel):
+    business_name: str
+    sector: Optional[str] = None
+    city: Optional[str] = None
+    weather_description: str
+    temperature_c: float
+    opening_hours_today: Optional[str] = None
+    top_keywords: list[str] = []
+
+
+class SocialPostVariant(BaseModel):
+    label: str
+    content: str
+
+
+class SocialPostResponse(BaseModel):
+    variants: list[SocialPostVariant]

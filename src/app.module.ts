@@ -13,6 +13,7 @@ import { ValidationLogsModule } from './validation-logs/validation-logs.module';
 import { ActionItemsModule } from './action-items/action-items.module';
 import { UsersModule } from './users/users.module';
 import { LocationsModule } from './locations/locations.module';
+import { ContentModule } from './content/content.module';
 
 @Module({
   imports: [
@@ -31,6 +32,7 @@ import { LocationsModule } from './locations/locations.module';
     ActionItemsModule,
     UsersModule,
     LocationsModule,
+    ContentModule,
   ],
   controllers: [AppController],
   providers: [AppService],

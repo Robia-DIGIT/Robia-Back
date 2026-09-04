@@ -7,5 +7,6 @@ import { LocationWeatherService } from './location-weather/location-weather.serv
 @Module({
   controllers: [LocationsController],
   providers: [LocationsService, LocationPlacesService, LocationWeatherService],
+  exports: [LocationsService],
 })
 export class LocationsModule {}
