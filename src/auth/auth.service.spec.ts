@@ -5,10 +5,11 @@ import { createHash } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthService } from './auth.service';
 import { PasswordResetMailService } from './password-reset-mail.service';
+import { N8nWebhookService } from '../integrations/n8n-webhook.service';
 
 describe('AuthService password reset', () => {
   const prisma = {
-    user: { findUnique: jest.fn(), update: jest.fn() },
+    user: { findUnique: jest.fn(), create: jest.fn(), update: jest.fn() },
     passwordResetToken: {
       findFirst: jest.fn(),
       findUnique: jest.fn(),
@@ -25,6 +26,7 @@ describe('AuthService password reset', () => {
     ),
   };
   const mail = { sendPasswordReset: jest.fn() };
+  const webhooks = { notifyUserRegistered: jest.fn() };
   let service: AuthService;
 
   beforeEach(() => {
@@ -34,13 +36,51 @@ describe('AuthService password reset', () => {
       jwt as unknown as JwtService,
       config as unknown as ConfigService,
       mail as unknown as PasswordResetMailService,
+      webhooks as unknown as N8nWebhookService,
     );
+  });
+
+  it('creates the account and schedules the welcome webhook', async () => {
+    prisma.user.findUnique.mockResolvedValue(null);
+    prisma.user.create.mockResolvedValue({
+      id: 'user-1',
+      email: 'user@example.com',
+      name: 'Landry',
+      company: 'ROBIA',
+      tokenVersion: 0,
+    });
+    jwt.sign.mockReturnValue('signed-token');
+    webhooks.notifyUserRegistered.mockResolvedValue(true);
+
+    const response = await service.register({
+      name: 'Landry',
+      company: 'ROBIA',
+      email: 'user@example.com',
+      password: 'password-2',
+    });
+
+    expect(webhooks.notifyUserRegistered).toHaveBeenCalledWith({
+      email: 'user@example.com',
+      name: 'Landry',
+      organizationName: 'ROBIA',
+    });
+    expect(response).toEqual({
+      accessToken: 'signed-token',
+      user: {
+        id: 'user-1',
+        name: 'Landry',
+        email: 'user@example.com',
+        company: 'ROBIA',
+      },
+    });
   });
 
   it('returns the same response when the email is unknown', async () => {
     prisma.user.findUnique.mockResolvedValue(null);
 
-    const response = await service.forgotPassword({ email: 'absent@example.com' });
+    const response = await service.forgotPassword({
+      email: 'absent@example.com',
+    });
 
     expect(response.message).toContain('Si un compte correspond');
     expect(mail.sendPasswordReset).not.toHaveBeenCalled();

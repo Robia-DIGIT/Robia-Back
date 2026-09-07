@@ -17,6 +17,7 @@ describe('OpportunitiesService', () => {
 
   let prisma: any;
   let generator: any;
+  let webhooks: any;
   let service: OpportunitiesService;
 
   beforeEach(() => {
@@ -31,20 +32,26 @@ describe('OpportunitiesService', () => {
         }),
       },
       opportunity: {
+        count: jest.fn().mockResolvedValue(0),
         deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
-        create: jest.fn().mockImplementation(({ data }) =>
-          Promise.resolve({ id: 'opportunity-1', ...data }),
-        ),
+        create: jest
+          .fn()
+          .mockImplementation(({ data }) =>
+            Promise.resolve({ id: 'opportunity-1', ...data }),
+          ),
       },
-      $transaction: jest.fn().mockImplementation((operations) =>
-        Promise.all(operations),
-      ),
+      $transaction: jest
+        .fn()
+        .mockImplementation((operations) => Promise.all(operations)),
     };
     generator = {
       generate: jest.fn().mockResolvedValue(generated),
       generateForSite: jest.fn().mockResolvedValue(generated),
     };
-    service = new OpportunitiesService(prisma, generator);
+    webhooks = {
+      notifyAuditCompleted: jest.fn().mockResolvedValue(true),
+    };
+    service = new OpportunitiesService(prisma, generator, webhooks);
   });
 
   it('uses attached multi-page evidence for new standard audits', async () => {
@@ -57,6 +64,12 @@ describe('OpportunitiesService', () => {
     };
     prisma.audit.findFirst.mockResolvedValue({
       id: auditId,
+      globalScore: 62,
+      completedAt: new Date('2026-09-04T21:00:00Z'),
+      website: { url: 'https://robiacopilot.site/' },
+      organization: {
+        owner: { name: 'Landry', email: 'landry@example.com' },
+      },
       resultJson: {
         global_score: 62,
         site_audit: siteAudit,
@@ -81,6 +94,15 @@ describe('OpportunitiesService', () => {
         title: generated[0].title,
       }),
     });
+    expect(webhooks.notifyAuditCompleted).toHaveBeenCalledWith({
+      auditId,
+      email: 'landry@example.com',
+      userName: 'Landry',
+      websiteUrl: 'https://robiacopilot.site/',
+      score: 62,
+      opportunities: ['Améliorer la présence locale'],
+      completedAt: new Date('2026-09-04T21:00:00Z'),
+    });
   });
 
   it('keeps the legacy single-page generator for existing audits', async () => {
@@ -90,6 +112,12 @@ describe('OpportunitiesService', () => {
     };
     prisma.audit.findFirst.mockResolvedValue({
       id: auditId,
+      globalScore: 62,
+      completedAt: new Date('2026-09-04T21:00:00Z'),
+      website: { url: 'https://robiacopilot.site/' },
+      organization: {
+        owner: { name: 'Landry', email: 'landry@example.com' },
+      },
       resultJson: legacyResult,
     });
 
@@ -100,5 +128,23 @@ describe('OpportunitiesService', () => {
       'Antananarivo',
     );
     expect(generator.generateForSite).not.toHaveBeenCalled();
+  });
+
+  it('does not send another audit email when opportunities already exist', async () => {
+    prisma.audit.findFirst.mockResolvedValue({
+      id: auditId,
+      globalScore: 62,
+      completedAt: new Date('2026-09-04T21:00:00Z'),
+      website: { url: 'https://robiacopilot.site/' },
+      organization: {
+        owner: { name: 'Landry', email: 'landry@example.com' },
+      },
+      resultJson: { global_score: 62 },
+    });
+    prisma.opportunity.count.mockResolvedValue(2);
+
+    await service.generateFromAudit(organizationId, auditId);
+
+    expect(webhooks.notifyAuditCompleted).not.toHaveBeenCalled();
   });
 });
