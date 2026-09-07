@@ -15,6 +15,7 @@ import { LoginDto } from './dto/login.dto';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
 import { PasswordResetMailService } from './password-reset-mail.service';
+import { N8nWebhookService } from '../integrations/n8n-webhook.service';
 
 const RESET_RESPONSE = {
   message:
@@ -30,6 +31,7 @@ export class AuthService {
     private readonly jwtService: JwtService,
     private readonly config: ConfigService,
     private readonly passwordResetMail: PasswordResetMailService,
+    private readonly webhooks: N8nWebhookService,
   ) {}
 
   async register(dto: RegisterDto) {
@@ -52,6 +54,19 @@ export class AuthService {
         company: dto.company,
       },
     });
+
+    void this.webhooks
+      .notifyUserRegistered({
+        email: user.email,
+        name: user.name,
+        organizationName: user.company,
+      })
+      .catch((error: unknown) => {
+        this.logger.warn(
+          'Le webhook d’inscription n’a pas pu être planifié',
+          error instanceof Error ? error.message : undefined,
+        );
+      });
 
     return this.buildAuthResponse(
       user.id,

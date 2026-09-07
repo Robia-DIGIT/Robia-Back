@@ -14,7 +14,9 @@ describe('Organization isolation', () => {
   it('derives the organization from the authenticated user and replaces client input', async () => {
     const prisma = {
       organization: {
-        findFirst: jest.fn().mockResolvedValue({ id: requestingOrganizationId }),
+        findFirst: jest
+          .fn()
+          .mockResolvedValue({ id: requestingOrganizationId }),
       },
     };
     const request = {
@@ -97,7 +99,11 @@ describe('Organization isolation', () => {
     const prisma = {
       opportunity: { findFirst: jest.fn().mockResolvedValue(null) },
     };
-    const service = new OpportunitiesService(prisma as any, {} as any);
+    const service = new OpportunitiesService(
+      prisma as any,
+      {} as any,
+      {} as any,
+    );
 
     await expect(
       service.findOne(requestingOrganizationId, 'opportunity-org-b'),

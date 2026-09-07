@@ -13,6 +13,8 @@ import { ValidationLogsModule } from './validation-logs/validation-logs.module';
 import { ActionItemsModule } from './action-items/action-items.module';
 import { UsersModule } from './users/users.module';
 import { LocationsModule } from './locations/locations.module';
+import { IntegrationsModule } from './integrations/integrations.module';
+import { ProspectsModule } from './prospects/prospects.module';
 
 @Module({
   imports: [
@@ -21,6 +23,7 @@ import { LocationsModule } from './locations/locations.module';
       envFilePath: '.env',
     }),
     PrismaModule,
+    IntegrationsModule,
     AuthModule,
     OrganizationsModule,
     WebsitesModule,
@@ -31,6 +34,7 @@ import { LocationsModule } from './locations/locations.module';
     ActionItemsModule,
     UsersModule,
     LocationsModule,
+    ProspectsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

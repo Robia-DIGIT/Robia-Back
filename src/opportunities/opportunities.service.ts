@@ -1,17 +1,25 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { OpportunityGeneratorService } from './opportunity-generator/opportunity-generator.service';
+import { N8nWebhookService } from '../integrations/n8n-webhook.service';
 
 @Injectable()
 export class OpportunitiesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly generator: OpportunityGeneratorService,
+    private readonly webhooks: N8nWebhookService,
   ) {}
 
   async generateFromAudit(organizationId: string, auditId: string) {
     const audit = await this.prisma.audit.findFirst({
       where: { id: auditId, organizationId, status: 'completed' },
+      include: {
+        website: { select: { url: true } },
+        organization: {
+          select: { owner: { select: { name: true, email: true } } },
+        },
+      },
     });
 
     if (!audit) {
@@ -41,13 +49,17 @@ export class OpportunitiesService {
         })
       : await this.generator.generate(auditResult, organization?.city);
 
+    const existingOpportunityCount = await this.prisma.opportunity.count({
+      where: { auditId: audit.id },
+    });
+
     // On supprime les anciennes opportunités liées à cet audit avant d'en générer de nouvelles
     // (évite l'accumulation si on relance la génération plusieurs fois sur le même audit)
     await this.prisma.opportunity.deleteMany({
       where: { auditId: audit.id },
     });
 
-    return this.prisma.$transaction(
+    const opportunities = await this.prisma.$transaction(
       generated.map((opp) =>
         this.prisma.opportunity.create({
           data: {
@@ -65,6 +77,24 @@ export class OpportunitiesService {
         }),
       ),
     );
+
+    if (existingOpportunityCount === 0) {
+      const scoreCandidate = audit.globalScore ?? auditResult?.global_score;
+      const score = Number(scoreCandidate);
+      void this.webhooks
+        .notifyAuditCompleted({
+          auditId: audit.id,
+          email: audit.organization.owner.email,
+          userName: audit.organization.owner.name,
+          websiteUrl: audit.website.url,
+          score: Number.isFinite(score) ? score : null,
+          opportunities: opportunities.map((opportunity) => opportunity.title),
+          completedAt: audit.completedAt ?? new Date(),
+        })
+        .catch(() => undefined);
+    }
+
+    return opportunities;
   }
 
   async generateFromSiteAudit(organizationId: string, auditId: string) {
