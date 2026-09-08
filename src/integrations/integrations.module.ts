@@ -1,9 +1,12 @@
 import { Global, Module } from '@nestjs/common';
 import { N8nWebhookService } from './n8n-webhook.service';
+import { GoogleSearchConsoleController } from './google-search-console.controller';
+import { GoogleSearchConsoleService } from './google-search-console.service';
 
 @Global()
 @Module({
-  providers: [N8nWebhookService],
-  exports: [N8nWebhookService],
+  controllers: [GoogleSearchConsoleController],
+  providers: [N8nWebhookService, GoogleSearchConsoleService],
+  exports: [N8nWebhookService, GoogleSearchConsoleService],
 })
 export class IntegrationsModule {}
