@@ -34,6 +34,9 @@ describe('OpportunitiesService', () => {
       opportunity: {
         count: jest.fn().mockResolvedValue(0),
         deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
+        findFirst: jest.fn(),
+        findMany: jest.fn().mockResolvedValue([]),
+        update: jest.fn(),
         create: jest
           .fn()
           .mockImplementation(({ data }) =>
@@ -84,9 +87,6 @@ describe('OpportunitiesService', () => {
       country: 'Madagascar',
     });
     expect(generator.generate).not.toHaveBeenCalled();
-    expect(prisma.opportunity.deleteMany).toHaveBeenCalledWith({
-      where: { auditId },
-    });
     expect(prisma.opportunity.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
         organizationId,
@@ -142,9 +142,39 @@ describe('OpportunitiesService', () => {
       resultJson: { global_score: 62 },
     });
     prisma.opportunity.count.mockResolvedValue(2);
+    prisma.opportunity.findMany.mockResolvedValue([
+      { id: 'existing-opportunity', auditId },
+    ]);
 
-    await service.generateFromAudit(organizationId, auditId);
+    await expect(
+      service.generateFromAudit(organizationId, auditId),
+    ).resolves.toEqual([{ id: 'existing-opportunity', auditId }]);
 
     expect(webhooks.notifyAuditCompleted).not.toHaveBeenCalled();
+    expect(generator.generate).not.toHaveBeenCalled();
+    expect(generator.generateForSite).not.toHaveBeenCalled();
+    expect(prisma.opportunity.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it('persists a status change only after checking organization ownership', async () => {
+    prisma.opportunity.findFirst.mockResolvedValue({
+      id: 'opportunity-1',
+      organizationId,
+    });
+    prisma.opportunity.update.mockResolvedValue({
+      id: 'opportunity-1',
+      status: 'done',
+    });
+
+    await expect(
+      service.updateStatus(organizationId, 'opportunity-1', 'done'),
+    ).resolves.toEqual({ id: 'opportunity-1', status: 'done' });
+    expect(prisma.opportunity.findFirst).toHaveBeenCalledWith({
+      where: { id: 'opportunity-1', organizationId },
+    });
+    expect(prisma.opportunity.update).toHaveBeenCalledWith({
+      where: { id: 'opportunity-1' },
+      data: { status: 'done' },
+    });
   });
 });
