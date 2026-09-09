@@ -10,16 +10,22 @@ export class ActionItemsService {
     private readonly generator: ActionGeneratorService,
   ) {}
 
-  async generateFromOpportunity(
-    organizationId: string,
-    opportunityId: string,
-  ) {
+  async generateFromOpportunity(organizationId: string, opportunityId: string) {
     const opportunity = await this.prisma.opportunity.findFirst({
       where: { id: opportunityId, organizationId },
     });
 
     if (!opportunity) {
       throw new NotFoundException('Opportunité non trouvée');
+    }
+
+    const existing = await this.prisma.actionItem.findMany({
+      where: { organizationId, opportunityId: opportunity.id },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    if (existing.length > 0) {
+      return existing;
     }
 
     const generated = await this.generator.generateFromOpportunity(
@@ -41,9 +47,12 @@ export class ActionItemsService {
     );
   }
 
-  async findAll(organizationId: string) {
+  async findAll(organizationId: string, websiteId?: string) {
     return this.prisma.actionItem.findMany({
-      where: { organizationId },
+      where: {
+        organizationId,
+        ...(websiteId ? { opportunity: { audit: { websiteId } } } : {}),
+      },
       orderBy: { createdAt: 'desc' },
     });
   }
@@ -67,12 +76,15 @@ export class ActionItemsService {
     });
   }
 
-  async getActionsForExport(organizationId: string) {
+  async getActionsForExport(organizationId: string, websiteId?: string) {
     return this.prisma.actionItem.findMany({
-      where: { organizationId },
-        orderBy: { createdAt: 'desc' },
-        select: { title: true, status: true, dueDate: true },
-  });
+      where: {
+        organizationId,
+        ...(websiteId ? { opportunity: { audit: { websiteId } } } : {}),
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { title: true, status: true, dueDate: true },
+    });
   }
 
   async generatePlan(organizationId: string) {
@@ -91,8 +103,10 @@ export class ActionItemsService {
 
     // Priorité : fort impact, faible effort en premier (quick wins)
     const sorted = actions.sort((a, b) => {
-      const scoreA = (a.opportunity?.impactScore ?? 5) - (a.opportunity?.effortScore ?? 3);
-      const scoreB = (b.opportunity?.impactScore ?? 5) - (b.opportunity?.effortScore ?? 3);
+      const scoreA =
+        (a.opportunity?.impactScore ?? 5) - (a.opportunity?.effortScore ?? 3);
+      const scoreB =
+        (b.opportunity?.impactScore ?? 5) - (b.opportunity?.effortScore ?? 3);
       return scoreB - scoreA;
     });
 
@@ -101,7 +115,9 @@ export class ActionItemsService {
 
     const updates = sorted.map((action, index) => {
       const dueDate = new Date();
-      dueDate.setDate(dueDate.getDate() + Math.min(index * intervalDays, daysSpan));
+      dueDate.setDate(
+        dueDate.getDate() + Math.min(index * intervalDays, daysSpan),
+      );
 
       return this.prisma.actionItem.update({
         where: { id: action.id },

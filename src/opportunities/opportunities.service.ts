@@ -33,6 +33,16 @@ export class OpportunitiesService {
       select: { city: true, country: true },
     });
 
+    const existingOpportunityCount = await this.prisma.opportunity.count({
+      where: { auditId: audit.id },
+    });
+
+    // La génération est idempotente : les opportunités peuvent déjà avoir des
+    // actions, documents et validations liés qu'une régénération détruirait.
+    if (existingOpportunityCount > 0) {
+      return this.findAllForAudit(organizationId, audit.id);
+    }
+
     const auditResult = audit.resultJson as Record<string, any>;
     const siteAuditResult = auditResult?.site_audit;
     const hasSiteEvidence =
@@ -48,16 +58,6 @@ export class OpportunitiesService {
           country: organization?.country,
         })
       : await this.generator.generate(auditResult, organization?.city);
-
-    const existingOpportunityCount = await this.prisma.opportunity.count({
-      where: { auditId: audit.id },
-    });
-
-    // On supprime les anciennes opportunités liées à cet audit avant d'en générer de nouvelles
-    // (évite l'accumulation si on relance la génération plusieurs fois sur le même audit)
-    await this.prisma.opportunity.deleteMany({
-      where: { auditId: audit.id },
-    });
 
     const opportunities = await this.prisma.$transaction(
       generated.map((opp) =>
@@ -78,21 +78,19 @@ export class OpportunitiesService {
       ),
     );
 
-    if (existingOpportunityCount === 0) {
-      const scoreCandidate = audit.globalScore ?? auditResult?.global_score;
-      const score = Number(scoreCandidate);
-      void this.webhooks
-        .notifyAuditCompleted({
-          auditId: audit.id,
-          email: audit.organization.owner.email,
-          userName: audit.organization.owner.name,
-          websiteUrl: audit.website.url,
-          score: Number.isFinite(score) ? score : null,
-          opportunities: opportunities.map((opportunity) => opportunity.title),
-          completedAt: audit.completedAt ?? new Date(),
-        })
-        .catch(() => undefined);
-    }
+    const scoreCandidate = audit.globalScore ?? auditResult?.global_score;
+    const score = Number(scoreCandidate);
+    void this.webhooks
+      .notifyAuditCompleted({
+        auditId: audit.id,
+        email: audit.organization.owner.email,
+        userName: audit.organization.owner.name,
+        websiteUrl: audit.website.url,
+        score: Number.isFinite(score) ? score : null,
+        opportunities: opportunities.map((opportunity) => opportunity.title),
+        completedAt: audit.completedAt ?? new Date(),
+      })
+      .catch(() => undefined);
 
     return opportunities;
   }
@@ -108,6 +106,14 @@ export class OpportunitiesService {
       );
     }
 
+    const existingOpportunityCount = await this.prisma.opportunity.count({
+      where: { auditId: audit.id },
+    });
+
+    if (existingOpportunityCount > 0) {
+      return this.findAllForAudit(organizationId, audit.id);
+    }
+
     const organization = await this.prisma.organization.findUnique({
       where: { id: organizationId },
       select: { city: true, country: true },
@@ -117,12 +123,6 @@ export class OpportunitiesService {
       siteAuditResult: audit.resultJson as Record<string, any>,
       city: organization?.city,
       country: organization?.country,
-    });
-
-    // Même logique de remplacement que generateFromAudit() : on évite
-    // l'accumulation si la génération est relancée sur le même audit.
-    await this.prisma.opportunity.deleteMany({
-      where: { auditId: audit.id },
     });
 
     return this.prisma.$transaction(
@@ -163,5 +163,18 @@ export class OpportunitiesService {
     }
 
     return opportunity;
+  }
+
+  async updateStatus(
+    organizationId: string,
+    opportunityId: string,
+    status: 'open' | 'in_progress' | 'done' | 'ignored',
+  ) {
+    await this.findOne(organizationId, opportunityId);
+
+    return this.prisma.opportunity.update({
+      where: { id: opportunityId },
+      data: { status },
+    });
   }
 }
