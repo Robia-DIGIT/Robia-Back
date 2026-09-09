@@ -5,6 +5,7 @@ import { GoogleSearchConsoleService } from './google-search-console.service';
 
 describe('GoogleSearchConsoleService', () => {
   const scope = 'https://www.googleapis.com/auth/webmasters.readonly';
+  const analyticsScope = 'https://www.googleapis.com/auth/analytics.readonly';
   const values: Record<string, string> = {
     GOOGLE_OAUTH_CLIENT_ID: 'client.apps.googleusercontent.com',
     GOOGLE_OAUTH_CLIENT_SECRET: 'client-secret',
@@ -46,14 +47,17 @@ describe('GoogleSearchConsoleService', () => {
     const url = new URL(service.getAuthorizationUrl('org-1', 'user-1'));
 
     expect(url.origin).toBe('https://accounts.google.com');
-    expect(url.searchParams.get('client_id')).toBe(values.GOOGLE_OAUTH_CLIENT_ID);
+    expect(url.searchParams.get('client_id')).toBe(
+      values.GOOGLE_OAUTH_CLIENT_ID,
+    );
     expect(url.searchParams.get('redirect_uri')).toBe(
       values.GOOGLE_OAUTH_REDIRECT_URI,
     );
     expect(url.searchParams.get('scope')?.split(' ')).toEqual(
-      expect.arrayContaining(['openid', 'email', scope]),
+      expect.arrayContaining(['openid', 'email', scope, analyticsScope]),
     );
     expect(url.searchParams.get('access_type')).toBe('offline');
+    expect(url.searchParams.get('include_granted_scopes')).toBe('true');
     expect(url.searchParams.get('state')).toMatch(/^[^.]+\.[^.]+$/);
   });
 
@@ -61,9 +65,9 @@ describe('GoogleSearchConsoleService', () => {
     const url = new URL(service.getAuthorizationUrl('org-1', 'user-1'));
     const state = `${url.searchParams.get('state')}x`;
 
-    await expect(service.completeAuthorization('code', state)).rejects.toBeInstanceOf(
-      UnauthorizedException,
-    );
+    await expect(
+      service.completeAuthorization('code', state),
+    ).rejects.toBeInstanceOf(UnauthorizedException);
     expect(prisma.organization.findFirst).not.toHaveBeenCalled();
   });
 
@@ -73,12 +77,14 @@ describe('GoogleSearchConsoleService', () => {
     ).searchParams.get('state')!;
     prisma.organization.findFirst.mockResolvedValue({ id: 'org-1' });
     prisma.googleSearchConsoleConnection.findUnique.mockResolvedValue(null);
-    prisma.googleSearchConsoleConnection.upsert.mockResolvedValue({ id: 'connection-1' });
+    prisma.googleSearchConsoleConnection.upsert.mockResolvedValue({
+      id: 'connection-1',
+    });
     const responses = [
       {
         access_token: 'access-token',
         refresh_token: 'refresh-token-never-store-in-clear',
-        scope: `openid email ${scope}`,
+        scope: `openid email ${scope} ${analyticsScope}`,
       },
       { email: 'owner@example.com' },
       {
@@ -96,11 +102,14 @@ describe('GoogleSearchConsoleService', () => {
       json: async () => responses.shift(),
     })) as unknown as typeof fetch;
 
-    await expect(service.completeAuthorization('code', state)).resolves.toEqual({
-      connected: true,
-    });
+    await expect(service.completeAuthorization('code', state)).resolves.toEqual(
+      {
+        connected: true,
+      },
+    );
 
-    const data = prisma.googleSearchConsoleConnection.upsert.mock.calls[0][0].create;
+    const data =
+      prisma.googleSearchConsoleConnection.upsert.mock.calls[0][0].create;
     expect(data.organizationId).toBe('org-1');
     expect(data.googleAccountEmail).toBe('owner@example.com');
     expect(data.selectedSiteUrl).toBe('sc-domain:robiacopilot.site');
@@ -112,7 +121,9 @@ describe('GoogleSearchConsoleService', () => {
 
   it('returns a token-free disconnected status and deletes only one organization', async () => {
     prisma.googleSearchConsoleConnection.findUnique.mockResolvedValue(null);
-    prisma.googleSearchConsoleConnection.deleteMany.mockResolvedValue({ count: 1 });
+    prisma.googleSearchConsoleConnection.deleteMany.mockResolvedValue({
+      count: 1,
+    });
 
     await expect(service.getStatus('org-1')).resolves.toEqual(
       expect.objectContaining({ connected: false }),
@@ -120,7 +131,9 @@ describe('GoogleSearchConsoleService', () => {
     await expect(service.disconnect('org-1')).resolves.toEqual({
       disconnected: true,
     });
-    expect(prisma.googleSearchConsoleConnection.deleteMany).toHaveBeenCalledWith({
+    expect(
+      prisma.googleSearchConsoleConnection.deleteMany,
+    ).toHaveBeenCalledWith({
       where: { organizationId: 'org-1' },
     });
   });
