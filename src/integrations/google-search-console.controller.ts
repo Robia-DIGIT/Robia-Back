@@ -14,6 +14,7 @@ import type { Request as ExpressRequest } from 'express';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { OrgScopeGuard } from '../common/guards/org-scope.guard';
 import { SelectSearchConsoleSiteDto } from './dto/select-search-console-site.dto';
+import { SelectGoogleAnalyticsPropertyDto } from './dto/select-google-analytics-property.dto';
 import { GoogleSearchConsoleService } from './google-search-console.service';
 
 interface ScopedRequest extends ExpressRequest {
@@ -79,10 +80,14 @@ export class GoogleSearchConsoleController {
       path: OAUTH_CALLBACK_PATH,
     });
     if (!state || !browserState || state !== browserState) {
-      return response.redirect(this.searchConsole.getDashboardRedirect('error'));
+      return response.redirect(
+        this.searchConsole.getDashboardRedirect('error'),
+      );
     }
     if (oauthError) {
-      return response.redirect(this.searchConsole.getDashboardRedirect('denied'));
+      return response.redirect(
+        this.searchConsole.getDashboardRedirect('denied'),
+      );
     }
     try {
       await this.searchConsole.completeAuthorization(code ?? '', state ?? '');
@@ -90,7 +95,9 @@ export class GoogleSearchConsoleController {
         this.searchConsole.getDashboardRedirect('connected'),
       );
     } catch {
-      return response.redirect(this.searchConsole.getDashboardRedirect('error'));
+      return response.redirect(
+        this.searchConsole.getDashboardRedirect('error'),
+      );
     }
   }
 
@@ -119,6 +126,30 @@ export class GoogleSearchConsoleController {
   @UseGuards(JwtAuthGuard, OrgScopeGuard)
   performance(@Req() request: ScopedRequest) {
     return this.searchConsole.getPerformance(request.organizationId);
+  }
+
+  @Get('analytics/properties')
+  @UseGuards(JwtAuthGuard, OrgScopeGuard)
+  analyticsProperties(@Req() request: ScopedRequest) {
+    return this.searchConsole.listAnalyticsProperties(request.organizationId);
+  }
+
+  @Post('analytics/property')
+  @UseGuards(JwtAuthGuard, OrgScopeGuard)
+  selectAnalyticsProperty(
+    @Req() request: ScopedRequest,
+    @Body() dto: SelectGoogleAnalyticsPropertyDto,
+  ) {
+    return this.searchConsole.selectAnalyticsProperty(
+      request.organizationId,
+      dto.propertyId,
+    );
+  }
+
+  @Get('analytics/performance')
+  @UseGuards(JwtAuthGuard, OrgScopeGuard)
+  analyticsPerformance(@Req() request: ScopedRequest) {
+    return this.searchConsole.getAnalyticsPerformance(request.organizationId);
   }
 
   @Delete()

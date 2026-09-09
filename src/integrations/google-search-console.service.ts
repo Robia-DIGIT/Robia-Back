@@ -19,6 +19,7 @@ import { PrismaService } from '../prisma/prisma.service';
 
 const SEARCH_CONSOLE_SCOPE =
   'https://www.googleapis.com/auth/webmasters.readonly';
+const ANALYTICS_SCOPE = 'https://www.googleapis.com/auth/analytics.readonly';
 const STATE_MAX_AGE_MS = 10 * 60 * 1000;
 
 interface OAuthState {
@@ -61,6 +62,36 @@ interface SearchAnalyticsResponse {
   rows?: SearchAnalyticsRow[];
 }
 
+interface AnalyticsPropertySummary {
+  property?: string;
+  displayName?: string;
+  propertyType?: string;
+}
+
+interface AnalyticsAccountSummary {
+  account?: string;
+  displayName?: string;
+  propertySummaries?: AnalyticsPropertySummary[];
+}
+
+interface AnalyticsAccountSummariesResponse {
+  accountSummaries?: AnalyticsAccountSummary[];
+  nextPageToken?: string;
+}
+
+interface AnalyticsValue {
+  value?: string;
+}
+
+interface AnalyticsReportRow {
+  dimensionValues?: AnalyticsValue[];
+  metricValues?: AnalyticsValue[];
+}
+
+interface AnalyticsReportResponse {
+  rows?: AnalyticsReportRow[];
+}
+
 @Injectable()
 export class GoogleSearchConsoleService {
   private readonly logger = new Logger(GoogleSearchConsoleService.name);
@@ -77,9 +108,10 @@ export class GoogleSearchConsoleService {
     url.searchParams.set('response_type', 'code');
     url.searchParams.set(
       'scope',
-      ['openid', 'email', SEARCH_CONSOLE_SCOPE].join(' '),
+      ['openid', 'email', SEARCH_CONSOLE_SCOPE, ANALYTICS_SCOPE].join(' '),
     );
     url.searchParams.set('access_type', 'offline');
+    url.searchParams.set('include_granted_scopes', 'true');
     url.searchParams.set('prompt', 'consent');
     url.searchParams.set(
       'state',
@@ -116,10 +148,17 @@ export class GoogleSearchConsoleService {
         "L'autorisation Search Console en lecture seule est absente.",
       );
     }
+    if (!tokens.scope?.split(' ').includes(ANALYTICS_SCOPE)) {
+      throw new UnauthorizedException(
+        "L'autorisation Google Analytics en lecture seule est absente.",
+      );
+    }
 
-    const existing = await this.prisma.googleSearchConsoleConnection.findUnique({
-      where: { organizationId: organization.id },
-    });
+    const existing = await this.prisma.googleSearchConsoleConnection.findUnique(
+      {
+        where: { organizationId: organization.id },
+      },
+    );
     const encryptedRefreshToken = tokens.refresh_token
       ? this.encrypt(tokens.refresh_token)
       : existing?.encryptedRefreshToken;
@@ -147,12 +186,14 @@ export class GoogleSearchConsoleService {
         organizationId: organization.id,
         googleAccountEmail: userInfo.email ?? null,
         encryptedRefreshToken,
+        grantedScopes: tokens.scope ?? null,
         selectedSiteUrl: selectedSite?.siteUrl ?? null,
         permissionLevel: selectedSite?.permissionLevel ?? null,
       },
       update: {
         googleAccountEmail: userInfo.email ?? null,
         encryptedRefreshToken,
+        grantedScopes: tokens.scope ?? null,
         selectedSiteUrl: selectedSite?.siteUrl ?? null,
         permissionLevel: selectedSite?.permissionLevel ?? null,
         connectedAt: new Date(),
@@ -163,19 +204,39 @@ export class GoogleSearchConsoleService {
   }
 
   async getStatus(organizationId: string) {
-    const connection = await this.prisma.googleSearchConsoleConnection.findUnique({
-      where: { organizationId },
-      select: {
-        googleAccountEmail: true,
-        selectedSiteUrl: true,
-        permissionLevel: true,
-        connectedAt: true,
-        lastSyncedAt: true,
-      },
-    });
+    const connection =
+      await this.prisma.googleSearchConsoleConnection.findUnique({
+        where: { organizationId },
+        select: {
+          googleAccountEmail: true,
+          selectedSiteUrl: true,
+          permissionLevel: true,
+          connectedAt: true,
+          lastSyncedAt: true,
+          lastAnalyticsSyncedAt: true,
+          selectedAnalyticsPropertyId: true,
+          selectedAnalyticsPropertyName: true,
+          grantedScopes: true,
+        },
+      });
 
     return connection
-      ? { connected: true, ...connection }
+      ? {
+          connected: true,
+          googleAccountEmail: connection.googleAccountEmail,
+          selectedSiteUrl: connection.selectedSiteUrl,
+          permissionLevel: connection.permissionLevel,
+          connectedAt: connection.connectedAt,
+          lastSyncedAt: connection.lastSyncedAt,
+          selectedAnalyticsPropertyId: connection.selectedAnalyticsPropertyId,
+          selectedAnalyticsPropertyName:
+            connection.selectedAnalyticsPropertyName,
+          lastAnalyticsSyncedAt: connection.lastAnalyticsSyncedAt,
+          analyticsAuthorized: this.hasScope(
+            connection.grantedScopes,
+            ANALYTICS_SCOPE,
+          ),
+        }
       : {
           connected: false,
           googleAccountEmail: null,
@@ -183,13 +244,144 @@ export class GoogleSearchConsoleService {
           permissionLevel: null,
           connectedAt: null,
           lastSyncedAt: null,
+          selectedAnalyticsPropertyId: null,
+          selectedAnalyticsPropertyName: null,
+          lastAnalyticsSyncedAt: null,
+          analyticsAuthorized: false,
         };
   }
 
-  async listSites(organizationId: string) {
-    const { connection, accessToken } = await this.authorizedConnection(
-      organizationId,
+  async listAnalyticsProperties(organizationId: string) {
+    const { connection, accessToken } =
+      await this.authorizedConnection(organizationId);
+    this.requireAnalyticsScope(connection.grantedScopes);
+    const properties = await this.fetchAnalyticsProperties(accessToken);
+    return properties.map((property) => ({
+      ...property,
+      selected: property.propertyId === connection.selectedAnalyticsPropertyId,
+    }));
+  }
+
+  async selectAnalyticsProperty(organizationId: string, propertyId: string) {
+    const normalizedId = propertyId.trim();
+    const { connection, accessToken } =
+      await this.authorizedConnection(organizationId);
+    this.requireAnalyticsScope(connection.grantedScopes);
+    const property = (await this.fetchAnalyticsProperties(accessToken)).find(
+      (candidate) => candidate.propertyId === normalizedId,
     );
+    if (!property) {
+      throw new BadRequestException(
+        "Cette propriété Google Analytics n'est pas accessible avec ce compte.",
+      );
+    }
+    await this.prisma.googleSearchConsoleConnection.update({
+      where: { organizationId },
+      data: {
+        selectedAnalyticsPropertyId: property.propertyId,
+        selectedAnalyticsPropertyName: property.displayName,
+      },
+    });
+    return property;
+  }
+
+  async getAnalyticsPerformance(organizationId: string) {
+    const { connection, accessToken } =
+      await this.authorizedConnection(organizationId);
+    this.requireAnalyticsScope(connection.grantedScopes);
+    if (!connection.selectedAnalyticsPropertyId) {
+      throw new BadRequestException(
+        "Sélectionnez d'abord une propriété Google Analytics.",
+      );
+    }
+
+    const endDate = new Date();
+    endDate.setUTCHours(0, 0, 0, 0);
+    endDate.setUTCDate(endDate.getUTCDate() - 1);
+    const startDate = new Date(endDate);
+    startDate.setUTCDate(startDate.getUTCDate() - 27);
+    const period = {
+      startDate: this.formatDate(startDate),
+      endDate: this.formatDate(endDate),
+    };
+    const dateRanges = [
+      { startDate: period.startDate, endDate: period.endDate },
+    ];
+    const propertyId = connection.selectedAnalyticsPropertyId;
+    const [summaryResponse, dailyResponse, pagesResponse] = await Promise.all([
+      this.runAnalyticsReport(accessToken, propertyId, {
+        dateRanges,
+        metrics: [
+          { name: 'activeUsers' },
+          { name: 'totalUsers' },
+          { name: 'sessions' },
+          { name: 'screenPageViews' },
+          { name: 'engagementRate' },
+        ],
+      }),
+      this.runAnalyticsReport(accessToken, propertyId, {
+        dateRanges,
+        dimensions: [{ name: 'date' }],
+        metrics: [
+          { name: 'activeUsers' },
+          { name: 'sessions' },
+          { name: 'screenPageViews' },
+        ],
+        orderBys: [{ dimension: { dimensionName: 'date' } }],
+        limit: '100',
+      }),
+      this.runAnalyticsReport(accessToken, propertyId, {
+        dateRanges,
+        dimensions: [{ name: 'pagePathPlusQueryString' }],
+        metrics: [
+          { name: 'screenPageViews' },
+          { name: 'activeUsers' },
+          { name: 'sessions' },
+        ],
+        orderBys: [{ metric: { metricName: 'screenPageViews' }, desc: true }],
+        limit: '10',
+      }),
+    ]);
+    const summaryValues = summaryResponse.rows?.[0]?.metricValues ?? [];
+    const numberAt = (values: AnalyticsValue[], index: number) =>
+      Number(values[index]?.value ?? 0);
+    const daily = (dailyResponse.rows ?? []).map((row) => ({
+      date: this.analyticsDate(row.dimensionValues?.[0]?.value ?? ''),
+      activeUsers: numberAt(row.metricValues ?? [], 0),
+      sessions: numberAt(row.metricValues ?? [], 1),
+      views: numberAt(row.metricValues ?? [], 2),
+    }));
+    const topPages = (pagesResponse.rows ?? []).map((row) => ({
+      path: row.dimensionValues?.[0]?.value ?? '',
+      views: numberAt(row.metricValues ?? [], 0),
+      activeUsers: numberAt(row.metricValues ?? [], 1),
+      sessions: numberAt(row.metricValues ?? [], 2),
+    }));
+    const syncedAt = new Date();
+    await this.prisma.googleSearchConsoleConnection.update({
+      where: { id: connection.id },
+      data: { lastAnalyticsSyncedAt: syncedAt },
+    });
+    return {
+      propertyId,
+      propertyName: connection.selectedAnalyticsPropertyName,
+      ...period,
+      summary: {
+        activeUsers: numberAt(summaryValues, 0),
+        totalUsers: numberAt(summaryValues, 1),
+        sessions: numberAt(summaryValues, 2),
+        views: numberAt(summaryValues, 3),
+        engagementRate: numberAt(summaryValues, 4),
+      },
+      daily,
+      topPages,
+      lastSyncedAt: syncedAt,
+    };
+  }
+
+  async listSites(organizationId: string) {
+    const { connection, accessToken } =
+      await this.authorizedConnection(organizationId);
     const sites = this.selectableSites(await this.fetchSites(accessToken));
     return sites.map((site) => ({
       ...site,
@@ -216,13 +408,15 @@ export class GoogleSearchConsoleService {
         permissionLevel: site.permissionLevel,
       },
     });
-    return { selectedSiteUrl: site.siteUrl, permissionLevel: site.permissionLevel };
+    return {
+      selectedSiteUrl: site.siteUrl,
+      permissionLevel: site.permissionLevel,
+    };
   }
 
   async getPerformance(organizationId: string) {
-    const { connection, accessToken } = await this.authorizedConnection(
-      organizationId,
-    );
+    const { connection, accessToken } =
+      await this.authorizedConnection(organizationId);
     if (!connection.selectedSiteUrl) {
       throw new BadRequestException(
         "Sélectionnez d'abord une propriété Search Console.",
@@ -317,9 +511,10 @@ export class GoogleSearchConsoleService {
   }
 
   private async authorizedConnection(organizationId: string) {
-    const connection = await this.prisma.googleSearchConsoleConnection.findUnique({
-      where: { organizationId },
-    });
+    const connection =
+      await this.prisma.googleSearchConsoleConnection.findUnique({
+        where: { organizationId },
+      });
     if (!connection) {
       throw new NotFoundException("Search Console n'est pas connecté.");
     }
@@ -406,6 +601,63 @@ export class GoogleSearchConsoleService {
     return (await response.json()) as SearchAnalyticsResponse;
   }
 
+  private async fetchAnalyticsProperties(accessToken: string) {
+    const properties: Array<{
+      propertyId: string;
+      displayName: string;
+      accountName: string;
+      propertyType: string;
+    }> = [];
+    let pageToken: string | undefined;
+    do {
+      const url = new URL(
+        'https://analyticsadmin.googleapis.com/v1beta/accountSummaries',
+      );
+      url.searchParams.set('pageSize', '200');
+      if (pageToken) url.searchParams.set('pageToken', pageToken);
+      const response = await this.googleRequest(
+        url.toString(),
+        { headers: { Authorization: `Bearer ${accessToken}` } },
+        'liste des propriétés Analytics',
+      );
+      const body = (await response.json()) as AnalyticsAccountSummariesResponse;
+      for (const account of body.accountSummaries ?? []) {
+        for (const property of account.propertySummaries ?? []) {
+          const propertyId = property.property?.replace(/^properties\//, '');
+          if (!propertyId || !/^\d+$/.test(propertyId)) continue;
+          properties.push({
+            propertyId,
+            displayName: property.displayName || `Propriété ${propertyId}`,
+            accountName: account.displayName || account.account || '',
+            propertyType: property.propertyType || '',
+          });
+        }
+      }
+      pageToken = body.nextPageToken;
+    } while (pageToken);
+    return properties;
+  }
+
+  private async runAnalyticsReport(
+    accessToken: string,
+    propertyId: string,
+    body: Record<string, unknown>,
+  ) {
+    const response = await this.googleRequest(
+      `https://analyticsdata.googleapis.com/v1beta/properties/${encodeURIComponent(propertyId)}:runReport`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      },
+      'données Analytics',
+    );
+    return (await response.json()) as AnalyticsReportResponse;
+  }
+
   private async googleRequest(
     url: string,
     init: RequestInit,
@@ -416,14 +668,16 @@ export class GoogleSearchConsoleService {
     try {
       const response = await fetch(url, { ...init, signal: controller.signal });
       if (!response.ok) {
-        this.logger.warn(`Google ${operation} refusé : HTTP ${response.status}`);
+        this.logger.warn(
+          `Google ${operation} refusé : HTTP ${response.status}`,
+        );
         if (response.status === 401 || response.status === 403) {
           throw new UnauthorizedException(
-            'Google a refusé cette autorisation. Reconnectez Search Console.',
+            'Google a refusé cette autorisation. Reconnectez votre compte Google.',
           );
         }
         throw new BadGatewayException(
-          `Google Search Console est temporairement indisponible (${response.status}).`,
+          `Le service Google est temporairement indisponible (${response.status}).`,
         );
       }
       return response;
@@ -436,7 +690,7 @@ export class GoogleSearchConsoleService {
       }
       this.logger.warn(`Google ${operation} inaccessible`);
       throw new BadGatewayException(
-        'Google Search Console est temporairement inaccessible.',
+        'Le service Google est temporairement inaccessible.',
       );
     } finally {
       clearTimeout(timeout);
@@ -452,6 +706,18 @@ export class GoogleSearchConsoleService {
     );
   }
 
+  private hasScope(scopes: string | null | undefined, scope: string) {
+    return scopes?.split(' ').includes(scope) ?? false;
+  }
+
+  private requireAnalyticsScope(scopes: string | null | undefined) {
+    if (!this.hasScope(scopes, ANALYTICS_SCOPE)) {
+      throw new UnauthorizedException(
+        'Reconnectez Google pour autoriser Analytics en lecture seule.',
+      );
+    }
+  }
+
   private metricRows(rows: SearchAnalyticsRow[] | undefined) {
     return (rows ?? []).map((row) => ({
       key: row.keys?.[0] ?? '',
@@ -462,7 +728,9 @@ export class GoogleSearchConsoleService {
     }));
   }
 
-  private summarize(rows: ReturnType<GoogleSearchConsoleService['metricRows']>) {
+  private summarize(
+    rows: ReturnType<GoogleSearchConsoleService['metricRows']>,
+  ) {
     const clicks = rows.reduce((sum, row) => sum + row.clicks, 0);
     const impressions = rows.reduce((sum, row) => sum + row.impressions, 0);
     const weightedPosition = rows.reduce(
@@ -499,7 +767,10 @@ export class GoogleSearchConsoleService {
     } catch {
       throw new UnauthorizedException('État OAuth invalide.');
     }
-    if (received.length !== expected.length || !timingSafeEqual(received, expected)) {
+    if (
+      received.length !== expected.length ||
+      !timingSafeEqual(received, expected)
+    ) {
       throw new UnauthorizedException('État OAuth invalide.');
     }
 
@@ -539,8 +810,15 @@ export class GoogleSearchConsoleService {
   }
 
   private decrypt(value: string) {
-    const [version, ivValue, tagValue, ciphertextValue, extra] = value.split('.');
-    if (version !== 'v1' || !ivValue || !tagValue || !ciphertextValue || extra) {
+    const [version, ivValue, tagValue, ciphertextValue, extra] =
+      value.split('.');
+    if (
+      version !== 'v1' ||
+      !ivValue ||
+      !tagValue ||
+      !ciphertextValue ||
+      extra
+    ) {
       throw new ServiceUnavailableException('Jeton Google chiffré invalide.');
     }
     try {
@@ -592,8 +870,10 @@ export class GoogleSearchConsoleService {
   }
 
   private dashboardUrl() {
-    return this.config.get<string>('DASHBOARD_URL')?.trim() ||
-      'https://app.robiacopilot.site';
+    return (
+      this.config.get<string>('DASHBOARD_URL')?.trim() ||
+      'https://app.robiacopilot.site'
+    );
   }
 
   private encryptionKey() {
@@ -615,5 +895,11 @@ export class GoogleSearchConsoleService {
 
   private formatDate(value: Date) {
     return value.toISOString().slice(0, 10);
+  }
+
+  private analyticsDate(value: string) {
+    return /^\d{8}$/.test(value)
+      ? `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}`
+      : value;
   }
 }
