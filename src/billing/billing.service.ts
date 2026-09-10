@@ -60,6 +60,7 @@ export class BillingService {
     const appUrl = this.appUrl();
     const session = await this.stripe().checkout.sessions.create({
       mode: 'subscription',
+      integration_identifier: 'robia_web_kqtmzjha',
       client_reference_id: organizationId,
       customer: billing?.stripeCustomerId ?? undefined,
       customer_email: billing?.stripeCustomerId ? undefined : email,
@@ -197,7 +198,7 @@ export class BillingService {
   }
 
   private stripe() {
-    const key = this.config.get<string>('STRIPE_SECRET_KEY');
+    const key = this.config.get<string>('STRIPE_API_KEY');
     if (!key) {
       throw new ServiceUnavailableException(
         "La facturation Stripe n'est pas encore configurée.",
