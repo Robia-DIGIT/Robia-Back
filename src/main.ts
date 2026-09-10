@@ -1,12 +1,18 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
+import { NestExpressApplication } from '@nestjs/platform-express';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, { rawBody: true });
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+    rawBody: true,
+  });
 
+  // Caddy is the only reverse-proxy hop in production. This makes req.ip,
+  // and therefore @nestjs/throttler, identify the real client forwarded by Caddy.
+  app.set('trust proxy', 1);
   app.use(helmet());
   app.useGlobalFilters(new AllExceptionsFilter());
 
@@ -60,4 +66,4 @@ async function bootstrap() {
   await app.listen(process.env.PORT ?? 3001);
 }
 
-bootstrap();
+void bootstrap();
