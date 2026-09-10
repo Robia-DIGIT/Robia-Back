@@ -9,7 +9,7 @@ describe('BillingService', () => {
   };
   const prisma = { stripeSubscription } as any;
   const values: Record<string, string> = {
-    STRIPE_SECRET_KEY: 'sk_test_example',
+    STRIPE_API_KEY: 'rk_test_example',
     STRIPE_WEBHOOK_SECRET: 'whsec_example',
     STRIPE_PRICE_PRO_MONTHLY: 'price_monthly',
     STRIPE_PRICE_PRO_ANNUAL: 'price_annual',
@@ -58,6 +58,7 @@ describe('BillingService', () => {
     expect(create).toHaveBeenCalledWith(
       expect.objectContaining({
         mode: 'subscription',
+        integration_identifier: 'robia_web_kqtmzjha',
         customer_email: 'owner@example.com',
         line_items: [{ price: 'price_monthly', quantity: 1 }],
         subscription_data: expect.objectContaining({ trial_period_days: 14 }),
