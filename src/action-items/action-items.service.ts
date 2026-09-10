@@ -218,11 +218,6 @@ export class ActionItemsService {
   ) {
     const action = await this.prisma.actionItem.findFirst({
       where: { id: actionId, organizationId },
-      include: {
-        opportunity: {
-          select: { id: true, impactScore: true, sourceData: true },
-        },
-      },
     });
 
     if (!action) {
@@ -234,9 +229,14 @@ export class ActionItemsService {
       data: { status: dto.status },
     });
 
+    const opportunity = await this.prisma.opportunity.findFirst({
+      where: { id: action.opportunityId, organizationId },
+      select: { id: true, impactScore: true, sourceData: true },
+    });
+
     return this.enrichAction(
       updated,
-      action.opportunity ?? { id: String(action.opportunityId) },
+      opportunity ?? { id: String(action.opportunityId) },
       1,
     );
   }
