@@ -3,12 +3,140 @@ import { PrismaService } from '../prisma/prisma.service';
 import { ActionGeneratorService } from './action-generator/action-generator.service';
 import { UpdateActionStatusDto } from './dto/update-action-status.dto';
 
+type JsonRecord = Record<string, unknown>;
+
+interface OpportunityContext {
+  id: string;
+  impactScore?: number | null;
+  sourceData?: unknown;
+}
+
 @Injectable()
 export class ActionItemsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly generator: ActionGeneratorService,
   ) {}
+
+  private asRecord(value: unknown): JsonRecord {
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as JsonRecord)
+      : {};
+  }
+
+  private stringList(value: unknown): string[] {
+    return Array.isArray(value)
+      ? value
+          .filter((item): item is string => typeof item === 'string')
+          .map((item) => item.trim())
+          .filter(Boolean)
+      : [];
+  }
+
+  private priorityLabel(severity: unknown): string {
+    switch (severity) {
+      case 'critical':
+        return 'Critique';
+      case 'high':
+        return 'Haute';
+      case 'medium':
+        return 'Moyenne';
+      case 'low':
+        return 'Faible';
+      default:
+        return 'À qualifier';
+    }
+  }
+
+  private enrichAction(
+    action: any,
+    opportunity: OpportunityContext,
+    sequence: number,
+  ) {
+    const source = this.asRecord(opportunity.sourceData);
+    const evidence = Array.isArray(source.evidence) ? source.evidence : [];
+    const affectedUrls = this.stringList(source.affectedUrls);
+    const expected = evidence
+      .map((item) => this.asRecord(item).expected)
+      .filter((item): item is string => typeof item === 'string' && Boolean(item.trim()));
+    const summary =
+      typeof source.summary === 'string' && source.summary.trim()
+        ? source.summary.trim()
+        : typeof source.whyItMatters === 'string'
+          ? source.whyItMatters.trim()
+          : '';
+    const priorityScore =
+      typeof source.priorityScore === 'number'
+        ? source.priorityScore
+        : (opportunity.impactScore ?? 0);
+
+    return {
+      ...action,
+      opportunity: undefined,
+      priority: this.priorityLabel(source.severity),
+      priorityScore,
+      sequence,
+      description: summary || undefined,
+      affectedUrls,
+      evidence,
+      validationCriteria:
+        expected.length > 0
+          ? `Relancer l'audit et vérifier : ${[...new Set(expected)].join(' ; ')}`
+          : "Vérifier manuellement la correction avant de terminer l'action.",
+    };
+  }
+
+  private enrichActions(
+    actions: any[],
+    fallbackOpportunity?: OpportunityContext,
+  ) {
+    const enriched = actions.map((action) => {
+      const opportunity =
+        (action.opportunity as OpportunityContext | undefined) ??
+        fallbackOpportunity ??
+        { id: String(action.opportunityId ?? '') };
+      const source = this.asRecord(opportunity.sourceData);
+      const recommendedSteps = this.stringList(source.recommendedSteps);
+      const stepIndex = recommendedSteps.indexOf(String(action.title ?? ''));
+
+      return {
+        value: this.enrichAction(
+          action,
+          opportunity,
+          stepIndex >= 0 ? stepIndex + 1 : 999,
+        ),
+        opportunityId: opportunity.id,
+        stepIndex,
+        createdAt: action.createdAt ? new Date(action.createdAt).getTime() : 0,
+      };
+    });
+
+    enriched.sort((left, right) => {
+      const priorityDifference =
+        Number(right.value.priorityScore) - Number(left.value.priorityScore);
+      if (priorityDifference !== 0) return priorityDifference;
+      if (left.opportunityId !== right.opportunityId) {
+        return left.opportunityId.localeCompare(right.opportunityId);
+      }
+      if (left.stepIndex >= 0 || right.stepIndex >= 0) {
+        return (left.stepIndex < 0 ? 999 : left.stepIndex) -
+          (right.stepIndex < 0 ? 999 : right.stepIndex);
+      }
+      return left.createdAt - right.createdAt;
+    });
+
+    let currentOpportunityId = '';
+    let sequence = 0;
+    return enriched.map((item) => {
+      if (item.opportunityId !== currentOpportunityId) {
+        currentOpportunityId = item.opportunityId;
+        sequence = 1;
+      } else {
+        sequence += 1;
+      }
+      return { ...item.value, sequence };
+    });
+  }
 
   async generateFromOpportunity(organizationId: string, opportunityId: string) {
     const opportunity = await this.prisma.opportunity.findFirst({
@@ -25,15 +153,20 @@ export class ActionItemsService {
     });
 
     if (existing.length > 0) {
-      return existing;
+      return this.enrichActions(existing, opportunity);
     }
 
-    const generated = await this.generator.generateFromOpportunity(
-      opportunity.title,
-      opportunity.description,
-    );
+    const source = this.asRecord(opportunity.sourceData);
+    const recommendedSteps = this.stringList(source.recommendedSteps);
+    const generated =
+      Number(source.version) === 2 && recommendedSteps.length > 0
+        ? recommendedSteps.map((title) => ({ title }))
+        : await this.generator.generateFromOpportunity(
+            opportunity.title,
+            opportunity.description,
+          );
 
-    return this.prisma.$transaction(
+    const created = await this.prisma.$transaction(
       generated.map((action) =>
         this.prisma.actionItem.create({
           data: {
@@ -45,16 +178,37 @@ export class ActionItemsService {
         }),
       ),
     );
+
+    return this.enrichActions(created, opportunity);
   }
 
   async findAll(organizationId: string, websiteId?: string) {
-    return this.prisma.actionItem.findMany({
+    let auditId: string | undefined;
+
+    if (websiteId) {
+      const latestAudit = await this.prisma.audit.findFirst({
+        where: { organizationId, websiteId, status: 'completed' },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true },
+      });
+      if (!latestAudit) return [];
+      auditId = latestAudit.id;
+    }
+
+    const actions = await this.prisma.actionItem.findMany({
       where: {
         organizationId,
-        ...(websiteId ? { opportunity: { audit: { websiteId } } } : {}),
+        ...(auditId ? { opportunity: { auditId } } : {}),
       },
-      orderBy: { createdAt: 'desc' },
+      include: {
+        opportunity: {
+          select: { id: true, impactScore: true, sourceData: true },
+        },
+      },
+      orderBy: { createdAt: 'asc' },
     });
+
+    return this.enrichActions(actions);
   }
 
   async updateStatus(
@@ -70,21 +224,32 @@ export class ActionItemsService {
       throw new NotFoundException('Action non trouvée');
     }
 
-    return this.prisma.actionItem.update({
+    const updated = await this.prisma.actionItem.update({
       where: { id: actionId },
       data: { status: dto.status },
     });
+
+    const opportunity = action.opportunityId
+      ? await this.prisma.opportunity.findFirst({
+          where: { id: action.opportunityId, organizationId },
+          select: { id: true, impactScore: true, sourceData: true },
+        })
+      : null;
+
+    return this.enrichAction(
+      updated,
+      opportunity ?? { id: String(action.opportunityId) },
+      1,
+    );
   }
 
   async getActionsForExport(organizationId: string, websiteId?: string) {
-    return this.prisma.actionItem.findMany({
-      where: {
-        organizationId,
-        ...(websiteId ? { opportunity: { audit: { websiteId } } } : {}),
-      },
-      orderBy: { createdAt: 'desc' },
-      select: { title: true, status: true, dueDate: true },
-    });
+    const actions = await this.findAll(organizationId, websiteId);
+    return actions.map((action) => ({
+      title: action.title,
+      status: action.status,
+      dueDate: action.dueDate,
+    }));
   }
 
   async generatePlan(organizationId: string) {
@@ -101,7 +266,6 @@ export class ActionItemsService {
       return [];
     }
 
-    // Priorité : fort impact, faible effort en premier (quick wins)
     const sorted = actions.sort((a, b) => {
       const scoreA =
         (a.opportunity?.impactScore ?? 5) - (a.opportunity?.effortScore ?? 3);
