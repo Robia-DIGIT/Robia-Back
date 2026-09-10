@@ -15,6 +15,7 @@ import { UsersModule } from './users/users.module';
 import { LocationsModule } from './locations/locations.module';
 import { IntegrationsModule } from './integrations/integrations.module';
 import { ProspectsModule } from './prospects/prospects.module';
+import { BillingModule } from './billing/billing.module';
 
 @Module({
   imports: [
@@ -35,6 +36,7 @@ import { ProspectsModule } from './prospects/prospects.module';
     UsersModule,
     LocationsModule,
     ProspectsModule,
+    BillingModule,
   ],
   controllers: [AppController],
   providers: [AppService],
