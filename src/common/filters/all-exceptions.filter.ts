@@ -9,6 +9,7 @@ import {
 import { Response } from 'express';
 
 const INTERNAL_ERROR_MESSAGE = 'Une erreur interne est survenue.';
+const INTERNAL_SERVER_ERROR_STATUS = 500;
 
 @Catch()
 export class AllExceptionsFilter implements ExceptionFilter {
@@ -27,14 +28,14 @@ export class AllExceptionsFilter implements ExceptionFilter {
       ? exception.getStatus()
       : HttpStatus.INTERNAL_SERVER_ERROR;
 
-    if (!isHttpException || status >= HttpStatus.INTERNAL_SERVER_ERROR) {
+    if (!isHttpException || status >= INTERNAL_SERVER_ERROR_STATUS) {
       this.logger.error(
         exception instanceof Error ? exception.message : String(exception),
         exception instanceof Error ? exception.stack : undefined,
       );
     }
 
-    if (status >= HttpStatus.INTERNAL_SERVER_ERROR) {
+    if (status >= INTERNAL_SERVER_ERROR_STATUS) {
       response.status(status).json({
         statusCode: status,
         message: INTERNAL_ERROR_MESSAGE,

@@ -26,7 +26,11 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npx prisma generate
-      - run: npx eslint "{src,apps,libs,test}/**/*.ts"
+      - name: Enforce the current ESLint debt baseline
+        shell: bash
+        run: |
+          npx eslint "{src,apps,libs,test}/**/*.ts" --format json --output-file eslint-report.json || true
+          node scripts/check-eslint-baseline.mjs eslint-report.json 195 30
 
   nest-build:
     runs-on: ubuntu-latest

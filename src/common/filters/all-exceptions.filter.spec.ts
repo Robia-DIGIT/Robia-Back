@@ -12,6 +12,7 @@ describe('AllExceptionsFilter', () => {
   let filter: AllExceptionsFilter;
   let response: Pick<Response, 'headersSent' | 'status' | 'json'>;
   let host: ArgumentsHost;
+  let loggerError: jest.SpyInstance;
 
   beforeEach(() => {
     filter = new AllExceptionsFilter();
@@ -25,7 +26,7 @@ describe('AllExceptionsFilter', () => {
         getResponse: () => response,
       }),
     } as unknown as ArgumentsHost;
-    jest.spyOn(Logger.prototype, 'error').mockImplementation();
+    loggerError = jest.spyOn(Logger.prototype, 'error').mockImplementation();
   });
 
   afterEach(() => {
@@ -76,10 +77,7 @@ describe('AllExceptionsFilter', () => {
       statusCode: 500,
       message: 'Une erreur interne est survenue.',
     });
-    expect(Logger.prototype.error).toHaveBeenCalledWith(
-      error.message,
-      error.stack,
-    );
+    expect(loggerError).toHaveBeenCalledWith(error.message, error.stack);
   });
 
   it('does not write a second response after headers were sent', () => {
