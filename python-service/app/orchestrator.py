@@ -3,6 +3,7 @@ from app.agents.analysis import compute_audit_result, _analyze_ai_readiness
 from app.agents.prioritization import generate_opportunities, generate_site_opportunities
 from app.agents.generation import generate_document_content
 from app.agents.action_generation import generate_actions
+from app.agents.audit_rules import evaluate_site_audit
 
 
 def run_audit(url: str, sector: str | None = None, city: str | None = None, country: str | None = None) -> dict:
@@ -98,7 +99,7 @@ def run_site_audit(url: str, max_pages: int = 20, max_depth: int = 2, city: str 
         for p in site.pages
     ]
 
-    return {
+    result = {
         "base_url": analysis.base_url,
         "discovery_method": site.discovery_method,
         "pages_discovered": len(site.discovered_urls),
@@ -125,3 +126,5 @@ def run_site_audit(url: str, max_pages: int = 20, max_depth: int = 2, city: str 
         "pages": pages_detail,
         "failed_urls": site.failed_urls,
     }
+    result["detailed_findings"] = evaluate_site_audit(result, city, country)
+    return result
