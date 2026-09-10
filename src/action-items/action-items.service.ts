@@ -49,7 +49,7 @@ export class ActionItemsService {
   }
 
   private enrichAction(
-    action: Record<string, any>,
+    action: any,
     opportunity: OpportunityContext,
     sequence: number,
   ) {
@@ -87,7 +87,7 @@ export class ActionItemsService {
   }
 
   private enrichActions(
-    actions: Record<string, any>[],
+    actions: any[],
     fallbackOpportunity?: OpportunityContext,
   ) {
     const enriched = actions.map((action) => {
@@ -234,7 +234,11 @@ export class ActionItemsService {
       data: { status: dto.status },
     });
 
-    return this.enrichAction(updated, action.opportunity, 1);
+    return this.enrichAction(
+      updated,
+      action.opportunity ?? { id: String(action.opportunityId) },
+      1,
+    );
   }
 
   async getActionsForExport(organizationId: string, websiteId?: string) {
