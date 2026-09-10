@@ -61,10 +61,67 @@ model Organization {
   validationLogs ValidationLog[]
   actionItems    ActionItem[]
   locations Location[] 
-  posts     Post[]
+  stripeSubscription            StripeSubscription?
+  googleSearchConsoleConnection GoogleSearchConsoleConnection?
+  posts                         Post[]
   createdAt DateTime @default(now()) @map("created_at")
 
   @@map("organizations")
+}
+
+model StripeSubscription {
+  id                   String   @id @default(cuid())
+  organizationId       String   @unique @map("organization_id")
+  organization         Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  stripeCustomerId     String?  @unique @map("stripe_customer_id")
+  stripeSubscriptionId String?  @unique @map("stripe_subscription_id")
+  stripePriceId        String?  @map("stripe_price_id")
+  plan                 String   @default("starter")
+  status               String   @default("inactive")
+  currentPeriodEnd     DateTime? @map("current_period_end")
+  cancelAtPeriodEnd    Boolean  @default(false) @map("cancel_at_period_end")
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+
+  @@map("stripe_subscriptions")
+}
+
+model GoogleSearchConsoleConnection {
+  id                    String   @id @default(cuid())
+  organizationId        String   @unique @map("organization_id")
+  organization          Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  googleAccountEmail    String?  @map("google_account_email")
+  encryptedRefreshToken String   @map("encrypted_refresh_token")
+  grantedScopes         String?  @map("granted_scopes")
+  selectedSiteUrl       String?  @map("selected_site_url")
+  permissionLevel       String?  @map("permission_level")
+  selectedAnalyticsPropertyId   String?  @map("selected_analytics_property_id")
+  selectedAnalyticsPropertyName String?  @map("selected_analytics_property_name")
+  connectedAt           DateTime @default(now()) @map("connected_at")
+  lastSyncedAt          DateTime? @map("last_synced_at")
+  lastAnalyticsSyncedAt DateTime? @map("last_analytics_synced_at")
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+  dailyMetrics          GoogleSearchConsoleDailyMetric[]
+
+  @@map("google_search_console_connections")
+}
+
+model GoogleSearchConsoleDailyMetric {
+  id           String   @id @default(cuid())
+  connectionId String   @map("connection_id")
+  connection   GoogleSearchConsoleConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  date         DateTime @db.Date
+  clicks       Float
+  impressions  Float
+  ctr          Float
+  position     Float
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  @@unique([connectionId, date])
+  @@index([connectionId, date])
+  @@map("google_search_console_daily_metrics")
 }
 
 model Website {

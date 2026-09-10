@@ -14,6 +14,9 @@ import { ActionItemsModule } from './action-items/action-items.module';
 import { UsersModule } from './users/users.module';
 import { LocationsModule } from './locations/locations.module';
 import { ContentModule } from './content/content.module';
+import { IntegrationsModule } from './integrations/integrations.module';
+import { ProspectsModule } from './prospects/prospects.module';
+import { BillingModule } from './billing/billing.module';
 
 @Module({
   imports: [
@@ -22,6 +25,7 @@ import { ContentModule } from './content/content.module';
       envFilePath: '.env',
     }),
     PrismaModule,
+    IntegrationsModule,
     AuthModule,
     OrganizationsModule,
     WebsitesModule,
@@ -33,6 +37,8 @@ import { ContentModule } from './content/content.module';
     UsersModule,
     LocationsModule,
     ContentModule,
+    ProspectsModule,
+    BillingModule,
   ],
   controllers: [AppController],
   providers: [AppService],

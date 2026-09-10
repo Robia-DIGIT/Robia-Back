@@ -51,6 +51,28 @@ export interface SitePageDetail {
   error: string | null;
 }
 
+
+export interface DetailedAuditFinding {
+  rule_code: string;
+  title: string;
+  category: string;
+  status: 'passed' | 'warning' | 'failed' | 'not_tested';
+  severity: 'info' | 'low' | 'medium' | 'high' | 'critical';
+  impact_score: number;
+  effort_score: number;
+  confidence_score: number;
+  priority_score: number;
+  affected_urls: string[];
+  evidence: Array<{
+    url: string;
+    observed: string;
+    expected: string;
+  }>;
+  source_data: string;
+  why_it_matters: string;
+  recommended_steps: string[];
+}
+
 export interface SiteAuditResult {
   base_url: string;
   discovery_method: string;
@@ -75,6 +97,7 @@ export interface SiteAuditResult {
   social_links: Record<string, string>;
   top_keywords: string[];
   findings: string[];
+  detailed_findings: DetailedAuditFinding[];
   pages: SitePageDetail[];
   failed_urls: string[];
 }

@@ -1,4 +1,15 @@
-import { Body, Controller, Get, Param, Patch, Post, Query, Req, Res, UseGuards} from '@nestjs/common'; 
+import {
+  Body,
+  Controller,
+  Get,
+  Param,
+  Patch,
+  Post,
+  Query,
+  Req,
+  Res,
+  UseGuards,
+} from '@nestjs/common';
 import type { Response } from 'express';
 import { ActionItemsService } from './action-items.service';
 import { UpdateActionStatusDto } from './dto/update-action-status.dto';
@@ -34,14 +45,19 @@ export class ActionItemsController {
   }
 
   @Get()
-  findAll(@Req() req: ScopedRequest) {
-    return this.actionItemsService.findAll(req.organizationId);
+  findAll(@Req() req: ScopedRequest, @Query('website_id') websiteId?: string) {
+    return this.actionItemsService.findAll(req.organizationId, websiteId);
   }
 
   @Get('export')
-  async exportPdf(@Req() req: ScopedRequest, @Res() res: Response) {
+  async exportPdf(
+    @Req() req: ScopedRequest,
+    @Res() res: Response,
+    @Query('website_id') websiteId?: string,
+  ) {
     const actions = await this.actionItemsService.getActionsForExport(
       req.organizationId,
+      websiteId,
     );
     const organization = await this.prisma.organization.findUnique({
       where: { id: req.organizationId },
@@ -68,11 +84,7 @@ export class ActionItemsController {
     @Param('id') id: string,
     @Body() dto: UpdateActionStatusDto,
   ) {
-    return this.actionItemsService.updateStatus(
-      req.organizationId,
-      id,
-      dto,
-    );
+    return this.actionItemsService.updateStatus(req.organizationId, id, dto);
   }
 
   @Post('plan')

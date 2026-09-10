@@ -10,9 +10,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: backend-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   nest-build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -21,9 +26,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
-      - run: npm test -- --runInBand src/app.controller.spec.ts
-      - run: npm test -- --runInBand src/auth/dto/register.dto.spec.ts src/auth/auth.service.spec.ts
-      - run: npm test -- --runInBand src/audits/audits.service.spec.ts src/opportunities/opportunities.service.spec.ts src/organization-isolation.spec.ts
+      - run: npm test -- --runInBand
 
   python-llm-tests:
     runs-on: ubuntu-latest
