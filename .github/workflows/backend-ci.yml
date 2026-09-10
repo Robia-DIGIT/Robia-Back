@@ -15,6 +15,23 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate
+      - name: Enforce the current ESLint debt baseline
+        shell: bash
+        run: |
+          npx eslint "{src,apps,libs,test}/**/*.ts" --format json --output-file eslint-report.json || true
+          node scripts/check-eslint-baseline.mjs eslint-report.json 269 30
+
   nest-build:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -57,7 +74,7 @@ jobs:
 
   deploy:
     name: Deploy production over restricted SSH
-    needs: [nest-build, python-llm-tests, production-containers, deployment-tests]
+    needs: [lint, nest-build, python-llm-tests, production-containers, deployment-tests]
     if: >-
       github.ref == 'refs/heads/main' &&
       github.repository == 'Robia-DIGIT/Robia-Back' &&
