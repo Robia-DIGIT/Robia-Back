@@ -9,6 +9,18 @@ export interface GeneratedOpportunity {
   effort_score: number;
   confidence_score: number;
   source_data: string;
+  rule_code?: string;
+  severity?: string;
+  audit_status?: string;
+  priority_score?: number;
+  affected_urls?: string[];
+  evidence?: Array<{
+    url: string;
+    observed: string;
+    expected: string;
+  }>;
+  why_it_matters?: string;
+  recommended_steps?: string[];
 }
 
 export interface GenerateForSiteParams {
@@ -28,7 +40,7 @@ export class OpportunityGeneratorService {
   }
 
   /**
-   * Le contrat de retour (GeneratedOpportunity[]) ne doit pas changer.
+   * Le contrat historique reste compatible ; les champs de preuve v2 sont optionnels.
    * Doit toujours retourner entre 3 et 5 opportunités max.
    */
   async generate(

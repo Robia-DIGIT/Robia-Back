@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, Dict
 
 
@@ -86,6 +86,29 @@ class PageDetail(BaseModel):
     error: Optional[str] = None
 
 
+class FindingEvidence(BaseModel):
+    url: str
+    observed: str
+    expected: str
+
+
+class DetailedFinding(BaseModel):
+    rule_code: str
+    title: str
+    category: str
+    status: str
+    severity: str
+    impact_score: int
+    effort_score: int
+    confidence_score: float
+    priority_score: int
+    affected_urls: list[str] = Field(default_factory=list)
+    evidence: list[FindingEvidence] = Field(default_factory=list)
+    source_data: str
+    why_it_matters: str
+    recommended_steps: list[str] = Field(default_factory=list)
+
+
 class SiteAuditResult(BaseModel):
     base_url: str
     discovery_method: str
@@ -115,6 +138,7 @@ class SiteAuditResult(BaseModel):
     top_keywords: list[str] = []
 
     findings: list[str]
+    detailed_findings: list[DetailedFinding] = Field(default_factory=list)
     pages: list[PageDetail]
     failed_urls: list[str] = []
 
@@ -138,6 +162,14 @@ class GeneratedOpportunity(BaseModel):
     effort_score: int
     confidence_score: float
     source_data: str
+    rule_code: Optional[str] = None
+    severity: Optional[str] = None
+    audit_status: Optional[str] = None
+    priority_score: Optional[int] = None
+    affected_urls: list[str] = Field(default_factory=list)
+    evidence: list[FindingEvidence] = Field(default_factory=list)
+    why_it_matters: Optional[str] = None
+    recommended_steps: list[str] = Field(default_factory=list)
 
 
 class DocumentRequest(BaseModel):

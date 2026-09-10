@@ -1,6 +1,9 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { OpportunityGeneratorService } from './opportunity-generator/opportunity-generator.service';
+import {
+  GeneratedOpportunity,
+  OpportunityGeneratorService,
+} from './opportunity-generator/opportunity-generator.service';
 import { N8nWebhookService } from '../integrations/n8n-webhook.service';
 
 @Injectable()
@@ -10,6 +13,26 @@ export class OpportunitiesService {
     private readonly generator: OpportunityGeneratorService,
     private readonly webhooks: N8nWebhookService,
   ) {}
+
+  private buildSourceData(opportunity: GeneratedOpportunity) {
+    if (!opportunity.rule_code) {
+      return opportunity.source_data;
+    }
+
+    return {
+      version: 2,
+      summary: opportunity.source_data,
+      ruleCode: opportunity.rule_code,
+      severity: opportunity.severity,
+      auditStatus: opportunity.audit_status,
+      priorityScore: opportunity.priority_score,
+      affectedUrls: opportunity.affected_urls ?? [],
+      evidence: opportunity.evidence ?? [],
+      whyItMatters:
+        opportunity.why_it_matters ?? opportunity.description,
+      recommendedSteps: opportunity.recommended_steps ?? [],
+    };
+  }
 
   async generateFromAudit(organizationId: string, auditId: string) {
     const audit = await this.prisma.audit.findFirst({
@@ -71,7 +94,7 @@ export class OpportunitiesService {
             impactScore: opp.impact_score,
             effortScore: opp.effort_score,
             confidenceScore: opp.confidence_score,
-            sourceData: opp.source_data,
+            sourceData: this.buildSourceData(opp),
             status: 'open',
           },
         }),
@@ -137,7 +160,7 @@ export class OpportunitiesService {
             impactScore: opp.impact_score,
             effortScore: opp.effort_score,
             confidenceScore: opp.confidence_score,
-            sourceData: opp.source_data,
+            sourceData: this.buildSourceData(opp),
             status: 'open',
           },
         }),
