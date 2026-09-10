@@ -229,10 +229,12 @@ export class ActionItemsService {
       data: { status: dto.status },
     });
 
-    const opportunity = await this.prisma.opportunity.findFirst({
-      where: { id: action.opportunityId, organizationId },
-      select: { id: true, impactScore: true, sourceData: true },
-    });
+    const opportunity = action.opportunityId
+      ? await this.prisma.opportunity.findFirst({
+          where: { id: action.opportunityId, organizationId },
+          select: { id: true, impactScore: true, sourceData: true },
+        })
+      : null;
 
     return this.enrichAction(
       updated,
