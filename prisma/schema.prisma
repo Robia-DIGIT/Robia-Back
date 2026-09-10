@@ -62,9 +62,27 @@ model Organization {
   actionItems    ActionItem[]
   locations Location[] 
   googleSearchConsoleConnection GoogleSearchConsoleConnection?
+  stripeSubscription StripeSubscription?
   createdAt DateTime @default(now()) @map("created_at")
 
   @@map("organizations")
+}
+
+model StripeSubscription {
+  id                   String   @id @default(cuid())
+  organizationId       String   @unique @map("organization_id")
+  organization         Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  stripeCustomerId     String?  @unique @map("stripe_customer_id")
+  stripeSubscriptionId String?  @unique @map("stripe_subscription_id")
+  stripePriceId        String?  @map("stripe_price_id")
+  plan                 String   @default("starter")
+  status               String   @default("inactive")
+  currentPeriodEnd     DateTime? @map("current_period_end")
+  cancelAtPeriodEnd    Boolean  @default(false) @map("cancel_at_period_end")
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+
+  @@map("stripe_subscriptions")
 }
 
 model GoogleSearchConsoleConnection {
