@@ -586,6 +586,57 @@ def evaluate_site_audit(
         )
     )
 
+    findings.append(
+        _page_rule(
+            pages=pages,
+            predicate=lambda p: not p.get("viewport_present"),
+            rule_code="technical.viewport_missing",
+            title="Ajouter une balise viewport adaptée au mobile",
+            category="technical",
+            severity="high",
+            impact_score=6,
+            effort_score=1,
+            confidence_score=0.98,
+            observed=lambda _p: "Aucune balise <meta name=\"viewport\"> détectée",
+            expected="Balise viewport présente (ex. width=device-width, initial-scale=1)",
+            failed_summary="sans balise viewport détectable",
+            passed_summary="balise viewport détectée",
+            why_it_matters=(
+                "Sans balise viewport, la page ne s'adapte pas aux écrans mobiles — "
+                "un frein direct pour une audience majoritairement mobile."
+            ),
+            recommended_steps=[
+                "Ajouter <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"> dans <head>.",
+                "Vérifier le rendu sur un écran mobile réel après ajout.",
+            ],
+        )
+    )
+
+    findings.append(
+        _page_rule(
+            pages=pages,
+            predicate=lambda p: not p.get("html_lang"),
+            rule_code="technical.html_lang_missing",
+            title="Déclarer la langue de la page",
+            category="technical",
+            severity="low",
+            impact_score=3,
+            effort_score=1,
+            confidence_score=0.95,
+            observed=lambda _p: "Aucun attribut lang détecté sur <html>",
+            expected="Attribut lang cohérent avec la langue du contenu (ex. lang=\"fr\")",
+            failed_summary="sans attribut de langue déclaré",
+            passed_summary="langue déclarée",
+            why_it_matters=(
+                "L'attribut lang aide les moteurs et les lecteurs d'écran à traiter "
+                "correctement le contenu dans la bonne langue."
+            ),
+            recommended_steps=[
+                "Ajouter l'attribut lang sur la balise <html> (ex. <html lang=\"fr\">).",
+            ],
+        )
+    )
+
     has_local_context = bool(
         (city and city.strip()) or (country and country.strip())
     )
@@ -665,6 +716,108 @@ def evaluate_site_audit(
                 ),
             )
         )
+
+    # Pragmatic subset of schema.org's LocalBusiness type hierarchy — the
+    # scraper captures the raw JSON-LD "@type" string with no ontology
+    # resolution, so this intentionally does not attempt to recognize
+    # every possible LocalBusiness subtype (see https://schema.org/LocalBusiness).
+    LOCAL_BUSINESS_SCHEMA_TYPES = {
+        "LocalBusiness",
+        "Organization",
+        "Restaurant",
+        "Store",
+        "ProfessionalService",
+        "FoodEstablishment",
+        "MedicalBusiness",
+        "AutomotiveBusiness",
+        "HomeAndConstructionBusiness",
+        "LodgingBusiness",
+    }
+    has_local_schema = any(
+        LOCAL_BUSINESS_SCHEMA_TYPES.intersection(page.get("structured_data_types") or [])
+        for page in pages
+    )
+    findings.append(
+        _finding(
+            rule_code="local.structured_data_missing",
+            title="Ajouter un balisage schema.org LocalBusiness",
+            category="local",
+            status="failed" if not has_local_schema else "passed",
+            severity="medium" if not has_local_schema else "info",
+            impact_score=5 if not has_local_schema else 0,
+            effort_score=3 if not has_local_schema else 0,
+            confidence_score=0.7,
+            affected_urls=[_page_url(page) for page in pages] if not has_local_schema else [],
+            evidence=(
+                [
+                    {
+                        "url": str(site_audit_result.get("base_url") or "Site"),
+                        "observed": "Aucun type schema.org de type entreprise locale détecté",
+                        "expected": "Un type LocalBusiness (ou sous-type adapté) en JSON-LD",
+                    }
+                ]
+                if not has_local_schema else []
+            ),
+            source_data=(
+                "Aucune donnée structurée d'entreprise locale détectée."
+                if not has_local_schema
+                else "Un type schema.org d'entreprise locale a été détecté."
+            ),
+            why_it_matters=(
+                "Un balisage LocalBusiness aide les moteurs à associer directement "
+                "le site à une entité locale précise (nom, adresse, catégorie)."
+                if not has_local_schema else ""
+            ),
+            recommended_steps=(
+                [
+                    "Ajouter un bloc JSON-LD de type LocalBusiness (ou sous-type adapté).",
+                    "Renseigner nom, adresse et coordonnées cohérents avec le site.",
+                ]
+                if not has_local_schema else []
+            ),
+        )
+    )
+
+    has_social_links = any(page.get("social_links") for page in pages)
+    findings.append(
+        _finding(
+            rule_code="local.social_profiles_missing",
+            title="Relier le site à des profils sociaux locaux",
+            category="local",
+            status="failed" if not has_social_links else "passed",
+            severity="low" if not has_social_links else "info",
+            impact_score=3 if not has_social_links else 0,
+            effort_score=1 if not has_social_links else 0,
+            confidence_score=0.6,
+            affected_urls=[_page_url(page) for page in pages] if not has_social_links else [],
+            evidence=(
+                [
+                    {
+                        "url": str(site_audit_result.get("base_url") or "Site"),
+                        "observed": "Aucun lien vers un profil social détecté",
+                        "expected": "Au moins un lien vers un profil social actif",
+                    }
+                ]
+                if not has_social_links else []
+            ),
+            source_data=(
+                "Aucun profil social détecté sur le site."
+                if not has_social_links
+                else "Au moins un profil social a été détecté."
+            ),
+            why_it_matters=(
+                "Les profils sociaux renforcent les signaux de confiance et de "
+                "présence locale, en complément de la fiche Google Business Profile."
+                if not has_social_links else ""
+            ),
+            recommended_steps=(
+                [
+                    "Ajouter un lien visible vers les profils sociaux actifs de l'entreprise.",
+                ]
+                if not has_social_links else []
+            ),
+        )
+    )
 
     findings.append(
         evaluate_performance(
