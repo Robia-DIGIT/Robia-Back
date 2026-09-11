@@ -7,6 +7,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import { Response } from 'express';
+import { captureException } from '../logging/sentry';
 
 const INTERNAL_ERROR_MESSAGE = 'Une erreur interne est survenue.';
 const INTERNAL_SERVER_ERROR_STATUS = 500;
@@ -33,6 +34,7 @@ export class AllExceptionsFilter implements ExceptionFilter {
         exception instanceof Error ? exception.message : String(exception),
         exception instanceof Error ? exception.stack : undefined,
       );
+      captureException(exception);
     }
 
     if (status >= INTERNAL_SERVER_ERROR_STATUS) {
