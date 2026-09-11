@@ -1,11 +1,18 @@
 from dotenv import load_dotenv
 load_dotenv()
 
+from app.logging_config import configure_logging, init_sentry, request_id_middleware
+
+# Must run before anything else can log or throw.
+configure_logging()
+init_sentry()
+
 from fastapi import FastAPI
 from app.schemas import AuditRequest, AuditResult, SiteAuditRequest, SiteAuditResult, OpportunityRequest, GeneratedOpportunity, DocumentRequest, GeneratedDocument, ActionRequest, GeneratedAction, SiteOpportunityRequest
 from app.orchestrator import run_audit, run_site_audit, run_opportunity_generation, run_site_opportunity_generation, run_document_generation, run_action_generation
 
 app = FastAPI(title="Robia AI Engine")
+app.middleware("http")(request_id_middleware)
 
 
 @app.get("/health")

@@ -1,4 +1,13 @@
-import { Body, Controller, Get, Param, Post, Query, Req, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Param,
+  Post,
+  Query,
+  Req,
+  UseGuards,
+} from '@nestjs/common';
 import { AuditsService } from './audits.service';
 import { RunAuditDto } from './dto/run-audit.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
@@ -8,6 +17,7 @@ import { RunSiteAuditDto } from './dto/run-site-audit.dto';
 interface ScopedRequest extends Request {
   user: { userId: string; email: string };
   organizationId: string;
+  id?: string;
 }
 
 @Controller('audits')
@@ -17,7 +27,7 @@ export class AuditsController {
 
   @Post('run')
   run(@Req() req: ScopedRequest, @Body() dto: RunAuditDto) {
-    return this.auditsService.run(req.organizationId, dto.websiteId);
+    return this.auditsService.run(req.organizationId, dto.websiteId, req.id);
   }
 
   @Post('run-site')
@@ -27,6 +37,7 @@ export class AuditsController {
       dto.websiteId,
       dto.maxPages,
       dto.maxDepth,
+      req.id,
     );
   }
 
@@ -39,10 +50,15 @@ export class AuditsController {
   }
 
   @Get('latest')
-  findLatest(@Req() req: ScopedRequest, @Query('website_id') websiteId: string) {
-    return this.auditsService.findLatestForWebsite(req.organizationId, websiteId);
+  findLatest(
+    @Req() req: ScopedRequest,
+    @Query('website_id') websiteId: string,
+  ) {
+    return this.auditsService.findLatestForWebsite(
+      req.organizationId,
+      websiteId,
+    );
   }
-
 
   @Get(':id')
   findOne(@Req() req: ScopedRequest, @Param('id') id: string) {
