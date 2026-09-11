@@ -1,6 +1,9 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { AuditRunnerService, SiteAuditResult } from './audit-runner/audit-runner.service';
+import {
+  AuditRunnerService,
+  SiteAuditResult,
+} from './audit-runner/audit-runner.service';
 //import { Prisma } from '@prisma/client';
 
 @Injectable()
@@ -10,7 +13,7 @@ export class AuditsService {
     private readonly auditRunner: AuditRunnerService,
   ) {}
 
-  async run(organizationId: string, websiteId: string) {
+  async run(organizationId: string, websiteId: string, requestId?: string) {
     const website = await this.prisma.website.findFirst({
       where: { id: websiteId, organizationId },
     });
@@ -42,6 +45,7 @@ export class AuditsService {
         maxDepth: 2,
         city: organization?.city,
         country: organization?.country,
+        requestId,
       });
       this.ensureSitePages(siteResult);
       await this.persistSitePages(website.id, siteResult);
@@ -51,6 +55,7 @@ export class AuditsService {
         sector: organization?.sector,
         city: organization?.city,
         country: organization?.country,
+        requestId,
       });
 
       return this.prisma.audit.update({
@@ -113,6 +118,7 @@ export class AuditsService {
     websiteId: string,
     maxPages = 20,
     maxDepth = 2,
+    requestId?: string,
   ) {
     const website = await this.prisma.website.findFirst({
       where: { id: websiteId, organizationId },
@@ -144,6 +150,7 @@ export class AuditsService {
         maxDepth,
         city: organization?.city,
         country: organization?.country,
+        requestId,
       });
 
       this.ensureSitePages(result);
@@ -255,5 +262,4 @@ export class AuditsService {
       });
     }
   }
-
 }
