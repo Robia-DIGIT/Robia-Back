@@ -4,6 +4,7 @@ from app.agents.prioritization import generate_opportunities, generate_site_oppo
 from app.agents.generation import generate_document_content
 from app.agents.action_generation import generate_actions
 from app.agents.audit_rules import evaluate_site_audit
+from app.integrations.pagespeed import fetch_pagespeed_insights
 
 
 def run_audit(url: str, sector: str | None = None, city: str | None = None, country: str | None = None) -> dict:
@@ -126,5 +127,8 @@ def run_site_audit(url: str, max_pages: int = 20, max_depth: int = 2, city: str 
         "pages": pages_detail,
         "failed_urls": site.failed_urls,
     }
-    result["detailed_findings"] = evaluate_site_audit(result, city, country)
+    psi_result = fetch_pagespeed_insights(result["base_url"])
+    result["detailed_findings"] = evaluate_site_audit(
+        result, city, country, psi_result=psi_result
+    )
     return result

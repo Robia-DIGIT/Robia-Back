@@ -126,10 +126,132 @@ def _page_rule(
     )
 
 
+def evaluate_performance(
+    psi_result: dict[str, Any] | None,
+    base_url: str,
+) -> dict[str, Any]:
+    """Turn a PageSpeed Insights (mobile) result into a performance finding.
+
+    ``psi_result`` is ``None`` whenever PSI is unavailable (no API key,
+    network failure, quota, timeout) — this always returns a well-formed
+    finding, using status "not_tested" in that case, so performance is
+    never silently missing from the audit.
+    """
+    if not psi_result:
+        return _finding(
+            rule_code="performance.pagespeed_insights",
+            title="Mesurer la performance mobile réelle",
+            category="performance",
+            status="not_tested",
+            severity="info",
+            impact_score=0,
+            effort_score=0,
+            confidence_score=0.0,
+            affected_urls=[],
+            evidence=[],
+            source_data=(
+                "Contrôle non exécuté : Google PageSpeed Insights est "
+                "indisponible ou aucune clé API n'est configurée."
+            ),
+            why_it_matters="",
+            recommended_steps=[],
+        )
+
+    score = psi_result.get("performance_score")
+    lcp_ms = psi_result.get("lcp_ms")
+    cls = psi_result.get("cls")
+    tbt_ms = psi_result.get("tbt_ms")
+
+    if score is None or score >= 90:
+        status, severity, impact_score, effort_score = "passed", "info", 0, 0
+    elif score >= 50:
+        status, severity, impact_score, effort_score = "warning", "medium", 5, 3
+    else:
+        status, severity, impact_score, effort_score = "failed", "high", 8, 3
+
+    evidence = [
+        {
+            "url": base_url,
+            "observed": f"Score de performance mobile : {score}/100",
+            "expected": "Score supérieur ou égal à 90/100",
+        }
+    ]
+    if lcp_ms is not None:
+        evidence.append(
+            {
+                "url": base_url,
+                "observed": f"Largest Contentful Paint (LCP) : {lcp_ms / 1000:.1f}s",
+                "expected": "LCP inférieur à 2.5s",
+            }
+        )
+    if cls is not None:
+        evidence.append(
+            {
+                "url": base_url,
+                "observed": f"Cumulative Layout Shift (CLS) : {cls:.2f}",
+                "expected": "CLS inférieur à 0.10",
+            }
+        )
+    if tbt_ms is not None:
+        evidence.append(
+            {
+                "url": base_url,
+                "observed": f"Total Blocking Time (TBT) : {tbt_ms:.0f}ms",
+                "expected": "TBT inférieur à 200ms",
+            }
+        )
+
+    recommended_steps: list[str] = []
+    if status != "passed":
+        if lcp_ms is not None and lcp_ms >= 2500:
+            recommended_steps.append(
+                "Accélérer le chargement de l'élément principal de la page "
+                "(compresser les images, réduire le temps de réponse serveur)."
+            )
+        if cls is not None and cls >= 0.1:
+            recommended_steps.append(
+                "Réserver l'espace des images et des blocs dynamiques pour "
+                "éviter les décalages de mise en page pendant le chargement."
+            )
+        if tbt_ms is not None and tbt_ms >= 200:
+            recommended_steps.append(
+                "Réduire ou différer le JavaScript qui bloque l'interactivité "
+                "de la page."
+            )
+        if not recommended_steps:
+            recommended_steps.append(
+                "Analyser le rapport PageSpeed Insights détaillé pour "
+                "identifier les optimisations les plus impactantes."
+            )
+
+    return _finding(
+        rule_code="performance.pagespeed_insights",
+        title="Améliorer la performance mobile réelle",
+        category="performance",
+        status=status,
+        severity=severity,
+        impact_score=impact_score,
+        effort_score=effort_score,
+        confidence_score=0.9,
+        affected_urls=[base_url] if status != "passed" else [],
+        evidence=evidence,
+        source_data=f"Score de performance mobile PageSpeed Insights : {score}/100.",
+        why_it_matters=(
+            "Une page mobile lente augmente l'abandon des visiteurs et peut "
+            "pénaliser le classement local, en particulier pour des "
+            "recherches faites en déplacement."
+            if status != "passed"
+            else ""
+        ),
+        recommended_steps=recommended_steps,
+    )
+
+
 def evaluate_site_audit(
     site_audit_result: dict[str, Any],
     city: str | None = None,
     country: str | None = None,
+    psi_result: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Return transparent, deterministic SEO checks for a multi-page audit."""
     pages = [
@@ -532,6 +654,13 @@ def evaluate_site_audit(
                 ),
             )
         )
+
+    findings.append(
+        evaluate_performance(
+            psi_result,
+            str(site_audit_result.get("base_url") or ""),
+        )
+    )
 
     return sorted(
         findings,
