@@ -73,6 +73,31 @@ export interface DetailedAuditFinding {
   recommended_steps: string[];
 }
 
+export interface PageSpeedMetrics {
+  lcpMs: number | null;
+  cls: number | null;
+  /** Lab proxy for interactivity (Total Blocking Time) — not a Core Web Vital. */
+  tbtMs: number | null;
+  fcpMs: number | null;
+}
+
+/**
+ * Structured PageSpeed Insights contract (RC-10/RC-11). Never
+ * influences the audit's overall SEO score — it is an additional,
+ * independent finding source.
+ */
+export interface PageSpeedInsightsResult {
+  status: 'ok' | 'unavailable';
+  strategy: 'mobile';
+  performanceScore: number | null;
+  metrics: PageSpeedMetrics;
+  fetchedAt: string;
+  analyzedUrl: string;
+  finalUrl: string | null;
+  source: string;
+  unavailableReason: string | null;
+}
+
 export interface SiteAuditResult {
   base_url: string;
   discovery_method: string;
@@ -98,6 +123,7 @@ export interface SiteAuditResult {
   top_keywords: string[];
   findings: string[];
   detailed_findings: DetailedAuditFinding[];
+  pagespeed_insights: PageSpeedInsightsResult | null;
   pages: SitePageDetail[];
   failed_urls: string[];
 }

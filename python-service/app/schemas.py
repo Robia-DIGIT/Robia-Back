@@ -109,6 +109,33 @@ class DetailedFinding(BaseModel):
     recommended_steps: list[str] = Field(default_factory=list)
 
 
+class PageSpeedMetrics(BaseModel):
+    # Deliberately camelCase: this mirrors the cross-service PSI
+    # contract field names (RC-10/RC-11), not this file's usual
+    # snake_case convention.
+    lcpMs: Optional[float] = None
+    cls: Optional[float] = None
+    tbtMs: Optional[float] = None  # lab proxy for interactivity, not a Core Web Vital
+    fcpMs: Optional[float] = None
+
+
+class PageSpeedInsightsResult(BaseModel):
+    """Structured PageSpeed Insights contract exposed on SiteAuditResult
+    for RC-11 to consume directly, without re-deriving values from the
+    "performance" finding's evidence text. Never influences the audit's
+    overall SEO score."""
+
+    status: str  # "ok" | "unavailable"
+    strategy: str
+    performanceScore: Optional[int] = None
+    metrics: PageSpeedMetrics
+    fetchedAt: str
+    analyzedUrl: str
+    finalUrl: Optional[str] = None
+    source: str
+    unavailableReason: Optional[str] = None
+
+
 class SiteAuditResult(BaseModel):
     base_url: str
     discovery_method: str
@@ -139,6 +166,7 @@ class SiteAuditResult(BaseModel):
 
     findings: list[str]
     detailed_findings: list[DetailedFinding] = Field(default_factory=list)
+    pagespeed_insights: Optional[PageSpeedInsightsResult] = None
     pages: list[PageDetail]
     failed_urls: list[str] = []
 
