@@ -4,6 +4,7 @@ from app.agents.prioritization import generate_opportunities, generate_site_oppo
 from app.agents.generation import generate_document_content
 from app.agents.action_generation import generate_actions
 from app.agents.audit_rules import evaluate_site_audit
+from app.agents.scoring import compute_seo_score_v2
 from app.integrations.pagespeed import fetch_pagespeed_insights
 
 
@@ -132,4 +133,10 @@ def run_site_audit(url: str, max_pages: int = 20, max_depth: int = 2, city: str 
     result["detailed_findings"] = evaluate_site_audit(
         result, city, country, psi_result=psi_result
     )
+    # Additive only (RC-12): exposed alongside the legacy score, does not
+    # replace resultJson.global_score / Audit.globalScore. Switching the
+    # displayed score to v2 is a separate product decision — see the
+    # RC-12 handoff for the two migration options (recompute vs. freeze
+    # existing audits).
+    result["seo_score_v2"] = compute_seo_score_v2(result["detailed_findings"])
     return result
