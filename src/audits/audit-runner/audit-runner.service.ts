@@ -45,6 +45,8 @@ export interface SitePageDetail {
   business_latitude: number | null;
   business_longitude: number | null;
   social_links: Record<string, string>;
+  viewport_present: boolean;
+  html_lang: string | null;
   js_rendering_used: boolean;
   js_rendering_suspected: boolean;
   main_content: string | null;

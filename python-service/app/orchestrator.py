@@ -92,6 +92,8 @@ def run_site_audit(url: str, max_pages: int = 20, max_depth: int = 2, city: str 
             "business_latitude": p.business_latitude,
             "business_longitude": p.business_longitude,
             "social_links": p.social_links,
+            "viewport_present": p.viewport_present,
+            "html_lang": p.html_lang,
             "js_rendering_used": p.js_rendering_used,
             "js_rendering_suspected": p.js_rendering_suspected,
             "main_content": p.main_content,
