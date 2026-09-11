@@ -130,14 +130,23 @@ def evaluate_performance(
     psi_result: dict[str, Any] | None,
     base_url: str,
 ) -> dict[str, Any]:
-    """Turn a PageSpeed Insights (mobile) result into a performance finding.
+    """Turn a PageSpeed Insights (mobile) structured result into a
+    performance finding.
 
-    ``psi_result`` is ``None`` whenever PSI is unavailable (no API key,
-    network failure, quota, timeout) — this always returns a well-formed
-    finding, using status "not_tested" in that case, so performance is
-    never silently missing from the audit.
+    ``psi_result`` follows the ``PageSpeedResult`` contract from
+    ``app.integrations.pagespeed`` (``status``/``strategy``/
+    ``performanceScore``/``metrics``/... — see that module). Pass
+    ``None`` only when PSI was never attempted; any ``status`` other
+    than ``"ok"`` (network failure, quota, timeout, malformed response)
+    is treated the same way, always producing a well-formed finding
+    with status "not_tested" so performance is never silently missing
+    from the audit. This never influences the audit's overall SEO
+    score — it is purely an additional, evidence-based finding.
     """
-    if not psi_result:
+    if not psi_result or psi_result.get("status") != "ok":
+        reason = (psi_result or {}).get("unavailableReason")
+        source_data = "Contrôle non exécuté : Google PageSpeed Insights est indisponible"
+        source_data += f" ({reason})." if reason else "."
         return _finding(
             rule_code="performance.pagespeed_insights",
             title="Mesurer la performance mobile réelle",
@@ -149,18 +158,17 @@ def evaluate_performance(
             confidence_score=0.0,
             affected_urls=[],
             evidence=[],
-            source_data=(
-                "Contrôle non exécuté : Google PageSpeed Insights est "
-                "indisponible ou aucune clé API n'est configurée."
-            ),
+            source_data=source_data,
             why_it_matters="",
             recommended_steps=[],
         )
 
-    score = psi_result.get("performance_score")
-    lcp_ms = psi_result.get("lcp_ms")
-    cls = psi_result.get("cls")
-    tbt_ms = psi_result.get("tbt_ms")
+    score = psi_result.get("performanceScore")
+    metrics = psi_result.get("metrics")
+    metrics = metrics if isinstance(metrics, dict) else {}
+    lcp_ms = metrics.get("lcpMs")
+    cls = metrics.get("cls")
+    tbt_ms = metrics.get("tbtMs")
 
     if score is None or score >= 90:
         status, severity, impact_score, effort_score = "passed", "info", 0, 0
@@ -196,7 +204,10 @@ def evaluate_performance(
         evidence.append(
             {
                 "url": base_url,
-                "observed": f"Total Blocking Time (TBT) : {tbt_ms:.0f}ms",
+                "observed": (
+                    f"Total Blocking Time (TBT, indicateur de laboratoire — "
+                    f"pas un Core Web Vital) : {tbt_ms:.0f}ms"
+                ),
                 "expected": "TBT inférieur à 200ms",
             }
         )

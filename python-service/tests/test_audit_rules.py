@@ -130,8 +130,41 @@ class AuditRulesTests(unittest.TestCase):
         self.assertTrue(passed_codes.isdisjoint(opportunity_codes))
 
 
+def _psi_ok(score, lcp_ms=None, cls=None, tbt_ms=None, fcp_ms=None):
+    return {
+        "status": "ok",
+        "strategy": "mobile",
+        "performanceScore": score,
+        "metrics": {
+            "lcpMs": lcp_ms,
+            "cls": cls,
+            "tbtMs": tbt_ms,
+            "fcpMs": fcp_ms,
+        },
+        "fetchedAt": "2026-09-11T00:00:00+00:00",
+        "analyzedUrl": "https://example.com",
+        "finalUrl": "https://example.com/",
+        "source": "google_pagespeed_insights",
+        "unavailableReason": None,
+    }
+
+
+def _psi_unavailable(reason):
+    return {
+        "status": "unavailable",
+        "strategy": "mobile",
+        "performanceScore": None,
+        "metrics": {"lcpMs": None, "cls": None, "tbtMs": None, "fcpMs": None},
+        "fetchedAt": "2026-09-11T00:00:00+00:00",
+        "analyzedUrl": "https://example.com",
+        "finalUrl": None,
+        "source": "google_pagespeed_insights",
+        "unavailableReason": reason,
+    }
+
+
 class EvaluatePerformanceTests(unittest.TestCase):
-    def test_not_tested_when_psi_unavailable(self):
+    def test_not_tested_when_psi_never_attempted(self):
         finding = evaluate_performance(None, "https://example.com")
 
         self.assertEqual(finding["status"], "not_tested")
@@ -140,15 +173,17 @@ class EvaluatePerformanceTests(unittest.TestCase):
         self.assertEqual(finding["affected_urls"], [])
         self.assertEqual(finding["evidence"], [])
 
+    def test_not_tested_when_psi_unavailable_mentions_reason(self):
+        finding = evaluate_performance(
+            _psi_unavailable("timeout"), "https://example.com"
+        )
+
+        self.assertEqual(finding["status"], "not_tested")
+        self.assertIn("timeout", finding["source_data"])
+
     def test_passed_for_good_score(self):
         finding = evaluate_performance(
-            {
-                "performance_score": 95,
-                "lcp_ms": 1800.0,
-                "cls": 0.05,
-                "tbt_ms": 50.0,
-                "fcp_ms": 900.0,
-            },
+            _psi_ok(95, lcp_ms=1800.0, cls=0.05, tbt_ms=50.0, fcp_ms=900.0),
             "https://example.com",
         )
 
@@ -160,13 +195,7 @@ class EvaluatePerformanceTests(unittest.TestCase):
 
     def test_failed_for_poor_score_with_metric_specific_recommendations(self):
         finding = evaluate_performance(
-            {
-                "performance_score": 25,
-                "lcp_ms": 5200.0,
-                "cls": 0.35,
-                "tbt_ms": 900.0,
-                "fcp_ms": 3000.0,
-            },
+            _psi_ok(25, lcp_ms=5200.0, cls=0.35, tbt_ms=900.0, fcp_ms=3000.0),
             "https://example.com",
         )
 
@@ -178,13 +207,7 @@ class EvaluatePerformanceTests(unittest.TestCase):
 
     def test_warning_for_middling_score(self):
         finding = evaluate_performance(
-            {
-                "performance_score": 65,
-                "lcp_ms": 3000.0,
-                "cls": 0.05,
-                "tbt_ms": 100.0,
-                "fcp_ms": 1500.0,
-            },
+            _psi_ok(65, lcp_ms=3000.0, cls=0.05, tbt_ms=100.0, fcp_ms=1500.0),
             "https://example.com",
         )
 
@@ -192,6 +215,17 @@ class EvaluatePerformanceTests(unittest.TestCase):
         self.assertEqual(finding["severity"], "medium")
         # Only LCP is above threshold here.
         self.assertEqual(len(finding["recommended_steps"]), 1)
+
+    def test_tbt_evidence_is_not_labelled_a_core_web_vital(self):
+        finding = evaluate_performance(
+            _psi_ok(25, lcp_ms=5200.0, cls=0.35, tbt_ms=900.0),
+            "https://example.com",
+        )
+
+        tbt_evidence = next(
+            item for item in finding["evidence"] if "TBT" in item["observed"]
+        )
+        self.assertIn("pas un Core Web Vital", tbt_evidence["observed"])
 
 
 class EvaluateSiteAuditPerformanceIntegrationTests(unittest.TestCase):
@@ -231,13 +265,7 @@ class EvaluateSiteAuditPerformanceIntegrationTests(unittest.TestCase):
     def test_includes_real_performance_finding_with_psi(self):
         findings = evaluate_site_audit(
             self.site,
-            psi_result={
-                "performance_score": 40,
-                "lcp_ms": 4500.0,
-                "cls": 0.3,
-                "tbt_ms": 700.0,
-                "fcp_ms": 2500.0,
-            },
+            psi_result=_psi_ok(40, lcp_ms=4500.0, cls=0.3, tbt_ms=700.0, fcp_ms=2500.0),
         )
 
         performance = next(
@@ -246,16 +274,21 @@ class EvaluateSiteAuditPerformanceIntegrationTests(unittest.TestCase):
         self.assertEqual(performance["status"], "failed")
         self.assertEqual(performance["rule_code"], "performance.pagespeed_insights")
 
+    def test_includes_not_tested_performance_finding_when_psi_unavailable(self):
+        findings = evaluate_site_audit(
+            self.site,
+            psi_result=_psi_unavailable("rate_limited"),
+        )
+
+        performance = next(
+            item for item in findings if item["category"] == "performance"
+        )
+        self.assertEqual(performance["status"], "not_tested")
+
     def test_failed_performance_finding_becomes_an_opportunity(self):
         findings = evaluate_site_audit(
             self.site,
-            psi_result={
-                "performance_score": 30,
-                "lcp_ms": 5000.0,
-                "cls": 0.3,
-                "tbt_ms": 800.0,
-                "fcp_ms": 2800.0,
-            },
+            psi_result=_psi_ok(30, lcp_ms=5000.0, cls=0.3, tbt_ms=800.0, fcp_ms=2800.0),
         )
         opportunities = findings_to_opportunities(findings)
 

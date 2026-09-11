@@ -128,6 +128,7 @@ def run_site_audit(url: str, max_pages: int = 20, max_depth: int = 2, city: str 
         "failed_urls": site.failed_urls,
     }
     psi_result = fetch_pagespeed_insights(result["base_url"])
+    result["pagespeed_insights"] = psi_result
     result["detailed_findings"] = evaluate_site_audit(
         result, city, country, psi_result=psi_result
     )
