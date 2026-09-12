@@ -96,9 +96,11 @@ describe('AuditsService', () => {
       },
       audit: {
         create: jest.fn().mockResolvedValue({ id: auditId }),
-        update: jest.fn().mockImplementation(({ data }) =>
-          Promise.resolve({ id: auditId, ...data }),
-        ),
+        update: jest
+          .fn()
+          .mockImplementation(({ data }) =>
+            Promise.resolve({ id: auditId, ...data }),
+          ),
       },
       webPage: {
         upsert: jest.fn().mockResolvedValue({}),
@@ -127,9 +129,9 @@ describe('AuditsService', () => {
       city: 'Antananarivo',
       country: 'Madagascar',
     });
-    expect(
-      auditRunner.runSiteAudit.mock.invocationCallOrder[0],
-    ).toBeLessThan(auditRunner.runAudit.mock.invocationCallOrder[0]);
+    expect(auditRunner.runSiteAudit.mock.invocationCallOrder[0]).toBeLessThan(
+      auditRunner.runAudit.mock.invocationCallOrder[0],
+    );
     expect(prisma.webPage.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         where: {

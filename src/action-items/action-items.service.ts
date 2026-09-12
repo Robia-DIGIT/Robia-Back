@@ -58,7 +58,10 @@ export class ActionItemsService {
     const affectedUrls = this.stringList(source.affectedUrls);
     const expected = evidence
       .map((item) => this.asRecord(item).expected)
-      .filter((item): item is string => typeof item === 'string' && Boolean(item.trim()));
+      .filter(
+        (item): item is string =>
+          typeof item === 'string' && Boolean(item.trim()),
+      );
     const summary =
       typeof source.summary === 'string' && source.summary.trim()
         ? source.summary.trim()
@@ -91,10 +94,9 @@ export class ActionItemsService {
     fallbackOpportunity?: OpportunityContext,
   ) {
     const enriched = actions.map((action) => {
-      const opportunity =
-        (action.opportunity as OpportunityContext | undefined) ??
-        fallbackOpportunity ??
-        { id: String(action.opportunityId ?? '') };
+      const opportunity = (action.opportunity as
+        OpportunityContext | undefined) ??
+        fallbackOpportunity ?? { id: String(action.opportunityId ?? '') };
       const source = this.asRecord(opportunity.sourceData);
       const recommendedSteps = this.stringList(source.recommendedSteps);
       const stepIndex = recommendedSteps.indexOf(String(action.title ?? ''));
@@ -119,8 +121,10 @@ export class ActionItemsService {
         return left.opportunityId.localeCompare(right.opportunityId);
       }
       if (left.stepIndex >= 0 || right.stepIndex >= 0) {
-        return (left.stepIndex < 0 ? 999 : left.stepIndex) -
-          (right.stepIndex < 0 ? 999 : right.stepIndex);
+        return (
+          (left.stepIndex < 0 ? 999 : left.stepIndex) -
+          (right.stepIndex < 0 ? 999 : right.stepIndex)
+        );
       }
       return left.createdAt - right.createdAt;
     });

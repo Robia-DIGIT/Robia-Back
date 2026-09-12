@@ -30,7 +30,9 @@ export class LocationPlacesService {
       throw new Error('GOOGLE_MAPS_API_KEY non configurée côté serveur.');
     }
 
-    const url = new URL('https://maps.googleapis.com/maps/api/place/textsearch/json');
+    const url = new URL(
+      'https://maps.googleapis.com/maps/api/place/textsearch/json',
+    );
     url.searchParams.set('query', query);
     url.searchParams.set('key', this.apiKey);
 
@@ -62,19 +64,28 @@ export class LocationPlacesService {
       throw new Error('GOOGLE_MAPS_API_KEY non configurée côté serveur.');
     }
 
-    const url = new URL('https://maps.googleapis.com/maps/api/place/details/json');
+    const url = new URL(
+      'https://maps.googleapis.com/maps/api/place/details/json',
+    );
     url.searchParams.set('place_id', placeId);
-    url.searchParams.set('fields', 'name,formatted_address,geometry,opening_hours');
+    url.searchParams.set(
+      'fields',
+      'name,formatted_address,geometry,opening_hours',
+    );
     url.searchParams.set('key', this.apiKey);
 
     const response = await fetch(url.toString());
     if (!response.ok) {
-      throw new Error(`Places API (details) a échoué avec le statut ${response.status}`);
+      throw new Error(
+        `Places API (details) a échoué avec le statut ${response.status}`,
+      );
     }
 
     const data = await response.json();
     if (data.status !== 'OK') {
-      throw new Error(`Places API (details) a retourné une erreur : ${data.status}`);
+      throw new Error(
+        `Places API (details) a retourné une erreur : ${data.status}`,
+      );
     }
 
     const result = data.result;

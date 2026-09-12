@@ -1,4 +1,8 @@
-import { Injectable, NotFoundException, ConflictException } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  ConflictException,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateWebsiteDto } from './dto/create-website.dto';
 import { Prisma } from '@prisma/client';
@@ -48,7 +52,9 @@ export class WebsitesService {
     });
 
     if (!website) {
-      throw new NotFoundException('Aucun site connecté pour cette organisation');
+      throw new NotFoundException(
+        'Aucun site connecté pour cette organisation',
+      );
     }
 
     return website;
