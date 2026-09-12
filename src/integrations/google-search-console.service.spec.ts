@@ -27,7 +27,7 @@ describe('GoogleSearchConsoleService', () => {
       update: jest.fn(),
       deleteMany: jest.fn(),
     },
-    googleSearchConsoleDailyMetric: { upsert: jest.fn() },
+    googleSearchConsoleDailyMetric: { upsert: jest.fn(), findMany: jest.fn() },
     $transaction: jest.fn(),
   };
   let service: GoogleSearchConsoleService;
@@ -100,7 +100,7 @@ describe('GoogleSearchConsoleService', () => {
       ok: true,
       status: 200,
       json: async () => responses.shift(),
-    })) as unknown as typeof fetch;
+    }));
 
     await expect(service.completeAuthorization('code', state)).resolves.toEqual(
       {
@@ -135,6 +135,109 @@ describe('GoogleSearchConsoleService', () => {
       prisma.googleSearchConsoleConnection.deleteMany,
     ).toHaveBeenCalledWith({
       where: { organizationId: 'org-1' },
+    });
+  });
+
+  describe('getSearchConsoleSignalsForAudit', () => {
+    it('never calls Google — reports not_connected when there is no connection at all', async () => {
+      prisma.googleSearchConsoleConnection.findUnique.mockResolvedValue(null);
+      const fetchSpy = jest.fn();
+      global.fetch = fetchSpy;
+
+      await expect(
+        service.getSearchConsoleSignalsForAudit('org-1'),
+      ).resolves.toEqual({
+        status: 'unavailable',
+        source: 'search_console',
+        siteUrl: null,
+        period: null,
+        summary: null,
+        lastSyncedAt: null,
+        unavailableReason: 'not_connected',
+      });
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it('reports no_property_selected when connected but no site was chosen yet', async () => {
+      prisma.googleSearchConsoleConnection.findUnique.mockResolvedValue({
+        id: 'connection-1',
+        selectedSiteUrl: null,
+        lastSyncedAt: null,
+      });
+
+      await expect(
+        service.getSearchConsoleSignalsForAudit('org-1'),
+      ).resolves.toEqual(
+        expect.objectContaining({
+          status: 'unavailable',
+          unavailableReason: 'no_property_selected',
+        }),
+      );
+      expect(
+        prisma.googleSearchConsoleDailyMetric.findMany,
+      ).not.toHaveBeenCalled();
+    });
+
+    it('reports not_synced_recently when a site is selected but no metric falls in the last 28 days', async () => {
+      const lastSyncedAt = new Date('2026-01-01T00:00:00.000Z');
+      prisma.googleSearchConsoleConnection.findUnique.mockResolvedValue({
+        id: 'connection-1',
+        selectedSiteUrl: 'sc-domain:robiacopilot.site',
+        lastSyncedAt,
+      });
+      prisma.googleSearchConsoleDailyMetric.findMany.mockResolvedValue([]);
+
+      await expect(
+        service.getSearchConsoleSignalsForAudit('org-1'),
+      ).resolves.toEqual({
+        status: 'unavailable',
+        source: 'search_console',
+        siteUrl: 'sc-domain:robiacopilot.site',
+        period: null,
+        summary: null,
+        lastSyncedAt,
+        unavailableReason: 'not_synced_recently',
+      });
+    });
+
+    it('reads only already-persisted metrics and summarizes them impression-weighted, without ever calling Google', async () => {
+      prisma.googleSearchConsoleConnection.findUnique.mockResolvedValue({
+        id: 'connection-1',
+        selectedSiteUrl: 'sc-domain:robiacopilot.site',
+        lastSyncedAt: new Date('2026-09-10T00:00:00.000Z'),
+      });
+      prisma.googleSearchConsoleDailyMetric.findMany.mockResolvedValue([
+        {
+          date: new Date('2026-09-09T00:00:00.000Z'),
+          clicks: 10,
+          impressions: 100,
+          ctr: 0.1,
+          position: 5,
+        },
+        {
+          date: new Date('2026-09-10T00:00:00.000Z'),
+          clicks: 20,
+          impressions: 300,
+          ctr: 0.0667,
+          position: 8,
+        },
+      ]);
+      const fetchSpy = jest.fn();
+      global.fetch = fetchSpy;
+
+      const result = await service.getSearchConsoleSignalsForAudit('org-1');
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(result.status).toBe('ok');
+      expect(result.siteUrl).toBe('sc-domain:robiacopilot.site');
+      // impression-weighted: clicks=30, impressions=400, ctr=30/400,
+      // position=(5*100 + 8*300)/400 — same formula as the live-fetch summarize().
+      expect(result.summary).toEqual({
+        clicks: 30,
+        impressions: 400,
+        ctr: 30 / 400,
+        position: (5 * 100 + 8 * 300) / 400,
+      });
     });
   });
 });

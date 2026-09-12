@@ -64,7 +64,7 @@ export class OpportunityGeneratorService {
       );
     }
 
-    return response.json();
+    return (await response.json()) as GeneratedOpportunity[];
   }
   
   /**
@@ -96,6 +96,6 @@ export class OpportunityGeneratorService {
       );
     }
 
-    return response.json();
+    return (await response.json()) as GeneratedOpportunity[];
   }
 }

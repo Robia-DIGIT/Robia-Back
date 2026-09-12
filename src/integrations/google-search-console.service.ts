@@ -92,6 +92,30 @@ interface AnalyticsReportResponse {
   rows?: AnalyticsReportRow[];
 }
 
+type SearchConsoleUnavailableReason =
+  'not_connected' | 'no_property_selected' | 'not_synced_recently';
+
+/**
+ * Additive, audit-attached Search Console evidence (RC-13). Same
+ * status/unavailableReason contract as PageSpeedInsightsResult (RC-10):
+ * never thrown, never influences global_score/seo_score_v2 — a future
+ * tranche decides whether and how these signals feed the score.
+ */
+export interface SearchConsoleAuditSignals {
+  status: 'ok' | 'unavailable';
+  source: 'search_console';
+  siteUrl: string | null;
+  period: { startDate: string; endDate: string } | null;
+  summary: {
+    clicks: number;
+    impressions: number;
+    ctr: number;
+    position: number;
+  } | null;
+  lastSyncedAt: Date | null;
+  unavailableReason: SearchConsoleUnavailableReason | null;
+}
+
 @Injectable()
 export class GoogleSearchConsoleService {
   private readonly logger = new Logger(GoogleSearchConsoleService.name);
@@ -497,6 +521,90 @@ export class GoogleSearchConsoleService {
     };
   }
 
+  /**
+   * Read-only Search Console signals for attaching to an audit result
+   * (RC-13). Unlike getPerformance(), this never calls the Google API —
+   * it only reads whatever was already persisted the last time the
+   * dashboard synced (googleSearchConsoleDailyMetric, populated by
+   * getPerformance()). That's a deliberate choice: the audit pipeline
+   * runs synchronously today (see audits.service.ts), and bolting a live
+   * Google Search Analytics call onto it would add latency and quota
+   * risk to every audit run, for an organization that may not even be
+   * looking at the audit-in-progress. A stale-but-real snapshot is more
+   * useful here than a live call that could stall or fail the audit.
+   * Never throws — mirrors the PageSpeedInsightsResult contract from
+   * RC-10 (status/unavailableReason, additive, audit-blocking-free).
+   */
+  async getSearchConsoleSignalsForAudit(
+    organizationId: string,
+  ): Promise<SearchConsoleAuditSignals> {
+    const connection =
+      await this.prisma.googleSearchConsoleConnection.findUnique({
+        where: { organizationId },
+        select: { id: true, selectedSiteUrl: true, lastSyncedAt: true },
+      });
+
+    const unavailable = (
+      reason: SearchConsoleUnavailableReason,
+    ): SearchConsoleAuditSignals => ({
+      status: 'unavailable',
+      source: 'search_console',
+      siteUrl: connection?.selectedSiteUrl ?? null,
+      period: null,
+      summary: null,
+      lastSyncedAt: connection?.lastSyncedAt ?? null,
+      unavailableReason: reason,
+    });
+
+    if (!connection) {
+      return unavailable('not_connected');
+    }
+    if (!connection.selectedSiteUrl) {
+      return unavailable('no_property_selected');
+    }
+
+    const endDate = new Date();
+    endDate.setUTCHours(0, 0, 0, 0);
+    endDate.setUTCDate(endDate.getUTCDate() - 1);
+    const startDate = new Date(endDate);
+    startDate.setUTCDate(startDate.getUTCDate() - 27);
+
+    const dailyMetrics =
+      await this.prisma.googleSearchConsoleDailyMetric.findMany({
+        where: {
+          connectionId: connection.id,
+          date: { gte: startDate, lte: endDate },
+        },
+      });
+
+    // Covers both "never synced" and "last sync fell outside the last 28
+    // days" — either way there is nothing recent enough to attach.
+    if (dailyMetrics.length === 0) {
+      return unavailable('not_synced_recently');
+    }
+
+    const rows = dailyMetrics.map((metric) => ({
+      key: this.formatDate(metric.date),
+      clicks: metric.clicks,
+      impressions: metric.impressions,
+      ctr: metric.ctr,
+      position: metric.position,
+    }));
+
+    return {
+      status: 'ok',
+      source: 'search_console',
+      siteUrl: connection.selectedSiteUrl,
+      period: {
+        startDate: this.formatDate(startDate),
+        endDate: this.formatDate(endDate),
+      },
+      summary: this.summarize(rows),
+      lastSyncedAt: connection.lastSyncedAt,
+      unavailableReason: null,
+    };
+  }
+
   async disconnect(organizationId: string) {
     await this.prisma.googleSearchConsoleConnection.deleteMany({
       where: { organizationId },
@@ -776,7 +884,9 @@ export class GoogleSearchConsoleService {
 
     let state: OAuthState;
     try {
-      state = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+      state = JSON.parse(
+        Buffer.from(payload, 'base64url').toString('utf8'),
+      ) as OAuthState;
     } catch {
       throw new UnauthorizedException('État OAuth invalide.');
     }
