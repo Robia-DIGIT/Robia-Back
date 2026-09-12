@@ -1,7 +1,10 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { AuditRunnerService, SiteAuditResult } from './audit-runner/audit-runner.service';
-//import { Prisma } from '@prisma/client';
+import {
+  AuditRunnerService,
+  SiteAuditResult,
+} from './audit-runner/audit-runner.service';
+import { Prisma } from '@prisma/client';
 
 @Injectable()
 export class AuditsService {
@@ -60,7 +63,10 @@ export class AuditsService {
           globalScore: result.global_score,
           // Keep the existing dashboard contract while attaching the
           // multi-page evidence used to generate site-wide opportunities.
-          resultJson: { ...result, site_audit: siteResult } as any,
+          resultJson: {
+            ...result,
+            site_audit: siteResult,
+          } as unknown as Prisma.InputJsonValue,
           completedAt: new Date(),
         },
       });
@@ -153,7 +159,7 @@ export class AuditsService {
         where: { id: audit.id },
         data: {
           status: 'completed',
-          resultJson: result as any,
+          resultJson: result as unknown as Prisma.InputJsonValue,
           completedAt: new Date(),
         },
       });
@@ -255,5 +261,4 @@ export class AuditsService {
       });
     }
   }
-
 }

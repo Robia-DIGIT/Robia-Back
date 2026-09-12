@@ -158,7 +158,7 @@ export class AuditRunnerService {
       );
     }
 
-    return response.json();
+    return (await response.json()) as AuditResult;
   }
 
   async runSiteAudit({ websiteUrl, maxPages = 20, maxDepth = 2, city, country }: RunSiteAuditParams): Promise<SiteAuditResult> {
@@ -174,6 +174,6 @@ export class AuditRunnerService {
       );
     }
 
-    return response.json();
+    return (await response.json()) as SiteAuditResult;
   }
 }

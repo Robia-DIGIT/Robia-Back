@@ -776,7 +776,9 @@ export class GoogleSearchConsoleService {
 
     let state: OAuthState;
     try {
-      state = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+      state = JSON.parse(
+        Buffer.from(payload, 'base64url').toString('utf8'),
+      ) as OAuthState;
     } catch {
       throw new UnauthorizedException('État OAuth invalide.');
     }

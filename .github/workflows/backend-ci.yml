@@ -30,7 +30,7 @@ jobs:
         shell: bash
         run: |
           npx eslint "{src,apps,libs,test}/**/*.ts" --format json --output-file eslint-report.json || true
-          node scripts/check-eslint-baseline.mjs eslint-report.json 269 30
+          node scripts/check-eslint-baseline.mjs eslint-report.json 148 30
 
   nest-build:
     runs-on: ubuntu-latest
