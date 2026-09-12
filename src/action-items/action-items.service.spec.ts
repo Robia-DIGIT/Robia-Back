@@ -51,7 +51,11 @@ describe('ActionItemsService', () => {
     });
     prisma.actionItem.findMany.mockResolvedValue([]);
     prisma.actionItem.create.mockImplementation(({ data }: any) =>
-      Promise.resolve({ id: `action-${data.title}`, ...data, createdAt: new Date() }),
+      Promise.resolve({
+        id: `action-${data.title}`,
+        ...data,
+        createdAt: new Date(),
+      }),
     );
 
     const result = await service.generateFromOpportunity(

@@ -78,6 +78,9 @@ export class LocationsService {
       );
     }
 
-    return this.weather.getCurrentWeather(location.latitude, location.longitude);
-  }  
+    return this.weather.getCurrentWeather(
+      location.latitude,
+      location.longitude,
+    );
+  }
 }

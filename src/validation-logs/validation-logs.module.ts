@@ -5,6 +5,6 @@ import { ValidationLogsController } from './validation-logs.controller';
 @Module({
   providers: [ValidationLogsService],
   controllers: [ValidationLogsController],
-  exports: [ValidationLogsService]
+  exports: [ValidationLogsService],
 })
 export class ValidationLogsModule {}

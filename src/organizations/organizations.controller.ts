@@ -22,10 +22,7 @@ export class OrganizationsController {
   constructor(private readonly organizationsService: OrganizationsService) {}
 
   @Post()
-  create(
-    @Req() req: AuthenticatedRequest,
-    @Body() dto: CreateOrganizationDto,
-  ) {
+  create(@Req() req: AuthenticatedRequest, @Body() dto: CreateOrganizationDto) {
     return this.organizationsService.create(req.user.userId, dto);
   }
 

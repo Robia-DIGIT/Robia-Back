@@ -100,7 +100,7 @@ describe('GoogleSearchConsoleService', () => {
       ok: true,
       status: 200,
       json: async () => responses.shift(),
-    })) as unknown as typeof fetch;
+    }));
 
     await expect(service.completeAuthorization('code', state)).resolves.toEqual(
       {

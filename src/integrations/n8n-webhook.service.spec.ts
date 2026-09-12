@@ -20,7 +20,7 @@ describe('N8nWebhookService', () => {
     );
     service = new N8nWebhookService(config as unknown as ConfigService);
     fetchMock = jest.fn().mockResolvedValue({ ok: true, status: 200 });
-    global.fetch = fetchMock as unknown as typeof fetch;
+    global.fetch = fetchMock;
   });
 
   it('sends the welcome event with the configured shared secret', async () => {
