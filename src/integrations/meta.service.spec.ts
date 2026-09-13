@@ -38,11 +38,15 @@ describe('MetaService', () => {
   const config = {
     get: jest.fn((name: string) => values[name]),
   };
+  let capturedUpsert: MetaUpsertPayload | undefined;
   const prisma = {
     organization: { findFirst: jest.fn() },
     metaConnection: {
       findUnique: jest.fn(),
-      upsert: jest.fn(),
+      upsert: jest.fn((payload: MetaUpsertPayload) => {
+        capturedUpsert = payload;
+        return Promise.resolve({ id: 'meta-1' });
+      }),
       update: jest.fn(),
       deleteMany: jest.fn(),
     },
@@ -52,6 +56,7 @@ describe('MetaService', () => {
   beforeEach(() => {
     jest.restoreAllMocks();
     jest.clearAllMocks();
+    capturedUpsert = undefined;
     config.get.mockImplementation((name: string) => values[name]);
     service = new MetaService(
       prisma as unknown as PrismaService,
@@ -94,7 +99,6 @@ describe('MetaService', () => {
     ).searchParams.get('state')!;
     prisma.organization.findFirst.mockResolvedValue({ id: 'org-1' });
     prisma.metaConnection.findUnique.mockResolvedValue(null);
-    prisma.metaConnection.upsert.mockResolvedValue({ id: 'meta-1' });
 
     const responses: object[] = [
       { access_token: 'short-user-token' },
@@ -136,9 +140,6 @@ describe('MetaService', () => {
       { connected: true },
     );
 
-    const capturedUpsert = prisma.metaConnection.upsert.mock.calls[0]?.[0] as
-      | MetaUpsertPayload
-      | undefined;
     expect(capturedUpsert).toBeDefined();
     if (!capturedUpsert) {
       throw new Error('Meta upsert was not captured.');
@@ -154,9 +155,7 @@ describe('MetaService', () => {
     expect(capturedUpsert.update.encryptedUserAccessToken).toMatch(/^v1\./);
     expect(capturedUpsert.update.encryptedPageAccessToken).toMatch(/^v1\./);
 
-    const serializedCall = JSON.stringify(
-      prisma.metaConnection.upsert.mock.calls,
-    );
+    const serializedCall = JSON.stringify(capturedUpsert);
     expect(serializedCall).not.toContain(
       'long-user-token-never-store-in-clear',
     );
