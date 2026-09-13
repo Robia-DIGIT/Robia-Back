@@ -107,10 +107,7 @@ export class MetaController {
 
   @Post('assets/select')
   @UseGuards(JwtAuthGuard, OrgScopeGuard)
-  selectAsset(
-    @Req() request: ScopedRequest,
-    @Body() dto: SelectMetaPageDto,
-  ) {
+  selectAsset(@Req() request: ScopedRequest, @Body() dto: SelectMetaPageDto) {
     return this.meta.selectPage(request.organizationId, dto.pageId);
   }
 

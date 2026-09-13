@@ -160,7 +160,9 @@ export class MetaService {
     if (!shortToken.access_token) {
       throw new BadGatewayException("Meta n'a pas fourni de jeton d'accès.");
     }
-    const longToken = await this.exchangeLongLivedToken(shortToken.access_token);
+    const longToken = await this.exchangeLongLivedToken(
+      shortToken.access_token,
+    );
     if (!longToken.access_token) {
       throw new BadGatewayException(
         "Meta n'a pas fourni de jeton d'accès longue durée.",
@@ -197,8 +199,7 @@ export class MetaService {
         encryptedPageAccessToken: selectedPage?.accessToken
           ? this.encrypt(selectedPage.accessToken)
           : null,
-        selectedInstagramAccountId:
-          selectedPage?.instagramAccount?.id ?? null,
+        selectedInstagramAccountId: selectedPage?.instagramAccount?.id ?? null,
         selectedInstagramUsername:
           selectedPage?.instagramAccount?.username ?? null,
       },
@@ -212,8 +213,7 @@ export class MetaService {
         encryptedPageAccessToken: selectedPage?.accessToken
           ? this.encrypt(selectedPage.accessToken)
           : null,
-        selectedInstagramAccountId:
-          selectedPage?.instagramAccount?.id ?? null,
+        selectedInstagramAccountId: selectedPage?.instagramAccount?.id ?? null,
         selectedInstagramUsername:
           selectedPage?.instagramAccount?.username ?? null,
         connectedAt: new Date(),
@@ -344,10 +344,7 @@ export class MetaService {
       instagram = await this.graphGet<MetaInstagramProfile>(
         connection.selectedInstagramAccountId,
         pageToken,
-        {
-          fields:
-            'id,username,followers_count,follows_count,media_count',
-        },
+        { fields: 'id,username,followers_count,follows_count,media_count' },
       );
       try {
         const media = await this.graphGet<MetaInstagramMediaResponse>(
@@ -387,8 +384,7 @@ export class MetaService {
       },
       instagram: instagram
         ? {
-            accountId:
-              instagram.id ?? connection.selectedInstagramAccountId,
+            accountId: instagram.id ?? connection.selectedInstagramAccountId,
             username:
               instagram.username ?? connection.selectedInstagramUsername,
             followersCount: instagram.followers_count ?? null,
@@ -424,7 +420,9 @@ export class MetaService {
       where: { organizationId },
     });
     if (!connection) {
-      throw new NotFoundException("Meta n'est pas connecté pour cette organisation.");
+      throw new NotFoundException(
+        "Meta n'est pas connecté pour cette organisation.",
+      );
     }
     return connection;
   }
@@ -440,8 +438,13 @@ export class MetaService {
   private selectablePages(response: MetaPageListResponse) {
     return (response.data ?? [])
       .filter(
-        (page): page is MetaPage & { id: string; name: string; access_token: string } =>
-          Boolean(page.id && page.name && page.access_token),
+        (
+          page,
+        ): page is MetaPage & {
+          id: string;
+          name: string;
+          access_token: string;
+        } => Boolean(page.id && page.name && page.access_token),
       )
       .map((page) => ({
         id: page.id,
@@ -497,9 +500,7 @@ export class MetaService {
     accessToken?: string,
     params: Record<string, string> = {},
   ): Promise<T> {
-    const url = new URL(
-      `${this.graphBaseUrl()}/${path.replace(/^\//, '')}`,
-    );
+    const url = new URL(`${this.graphBaseUrl()}/${path.replace(/^\//, '')}`);
     for (const [key, value] of Object.entries(params)) {
       url.searchParams.set(key, value);
     }
@@ -520,16 +521,14 @@ export class MetaService {
       );
     }
 
-    const payload = (await response.json().catch(() => ({}))) as
-      | T
-      | MetaGraphErrorResponse;
+    const payload = (await response.json().catch(() => ({}))) as T;
     if (!response.ok) {
       const graphError = payload as MetaGraphErrorResponse;
       throw new BadGatewayException(
         graphError.error?.message || 'Meta a refusé la requête.',
       );
     }
-    return payload as T;
+    return payload;
   }
 
   private graphBaseUrl() {

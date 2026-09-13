@@ -12,8 +12,7 @@ describe('MetaService', () => {
     META_TOKEN_ENCRYPTION_KEY: 'c'.repeat(64),
     META_OAUTH_STATE_SECRET: 'd'.repeat(64),
     META_GRAPH_API_VERSION: 'v26.0',
-    META_OAUTH_SCOPES:
-      'pages_show_list,pages_read_engagement,instagram_basic',
+    META_OAUTH_SCOPES: 'pages_show_list,pages_read_engagement,instagram_basic',
     META_GRAPH_TIMEOUT_MS: '10000',
     DASHBOARD_URL: 'https://app.robiacopilot.site',
   };
@@ -32,6 +31,7 @@ describe('MetaService', () => {
   let service: MetaService;
 
   beforeEach(() => {
+    jest.restoreAllMocks();
     jest.clearAllMocks();
     config.get.mockImplementation((name: string) => values[name]);
     service = new MetaService(
@@ -77,7 +77,7 @@ describe('MetaService', () => {
     prisma.metaConnection.findUnique.mockResolvedValue(null);
     prisma.metaConnection.upsert.mockResolvedValue({ id: 'meta-1' });
 
-    const responses = [
+    const responses: object[] = [
       { access_token: 'short-user-token' },
       { access_token: 'long-user-token-never-store-in-clear' },
       { id: 'meta-user-1', name: 'ROBIA Owner' },
@@ -103,25 +103,41 @@ describe('MetaService', () => {
         ],
       },
     ];
-    global.fetch = jest.fn().mockImplementation(async () => ({
-      ok: true,
-      status: 200,
-      json: async () => responses.shift(),
-    }));
+    jest.spyOn(global, 'fetch').mockImplementation(() => {
+      const payload = responses.shift() ?? {};
+      return Promise.resolve(
+        new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      );
+    });
 
     await expect(service.completeAuthorization('code', state)).resolves.toEqual(
       { connected: true },
     );
 
-    const data = prisma.metaConnection.upsert.mock.calls[0][0].create;
-    expect(data.organizationId).toBe('org-1');
-    expect(data.metaUserId).toBe('meta-user-1');
-    expect(data.selectedPageId).toBe('page-1');
-    expect(data.selectedInstagramAccountId).toBe('ig-1');
-    expect(data.encryptedUserAccessToken).toMatch(/^v1\./);
-    expect(data.encryptedPageAccessToken).toMatch(/^v1\./);
-    expect(data.encryptedUserAccessToken).not.toContain('long-user-token');
-    expect(data.encryptedPageAccessToken).not.toContain('page-token');
+    expect(prisma.metaConnection.upsert).toHaveBeenCalledWith({
+      where: { organizationId: 'org-1' },
+      create: expect.objectContaining({
+        organizationId: 'org-1',
+        metaUserId: 'meta-user-1',
+        selectedPageId: 'page-1',
+        selectedInstagramAccountId: 'ig-1',
+        encryptedUserAccessToken: expect.stringMatching(/^v1\./),
+        encryptedPageAccessToken: expect.stringMatching(/^v1\./),
+      }),
+      update: expect.objectContaining({
+        metaUserId: 'meta-user-1',
+        selectedPageId: 'page-1',
+        selectedInstagramAccountId: 'ig-1',
+        encryptedUserAccessToken: expect.stringMatching(/^v1\./),
+        encryptedPageAccessToken: expect.stringMatching(/^v1\./),
+      }),
+    });
+    const serializedCall = JSON.stringify(prisma.metaConnection.upsert.mock.calls);
+    expect(serializedCall).not.toContain('long-user-token-never-store-in-clear');
+    expect(serializedCall).not.toContain('page-token-never-store-in-clear');
   });
 
   it('returns a token-free disconnected status and deletes only one organization', async () => {
