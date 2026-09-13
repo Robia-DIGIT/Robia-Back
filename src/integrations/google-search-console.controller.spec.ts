@@ -9,7 +9,8 @@ describe('GoogleSearchConsoleController', () => {
     getAuthorizationUrl: jest.fn(() => authorizationUrl),
     completeAuthorization: jest.fn(),
     getDashboardRedirect: jest.fn(
-      (status: string) => `https://app.robiacopilot.site/google-data?google=${status}`,
+      (status: string) =>
+        `https://app.robiacopilot.site/google-data?google=${status}`,
     ),
   };
   let controller: GoogleSearchConsoleController;

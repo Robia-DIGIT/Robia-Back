@@ -43,7 +43,10 @@ export class LocationWeatherService {
    * clé API, quotas larges pour un usage MVP). Nécessite uniquement des
    * coordonnées — pas de compte ni de configuration.
    */
-  async getCurrentWeather(latitude: number, longitude: number): Promise<CurrentWeather> {
+  async getCurrentWeather(
+    latitude: number,
+    longitude: number,
+  ): Promise<CurrentWeather> {
     const url = new URL('https://api.open-meteo.com/v1/forecast');
     url.searchParams.set('latitude', latitude.toString());
     url.searchParams.set('longitude', longitude.toString());
@@ -61,7 +64,7 @@ export class LocationWeatherService {
     const data = await response.json();
     const current = data.current;
     if (!current) {
-      throw new Error('Open-Meteo n\'a retourné aucune donnée météo actuelle.');
+      throw new Error("Open-Meteo n'a retourné aucune donnée météo actuelle.");
     }
 
     const weatherCode = current.weather_code;
@@ -71,7 +74,8 @@ export class LocationWeatherService {
       precipitationMm: current.precipitation,
       windSpeedKmh: current.wind_speed_10m,
       weatherCode,
-      description: WEATHER_CODE_DESCRIPTIONS[weatherCode] ?? 'Conditions inconnues',
+      description:
+        WEATHER_CODE_DESCRIPTIONS[weatherCode] ?? 'Conditions inconnues',
       isDay: current.is_day === 1,
       observedAt: current.time,
     };
