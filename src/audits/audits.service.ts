@@ -4,6 +4,7 @@ import {
   AuditRunnerService,
   SiteAuditResult,
 } from './audit-runner/audit-runner.service';
+import { GoogleSearchConsoleService } from '../integrations/google-search-console.service';
 import { Prisma } from '@prisma/client';
 
 @Injectable()
@@ -11,6 +12,7 @@ export class AuditsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly auditRunner: AuditRunnerService,
+    private readonly googleSearchConsole: GoogleSearchConsoleService,
   ) {}
 
   async run(organizationId: string, websiteId: string) {
@@ -56,6 +58,14 @@ export class AuditsService {
         country: organization?.country,
       });
 
+      // RC-13: attaches whatever Search Console signal is already on
+      // file, purely as evidence — never influences globalScore, and
+      // 'unavailable' (not connected/synced) is a normal, expected value.
+      const googleSearchConsole =
+        await this.googleSearchConsole.getSearchConsoleSignalsForAudit(
+          organizationId,
+        );
+
       return this.prisma.audit.update({
         where: { id: audit.id },
         data: {
@@ -66,6 +76,7 @@ export class AuditsService {
           resultJson: {
             ...result,
             site_audit: siteResult,
+            google_search_console: googleSearchConsole,
           } as unknown as Prisma.InputJsonValue,
           completedAt: new Date(),
         },
@@ -155,11 +166,19 @@ export class AuditsService {
       this.ensureSitePages(result);
       await this.persistSitePages(website.id, result);
 
+      const googleSearchConsole =
+        await this.googleSearchConsole.getSearchConsoleSignalsForAudit(
+          organizationId,
+        );
+
       return this.prisma.audit.update({
         where: { id: audit.id },
         data: {
           status: 'completed',
-          resultJson: result as unknown as Prisma.InputJsonValue,
+          resultJson: {
+            ...result,
+            google_search_console: googleSearchConsole,
+          } as unknown as Prisma.InputJsonValue,
           completedAt: new Date(),
         },
       });

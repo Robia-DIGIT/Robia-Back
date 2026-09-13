@@ -12,9 +12,7 @@ interface ScopedRequest extends Request {
 @Controller('validations')
 @UseGuards(JwtAuthGuard, OrgScopeGuard)
 export class ValidationLogsController {
-  constructor(
-    private readonly validationLogsService: ValidationLogsService,
-  ) {}
+  constructor(private readonly validationLogsService: ValidationLogsService) {}
 
   @Post()
   create(@Req() req: ScopedRequest, @Body() dto: CreateValidationLogDto) {
