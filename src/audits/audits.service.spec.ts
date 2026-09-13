@@ -1,4 +1,5 @@
 import { AuditsService } from './audits.service';
+import { GoogleSearchConsoleService } from '../integrations/google-search-console.service';
 
 describe('AuditsService', () => {
   const organizationId = 'org-1';
@@ -7,6 +8,7 @@ describe('AuditsService', () => {
 
   let prisma: any;
   let auditRunner: any;
+  let googleSearchConsole: { getSearchConsoleSignalsForAudit: jest.Mock };
   let service: AuditsService;
 
   const page = {
@@ -79,6 +81,16 @@ describe('AuditsService', () => {
     summary: 'Résumé',
   };
 
+  const searchConsoleSignals = {
+    status: 'unavailable',
+    source: 'search_console',
+    siteUrl: null,
+    period: null,
+    summary: null,
+    lastSyncedAt: null,
+    unavailableReason: 'not_connected',
+  };
+
   beforeEach(() => {
     prisma = {
       website: {
@@ -110,7 +122,16 @@ describe('AuditsService', () => {
       runSiteAudit: jest.fn().mockResolvedValue(siteResult),
       runAudit: jest.fn().mockResolvedValue(scoreResult),
     };
-    service = new AuditsService(prisma, auditRunner);
+    googleSearchConsole = {
+      getSearchConsoleSignalsForAudit: jest
+        .fn()
+        .mockResolvedValue(searchConsoleSignals),
+    };
+    service = new AuditsService(
+      prisma,
+      auditRunner,
+      googleSearchConsole as unknown as GoogleSearchConsoleService,
+    );
   });
 
   it('crawls and persists site pages before completing the standard audit', async () => {
@@ -156,11 +177,15 @@ describe('AuditsService', () => {
           resultJson: expect.objectContaining({
             global_score: 62,
             site_audit: siteResult,
+            google_search_console: searchConsoleSignals,
           }),
           completedAt: expect.any(Date),
         }),
       }),
     );
+    expect(
+      googleSearchConsole.getSearchConsoleSignalsForAudit,
+    ).toHaveBeenCalledWith(organizationId);
     expect(result.status).toBe('completed');
   });
 
@@ -175,6 +200,9 @@ describe('AuditsService', () => {
 
     expect(auditRunner.runAudit).not.toHaveBeenCalled();
     expect(prisma.webPage.upsert).not.toHaveBeenCalled();
+    expect(
+      googleSearchConsole.getSearchConsoleSignalsForAudit,
+    ).not.toHaveBeenCalled();
     expect(prisma.audit.update).toHaveBeenCalledWith({
       where: { id: auditId },
       data: {

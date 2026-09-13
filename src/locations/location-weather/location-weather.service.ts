@@ -1,5 +1,18 @@
 import { Injectable } from '@nestjs/common';
 
+interface OpenMeteoCurrentBlock {
+  temperature_2m: number;
+  precipitation: number;
+  weather_code: number;
+  wind_speed_10m: number;
+  is_day: number;
+  time: string;
+}
+
+interface OpenMeteoForecastResponse {
+  current?: OpenMeteoCurrentBlock;
+}
+
 export interface CurrentWeather {
   temperatureC: number;
   precipitationMm: number;
@@ -61,7 +74,7 @@ export class LocationWeatherService {
       throw new Error(`Open-Meteo a échoué avec le statut ${response.status}`);
     }
 
-    const data = await response.json();
+    const data = (await response.json()) as OpenMeteoForecastResponse;
     const current = data.current;
     if (!current) {
       throw new Error("Open-Meteo n'a retourné aucune donnée météo actuelle.");
