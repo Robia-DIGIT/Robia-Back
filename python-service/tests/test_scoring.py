@@ -60,9 +60,9 @@ class ComputeSeoScoreV2Tests(unittest.TestCase):
         self.assertEqual(result["categories"]["local"]["score"], 0)
 
     def test_global_score_weights_only_measured_categories(self):
-        # Only "content" (weight 0.20) and "local" (weight 0.25) are
+        # Only "content" (weight 0.25) and "local" (weight 0.25) are
         # measured; the global score must come from those two weights
-        # alone, not a fabricated 5-way split.
+        # alone, not a fabricated 4-way split.
         findings = [
             _finding("content", "passed"),  # 100
             _finding("local", "failed", severity="medium"),  # 86
@@ -70,11 +70,60 @@ class ComputeSeoScoreV2Tests(unittest.TestCase):
 
         result = compute_seo_score_v2(findings)
 
-        expected = round((100 * 0.20 + 86 * 0.25) / (0.20 + 0.25))
+        expected = round((100 * 0.25 + 86 * 0.25) / (0.25 + 0.25))
         self.assertEqual(result["globalScore"], expected)
         self.assertFalse(result["categories"]["technical"]["measured"])
         self.assertFalse(result["categories"]["performance"]["measured"])
-        self.assertFalse(result["categories"]["ai_readiness"]["measured"])
+
+    def test_category_weights_match_the_validated_product_decision(self):
+        # Romeo/Landry decision closing the RC-12 handoff's open question.
+        # "ai_readiness" is deliberately absent — see the next two tests.
+        self.assertEqual(
+            CATEGORY_WEIGHTS,
+            {
+                "technical": 0.30,
+                "content": 0.25,
+                "local": 0.25,
+                "performance": 0.20,
+            },
+        )
+        self.assertNotIn("ai_readiness", CATEGORY_WEIGHTS)
+
+    def test_ai_readiness_is_scored_but_carries_no_weight(self):
+        findings = [_finding("ai_readiness", "failed", severity="critical")]
+
+        result = compute_seo_score_v2(findings)
+
+        self.assertTrue(result["categories"]["ai_readiness"]["measured"])
+        self.assertIsNotNone(result["categories"]["ai_readiness"]["score"])
+        self.assertIsNone(result["categories"]["ai_readiness"]["weight"])
+        # The only measured category is unweighted, so there is nothing
+        # to average — never a fabricated global score from it alone.
+        self.assertIsNone(result["globalScore"])
+
+    def test_ai_readiness_never_moves_the_global_score(self):
+        # "technical" alone, perfect score: with only 4 weighted axes, a
+        # single fully-measured axis IS the whole weighted average
+        # (weight_sum == that axis's own weight), so the expected global
+        # score is exactly 100 regardless of what CATEGORY_WEIGHTS["technical"]
+        # happens to be. Four "critical" findings clamp ai_readiness's own
+        # score to 0 (same pattern as test_score_never_goes_below_zero) —
+        # the worst possible ai_readiness result still must not move it.
+        baseline_findings = [_finding("technical", "passed")]
+        terrible_ai_readiness_findings = [
+            _finding("ai_readiness", "failed", severity="critical") for _ in range(4)
+        ]
+
+        baseline = compute_seo_score_v2(baseline_findings)
+        with_terrible_ai_readiness = compute_seo_score_v2(
+            baseline_findings + terrible_ai_readiness_findings
+        )
+
+        self.assertEqual(baseline["globalScore"], 100)
+        self.assertEqual(with_terrible_ai_readiness["globalScore"], 100)
+        self.assertEqual(
+            with_terrible_ai_readiness["categories"]["ai_readiness"]["score"], 0
+        )
 
     def test_unweighted_category_is_reported_but_excluded_from_global_score(self):
         findings = [_finding("uncategorized", "failed", severity="critical")]

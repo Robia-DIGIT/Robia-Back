@@ -134,9 +134,10 @@ def run_site_audit(url: str, max_pages: int = 20, max_depth: int = 2, city: str 
         result, city, country, psi_result=psi_result
     )
     # Additive only (RC-12): exposed alongside the legacy score, does not
-    # replace resultJson.global_score / Audit.globalScore. Switching the
-    # displayed score to v2 is a separate product decision — see the
-    # RC-12 handoff for the two migration options (recompute vs. freeze
-    # existing audits).
+    # replace resultJson.global_score / Audit.globalScore. Closed product
+    # decision (Romeo/Landry): no historical recompute — existing audits
+    # keep their legacy score exactly as stored; new audits get both
+    # legacy and v2, additively, until a final display-migration decision
+    # is made separately.
     result["seo_score_v2"] = compute_seo_score_v2(result["detailed_findings"])
     return result

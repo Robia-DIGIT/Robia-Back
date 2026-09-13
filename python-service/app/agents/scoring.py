@@ -5,9 +5,12 @@ This is a deliberately scoped first slice of the RC-12 plan: an explicit,
 testable score formula. It does not expand rule coverage (still the rules
 introduced through RC-10) and it does not touch or replace the legacy
 score (`Audit.globalScore` / `resultJson.global_score`, computed by
-`analysis.py`'s `compute_audit_result` for the older single-page path) —
-that is a separate decision (recompute existing audits vs. freeze them)
-left to product/Romeo-Landry, not something to improvise here.
+`analysis.py`'s `compute_audit_result` for the older single-page path).
+Closed product decision (Romeo/Landry): no historical recompute —
+existing audits keep their legacy score exactly as stored, new audits
+get both legacy and v2 additively, and legacy `globalScore` is never
+overwritten until a final display-migration decision is made
+separately.
 
 ## Why not the legacy formula
 
@@ -38,13 +41,27 @@ to represent "not measured" — a category with nothing to say about it.
    the weights actually available. A site where only "technical" and
    "content" have been evaluated gets a global score computed from
    those two axes' weights alone, not from an assumption about the
-   other three.
+   other two.
 4. If nothing at all is measured, the global score is `None`.
 
-CATEGORY_WEIGHTS is a proposal, not a final product decision — see the
-RC-12 plan handoff for the reasoning and for the open question of
-whether "ai_readiness" (LLM-derived, not deterministic) belongs at the
-same weight class as the four rule-based axes.
+Closed product decision (Romeo/Landry): Search Console and GA4 are
+outcome/performance signals, displayed separately (see
+`GoogleSearchConsoleService.getSearchConsoleSignalsForAudit` /
+`AuditSearchConsoleSignals`) — they do not, and will not, feed into
+this formula. Nothing in `compute_seo_score_v2` reads either signal;
+its only input is `detailed_findings`.
+
+CATEGORY_WEIGHTS below reflects the official product decision (Romeo/
+Landry, closing the RC-12 handoff's open question): technical=0.30,
+content=0.25, local=0.25, performance=0.20. "ai_readiness" is
+deliberately absent from this dict — it is LLM-derived reasoning, not a
+deterministic rule like the other four axes, and the decision is that it
+must never move `seo_score_v2`. It still gets scored and reported as its
+own entry in `categories` (informative only, `weight: None`) whenever
+the audit produced ai_readiness findings — see `compute_seo_score_v2`:
+a category absent from CATEGORY_WEIGHTS is excluded from `available` and
+therefore from the weighted average, by construction, not by a special
+case.
 """
 
 from __future__ import annotations
@@ -53,16 +70,14 @@ from typing import Any, Optional, TypedDict
 
 from app.agents.audit_rules import SEVERITY_WEIGHTS
 
-# Proposal (RC-12 plan): sums to 1.0. "local" weighted highest because
-# ROBIA's stated product focus is local SEO for PMEs; "ai_readiness" is
-# weighted lowest because it is LLM-derived reasoning, not a
-# deterministic, reproducible rule like the other four axes.
+# Official weights (Romeo/Landry decision). Sums to 1.0 across the four
+# deterministic, rule-based axes only. "ai_readiness" is intentionally
+# not a key here — see the module docstring.
 CATEGORY_WEIGHTS: dict[str, float] = {
+    "technical": 0.30,
+    "content": 0.25,
     "local": 0.25,
-    "technical": 0.20,
-    "content": 0.20,
     "performance": 0.20,
-    "ai_readiness": 0.15,
 }
 
 TESTED_STATUSES = {"passed", "warning", "failed"}
