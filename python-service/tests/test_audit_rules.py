@@ -385,6 +385,25 @@ class LocalAndTechnicalRuleExpansionTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "passed")
 
+    def test_recognizes_the_literal_localbusiness_type(self):
+        page = {**self.page_with_signals, "structured_data_types": ["LocalBusiness"]}
+        findings = evaluate_site_audit(self.site([page]))
+        result = self.finding(findings, "local.structured_data_missing")
+
+        self.assertEqual(result["status"], "passed")
+
+    def test_rejects_organization_as_insufficient_local_business_evidence(self):
+        # schema.org defines LocalBusiness as a *subtype* of Organization, not
+        # the other way around — a bare Organization markup (e.g. a generic
+        # corporate JSON-LD block) is not evidence of a local business
+        # presence, and must not satisfy this check.
+        page = {**self.page_with_signals, "structured_data_types": ["Organization"]}
+        findings = evaluate_site_audit(self.site([page]))
+        result = self.finding(findings, "local.structured_data_missing")
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["category"], "local")
+
     def test_flags_missing_social_links(self):
         findings = evaluate_site_audit(self.site([self.page_without_signals]))
         result = self.finding(findings, "local.social_profiles_missing")

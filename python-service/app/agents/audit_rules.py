@@ -721,9 +721,12 @@ def evaluate_site_audit(
     # scraper captures the raw JSON-LD "@type" string with no ontology
     # resolution, so this intentionally does not attempt to recognize
     # every possible LocalBusiness subtype (see https://schema.org/LocalBusiness).
+    # "Organization" is deliberately excluded: schema.org defines LocalBusiness
+    # as a more specific subtype of Organization, not the other way around, so
+    # a bare Organization markup is not evidence of a local business presence —
+    # accepting it would let a generic corporate markup pass this check.
     LOCAL_BUSINESS_SCHEMA_TYPES = {
         "LocalBusiness",
-        "Organization",
         "Restaurant",
         "Store",
         "ProfessionalService",
