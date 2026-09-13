@@ -3,6 +3,25 @@ import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { MetaService } from './meta.service';
 
+interface MetaUpsertPayload {
+  where: { organizationId: string };
+  create: {
+    organizationId: string;
+    metaUserId: string | null;
+    selectedPageId: string | null;
+    selectedInstagramAccountId: string | null;
+    encryptedUserAccessToken: string;
+    encryptedPageAccessToken: string | null;
+  };
+  update: {
+    metaUserId: string | null;
+    selectedPageId: string | null;
+    selectedInstagramAccountId: string | null;
+    encryptedUserAccessToken: string;
+    encryptedPageAccessToken: string | null;
+  };
+}
+
 describe('MetaService', () => {
   const values: Record<string, string> = {
     META_APP_ID: '1234567890',
@@ -117,26 +136,30 @@ describe('MetaService', () => {
       { connected: true },
     );
 
-    expect(prisma.metaConnection.upsert).toHaveBeenCalledWith({
-      where: { organizationId: 'org-1' },
-      create: expect.objectContaining({
-        organizationId: 'org-1',
-        metaUserId: 'meta-user-1',
-        selectedPageId: 'page-1',
-        selectedInstagramAccountId: 'ig-1',
-        encryptedUserAccessToken: expect.stringMatching(/^v1\./),
-        encryptedPageAccessToken: expect.stringMatching(/^v1\./),
-      }),
-      update: expect.objectContaining({
-        metaUserId: 'meta-user-1',
-        selectedPageId: 'page-1',
-        selectedInstagramAccountId: 'ig-1',
-        encryptedUserAccessToken: expect.stringMatching(/^v1\./),
-        encryptedPageAccessToken: expect.stringMatching(/^v1\./),
-      }),
-    });
-    const serializedCall = JSON.stringify(prisma.metaConnection.upsert.mock.calls);
-    expect(serializedCall).not.toContain('long-user-token-never-store-in-clear');
+    const capturedUpsert = prisma.metaConnection.upsert.mock.calls[0]?.[0] as
+      | MetaUpsertPayload
+      | undefined;
+    expect(capturedUpsert).toBeDefined();
+    if (!capturedUpsert) {
+      throw new Error('Meta upsert was not captured.');
+    }
+
+    expect(capturedUpsert.where.organizationId).toBe('org-1');
+    expect(capturedUpsert.create.organizationId).toBe('org-1');
+    expect(capturedUpsert.create.metaUserId).toBe('meta-user-1');
+    expect(capturedUpsert.create.selectedPageId).toBe('page-1');
+    expect(capturedUpsert.create.selectedInstagramAccountId).toBe('ig-1');
+    expect(capturedUpsert.create.encryptedUserAccessToken).toMatch(/^v1\./);
+    expect(capturedUpsert.create.encryptedPageAccessToken).toMatch(/^v1\./);
+    expect(capturedUpsert.update.encryptedUserAccessToken).toMatch(/^v1\./);
+    expect(capturedUpsert.update.encryptedPageAccessToken).toMatch(/^v1\./);
+
+    const serializedCall = JSON.stringify(
+      prisma.metaConnection.upsert.mock.calls,
+    );
+    expect(serializedCall).not.toContain(
+      'long-user-token-never-store-in-clear',
+    );
     expect(serializedCall).not.toContain('page-token-never-store-in-clear');
   });
 
