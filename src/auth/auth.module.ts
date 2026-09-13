@@ -21,11 +21,7 @@ import { PasswordResetMailService } from './password-reset-mail.service';
       }),
     }),
   ],
-  providers: [
-    AuthService,
-    JwtStrategy,
-    PasswordResetMailService,
-  ],
+  providers: [AuthService, JwtStrategy, PasswordResetMailService],
   controllers: [AuthController],
   exports: [AuthService],
 })

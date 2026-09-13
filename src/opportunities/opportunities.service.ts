@@ -28,8 +28,7 @@ export class OpportunitiesService {
       priorityScore: opportunity.priority_score,
       affectedUrls: opportunity.affected_urls ?? [],
       evidence: opportunity.evidence ?? [],
-      whyItMatters:
-        opportunity.why_it_matters ?? opportunity.description,
+      whyItMatters: opportunity.why_it_matters ?? opportunity.description,
       recommendedSteps: opportunity.recommended_steps ?? [],
     };
   }

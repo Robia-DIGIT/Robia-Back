@@ -27,7 +27,7 @@ export class BillingService {
     });
     const hasPaidAccess = Boolean(
       subscription &&
-        ['active', 'trialing', 'past_due'].includes(subscription.status),
+      ['active', 'trialing', 'past_due'].includes(subscription.status),
     );
 
     return {
