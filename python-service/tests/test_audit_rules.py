@@ -297,5 +297,123 @@ class EvaluateSiteAuditPerformanceIntegrationTests(unittest.TestCase):
         )
 
 
+class LocalAndTechnicalRuleExpansionTests(unittest.TestCase):
+    """RC-12 (tranche 2): technical.viewport_missing, technical.html_lang_missing,
+    local.structured_data_missing, local.social_profiles_missing — all built
+    on fields the crawler already captured (ScrapedPage.viewport_present /
+    html_lang / social_links / structured_data_types) but that no v2 rule
+    used before this."""
+
+    def setUp(self):
+        self.page_with_signals = {
+            "url": "https://example.com/",
+            "accessible": True,
+            "status_code": 200,
+            "title": "Service local à Antananarivo",
+            "meta_description": "Une description utile.",
+            "h1": ["Service local"],
+            "canonical": "https://example.com/",
+            "meta_robots": "index, follow",
+            "word_count": 650,
+            "images_count": 1,
+            "images_without_alt": 0,
+            "structured_data_types": ["Restaurant"],
+            "viewport_present": True,
+            "html_lang": "fr",
+            "social_links": {"facebook": "https://facebook.com/example"},
+        }
+        self.page_without_signals = {
+            **self.page_with_signals,
+            "url": "https://example.com/service",
+            "structured_data_types": [],
+            "viewport_present": False,
+            "html_lang": None,
+            "social_links": {},
+        }
+
+    def site(self, pages):
+        return {
+            "base_url": "https://example.com",
+            "pages": pages,
+            "failed_urls": [],
+            "business_address": None,
+            "business_latitude": None,
+            "business_longitude": None,
+        }
+
+    def finding(self, findings, rule_code):
+        return next(item for item in findings if item["rule_code"] == rule_code)
+
+    def test_flags_missing_viewport(self):
+        findings = evaluate_site_audit(self.site([self.page_without_signals]))
+        result = self.finding(findings, "technical.viewport_missing")
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["category"], "technical")
+
+    def test_passes_when_viewport_present_on_all_pages(self):
+        findings = evaluate_site_audit(self.site([self.page_with_signals]))
+        result = self.finding(findings, "technical.viewport_missing")
+
+        self.assertEqual(result["status"], "passed")
+
+    def test_flags_missing_html_lang(self):
+        findings = evaluate_site_audit(self.site([self.page_without_signals]))
+        result = self.finding(findings, "technical.html_lang_missing")
+
+        self.assertEqual(result["status"], "failed")
+
+    def test_passes_when_html_lang_present(self):
+        findings = evaluate_site_audit(self.site([self.page_with_signals]))
+        result = self.finding(findings, "technical.html_lang_missing")
+
+        self.assertEqual(result["status"], "passed")
+
+    def test_flags_missing_local_business_schema(self):
+        findings = evaluate_site_audit(self.site([self.page_without_signals]))
+        result = self.finding(findings, "local.structured_data_missing")
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["category"], "local")
+
+    def test_recognizes_a_localbusiness_schema_subtype(self):
+        # page_with_signals uses "Restaurant", a LocalBusiness subtype, not
+        # the literal string "LocalBusiness" — proves the pragmatic subset
+        # actually matches real-world JSON-LD, not just the exact type name.
+        findings = evaluate_site_audit(self.site([self.page_with_signals]))
+        result = self.finding(findings, "local.structured_data_missing")
+
+        self.assertEqual(result["status"], "passed")
+
+    def test_flags_missing_social_links(self):
+        findings = evaluate_site_audit(self.site([self.page_without_signals]))
+        result = self.finding(findings, "local.social_profiles_missing")
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["category"], "local")
+
+    def test_passes_when_social_links_present(self):
+        findings = evaluate_site_audit(self.site([self.page_with_signals]))
+        result = self.finding(findings, "local.social_profiles_missing")
+
+        self.assertEqual(result["status"], "passed")
+
+    def test_one_good_page_is_enough_for_the_site_level_local_rules(self):
+        # local.structured_data_missing and local.social_profiles_missing
+        # are site-level ("does the site have this anywhere"), unlike the
+        # per-page technical rules — a single compliant page should pass
+        # even alongside a page that has neither signal.
+        findings = evaluate_site_audit(
+            self.site([self.page_with_signals, self.page_without_signals])
+        )
+
+        self.assertEqual(
+            self.finding(findings, "local.structured_data_missing")["status"], "passed"
+        )
+        self.assertEqual(
+            self.finding(findings, "local.social_profiles_missing")["status"], "passed"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

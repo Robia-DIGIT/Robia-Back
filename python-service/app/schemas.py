@@ -80,6 +80,8 @@ class PageDetail(BaseModel):
     business_latitude: Optional[float] = None
     business_longitude: Optional[float] = None
     social_links: Dict[str, str] = {}
+    viewport_present: bool = False
+    html_lang: Optional[str] = None
     js_rendering_used: bool = False
     js_rendering_suspected: bool = False
     main_content: Optional[str] = None
