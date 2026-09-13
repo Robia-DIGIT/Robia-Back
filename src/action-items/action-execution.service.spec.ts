@@ -168,6 +168,37 @@ describe('ActionExecutionService', () => {
     expect(result.idempotent).toBe(false);
   });
 
+  it('rejects a verification audit from another website', async () => {
+    prisma.actionItem.findFirst.mockResolvedValue({
+      id: actionId,
+      organizationId,
+      approvalStatus: 'approved',
+      executionStatus: 'ready',
+      opportunity: { audit: { websiteId: 'website-1' } },
+    });
+    prisma.actionExecutionEvent.findFirst.mockResolvedValue(null);
+    prisma.audit.findFirst.mockResolvedValue(null);
+
+    await expect(
+      service.recordExecution(organizationId, userId, actionId, {
+        idempotencyKey: 'attempt-002',
+        outcome: 'succeeded',
+        evidence: { url: 'https://example.com/proof' },
+        verificationAuditId: 'audit-other-site',
+      }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+
+    expect(prisma.audit.findFirst).toHaveBeenCalledWith({
+      where: {
+        id: 'audit-other-site',
+        organizationId,
+        websiteId: 'website-1',
+      },
+      select: { id: true },
+    });
+    expect(prisma.actionItem.update).not.toHaveBeenCalled();
+  });
+
   it('returns the existing execution event for the same idempotency key', async () => {
     const action = {
       id: actionId,
