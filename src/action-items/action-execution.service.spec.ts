@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-argument */
 import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { ActionExecutionService } from './action-execution.service';
 
@@ -52,7 +53,10 @@ describe('ActionExecutionService', () => {
       },
     });
     expect(result).toEqual(
-      expect.objectContaining({ changed: true, event: { id: 'event-submit', eventType: 'submitted' } }),
+      expect.objectContaining({
+        changed: true,
+        event: { id: 'event-submit', eventType: 'submitted' },
+      }),
     );
   });
 
@@ -63,9 +67,9 @@ describe('ActionExecutionService', () => {
       approvalStatus: 'draft',
     });
 
-    await expect(service.approve(organizationId, userId, actionId)).rejects.toBeInstanceOf(
-      BadRequestException,
-    );
+    await expect(
+      service.approve(organizationId, userId, actionId),
+    ).rejects.toBeInstanceOf(BadRequestException);
   });
 
   it('rejects a pending action with a reason and an audit event', async () => {
@@ -84,7 +88,9 @@ describe('ActionExecutionService', () => {
       eventType: 'rejected',
     });
 
-    await service.reject(organizationId, userId, actionId, { reason: ' Needs review ' });
+    await service.reject(organizationId, userId, actionId, {
+      reason: ' Needs review ',
+    });
 
     expect(prisma.actionExecutionEvent.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
@@ -134,12 +140,17 @@ describe('ActionExecutionService', () => {
       eventType: 'execution_succeeded',
     });
 
-    const result = await service.recordExecution(organizationId, userId, actionId, {
-      idempotencyKey: 'attempt-001',
-      outcome: 'succeeded',
-      evidence: { url: 'https://example.com/proof' },
-      verificationAuditId: 'audit-2',
-    });
+    const result = await service.recordExecution(
+      organizationId,
+      userId,
+      actionId,
+      {
+        idempotencyKey: 'attempt-001',
+        outcome: 'succeeded',
+        evidence: { url: 'https://example.com/proof' },
+        verificationAuditId: 'audit-2',
+      },
+    );
 
     expect(prisma.audit.findFirst).toHaveBeenCalledWith({
       where: { id: 'audit-2', organizationId },
@@ -168,11 +179,16 @@ describe('ActionExecutionService', () => {
     prisma.actionItem.findFirst.mockResolvedValue(action);
     prisma.actionExecutionEvent.findFirst.mockResolvedValue(event);
 
-    const result = await service.recordExecution(organizationId, userId, actionId, {
-      idempotencyKey: 'attempt-001',
-      outcome: 'succeeded',
-      evidence: { url: 'https://example.com/proof' },
-    });
+    const result = await service.recordExecution(
+      organizationId,
+      userId,
+      actionId,
+      {
+        idempotencyKey: 'attempt-001',
+        outcome: 'succeeded',
+        evidence: { url: 'https://example.com/proof' },
+      },
+    );
 
     expect(result).toEqual({ action, event, idempotent: true });
     expect(prisma.actionItem.update).not.toHaveBeenCalled();
@@ -182,9 +198,9 @@ describe('ActionExecutionService', () => {
   it('does not expose history for an action from another organization', async () => {
     prisma.actionItem.findFirst.mockResolvedValue(null);
 
-    await expect(service.history(organizationId, 'foreign-action')).rejects.toBeInstanceOf(
-      NotFoundException,
-    );
+    await expect(
+      service.history(organizationId, 'foreign-action'),
+    ).rejects.toBeInstanceOf(NotFoundException);
     expect(prisma.actionExecutionEvent.findMany).not.toHaveBeenCalled();
   });
 });
