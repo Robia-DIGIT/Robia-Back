@@ -39,7 +39,10 @@ jobs:
         shell: bash
         run: |
           npx eslint "{src,apps,libs,test}/**/*.ts" --format json --output-file eslint-report.json || true
-          node scripts/check-eslint-baseline.mjs eslint-report.json 101 29
+          node scripts/check-eslint-baseline.mjs eslint-report.json 101 29 || {
+            node -e "const fs=require('fs'); const r=JSON.parse(fs.readFileSync('eslint-report.json','utf8')); for (const f of r) { if (!f.filePath.includes('action-execution') && !f.filePath.includes('reject-action') && !f.filePath.includes('record-action-execution') && !f.filePath.includes('action-items.module')) continue; for (const m of f.messages) console.log(f.filePath + ':' + m.line + ':' + m.column + ' severity=' + m.severity + ' rule=' + m.ruleId + ' ' + m.message); }"
+            exit 1
+          }
 
   nest-build:
     runs-on: ubuntu-latest
