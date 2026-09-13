@@ -101,8 +101,10 @@ type SearchConsoleUnavailableReason =
 /**
  * Additive, audit-attached Search Console evidence (RC-13). Same
  * status/unavailableReason contract as PageSpeedInsightsResult (RC-10):
- * never thrown, never influences global_score/seo_score_v2 — a future
- * tranche decides whether and how these signals feed the score.
+ * never thrown, never influences global_score/seo_score_v2. Closed
+ * product decision (Romeo/Landry): Search Console (and, later, GA4)
+ * are outcome/performance signals displayed separately — they do not,
+ * and will not, feed into seo_score_v2.
  */
 export interface SearchConsoleAuditSignals {
   status: 'ok' | 'unavailable';
