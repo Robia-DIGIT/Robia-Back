@@ -93,7 +93,10 @@ interface AnalyticsReportResponse {
 }
 
 type SearchConsoleUnavailableReason =
-  'not_connected' | 'no_property_selected' | 'not_synced_recently';
+  | 'not_connected'
+  | 'no_property_selected'
+  | 'not_synced_recently'
+  | 'temporarily_unavailable';
 
 /**
  * Additive, audit-attached Search Console evidence (RC-13). Same
@@ -538,11 +541,34 @@ export class GoogleSearchConsoleService {
   async getSearchConsoleSignalsForAudit(
     organizationId: string,
   ): Promise<SearchConsoleAuditSignals> {
-    const connection =
-      await this.prisma.googleSearchConsoleConnection.findUnique({
+    // Genuinely never throws: both Prisma reads below are wrapped, so a
+    // transient DB failure while collecting this evidence degrades to
+    // 'unavailable' instead of aborting the whole audit (see
+    // audits.service.ts, which awaits this directly inside its own
+    // try/catch and would otherwise mark a fully-completed audit
+    // 'failed' just because this side-signal's read hiccuped).
+    let connection: {
+      id: string;
+      selectedSiteUrl: string | null;
+      lastSyncedAt: Date | null;
+    } | null;
+    try {
+      connection = await this.prisma.googleSearchConsoleConnection.findUnique({
         where: { organizationId },
         select: { id: true, selectedSiteUrl: true, lastSyncedAt: true },
       });
+    } catch {
+      this.logger.warn('Search Console : lecture de la connexion indisponible');
+      return {
+        status: 'unavailable',
+        source: 'search_console',
+        siteUrl: null,
+        period: null,
+        summary: null,
+        lastSyncedAt: null,
+        unavailableReason: 'temporarily_unavailable',
+      };
+    }
 
     const unavailable = (
       reason: SearchConsoleUnavailableReason,
@@ -569,13 +595,24 @@ export class GoogleSearchConsoleService {
     const startDate = new Date(endDate);
     startDate.setUTCDate(startDate.getUTCDate() - 27);
 
-    const dailyMetrics =
-      await this.prisma.googleSearchConsoleDailyMetric.findMany({
+    let dailyMetrics: Array<{
+      date: Date;
+      clicks: number;
+      impressions: number;
+      ctr: number;
+      position: number;
+    }>;
+    try {
+      dailyMetrics = await this.prisma.googleSearchConsoleDailyMetric.findMany({
         where: {
           connectionId: connection.id,
           date: { gte: startDate, lte: endDate },
         },
       });
+    } catch {
+      this.logger.warn('Search Console : lecture des métriques indisponible');
+      return unavailable('temporarily_unavailable');
+    }
 
     // Covers both "never synced" and "last sync fell outside the last 28
     // days" — either way there is nothing recent enough to attach.

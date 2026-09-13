@@ -239,5 +239,49 @@ describe('GoogleSearchConsoleService', () => {
         position: (5 * 100 + 8 * 300) / 400,
       });
     });
+
+    it('degrades to unavailable instead of throwing when the connection read fails', async () => {
+      prisma.googleSearchConsoleConnection.findUnique.mockRejectedValue(
+        new Error('connection refused'),
+      );
+
+      await expect(
+        service.getSearchConsoleSignalsForAudit('org-1'),
+      ).resolves.toEqual({
+        status: 'unavailable',
+        source: 'search_console',
+        siteUrl: null,
+        period: null,
+        summary: null,
+        lastSyncedAt: null,
+        unavailableReason: 'temporarily_unavailable',
+      });
+      expect(
+        prisma.googleSearchConsoleDailyMetric.findMany,
+      ).not.toHaveBeenCalled();
+    });
+
+    it('degrades to unavailable instead of throwing when the daily-metrics read fails', async () => {
+      prisma.googleSearchConsoleConnection.findUnique.mockResolvedValue({
+        id: 'connection-1',
+        selectedSiteUrl: 'sc-domain:robiacopilot.site',
+        lastSyncedAt: new Date('2026-09-10T00:00:00.000Z'),
+      });
+      prisma.googleSearchConsoleDailyMetric.findMany.mockRejectedValue(
+        new Error('connection refused'),
+      );
+
+      await expect(
+        service.getSearchConsoleSignalsForAudit('org-1'),
+      ).resolves.toEqual({
+        status: 'unavailable',
+        source: 'search_console',
+        siteUrl: 'sc-domain:robiacopilot.site',
+        period: null,
+        summary: null,
+        lastSyncedAt: new Date('2026-09-10T00:00:00.000Z'),
+        unavailableReason: 'temporarily_unavailable',
+      });
+    });
   });
 });

@@ -1,5 +1,8 @@
+import { ConfigService } from '@nestjs/config';
 import { AuditsService } from './audits.service';
 import { GoogleSearchConsoleService } from '../integrations/google-search-console.service';
+import { PrismaService } from '../prisma/prisma.service';
+import { AuditRunnerService } from './audit-runner/audit-runner.service';
 
 describe('AuditsService', () => {
   const organizationId = 'org-1';
@@ -211,5 +214,76 @@ describe('AuditsService', () => {
       },
     });
     expect(result.status).toBe('failed');
+  });
+
+  it('completes the audit with an unavailable Search Console signal when its underlying reads fail — not a failed audit', async () => {
+    // End-to-end proof (real GoogleSearchConsoleService, not a mock of it):
+    // a transient DB failure while collecting the GSC side-signal must not
+    // abort an otherwise-successful audit. See getSearchConsoleSignalsForAudit's
+    // own unit tests in google-search-console.service.spec.ts for the same
+    // guarantee isolated to that method.
+    const gscPrisma = {
+      googleSearchConsoleConnection: {
+        findUnique: jest
+          .fn()
+          .mockRejectedValue(new Error('connection refused')),
+      },
+      googleSearchConsoleDailyMetric: { findMany: jest.fn() },
+    } as unknown as PrismaService;
+    const realGoogleSearchConsole = new GoogleSearchConsoleService(gscPrisma, {
+      get: jest.fn(),
+    } as unknown as ConfigService);
+    // Fresh, precisely-typed mocks for prisma/auditRunner here (rather
+    // than reusing the file's shared `any`-typed ones) so the cast this
+    // test needs is a genuine narrowing the linter accepts, not a no-op
+    // it flags as unnecessary.
+    const auditPrisma = {
+      website: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: websiteId,
+          url: 'https://robiacopilot.site/',
+        }),
+      },
+      organization: {
+        findUnique: jest.fn().mockResolvedValue({
+          city: 'Antananarivo',
+          sector: 'SaaS',
+          country: 'Madagascar',
+        }),
+      },
+      audit: {
+        create: jest.fn().mockResolvedValue({ id: auditId }),
+        update: jest
+          .fn()
+          .mockImplementation(({ data }: any) =>
+            Promise.resolve({ id: auditId, ...data }),
+          ),
+      },
+      webPage: {
+        upsert: jest.fn().mockResolvedValue({}),
+      },
+    } as unknown as PrismaService;
+    const auditRunnerForThisTest = {
+      runSiteAudit: jest.fn().mockResolvedValue(siteResult),
+      runAudit: jest.fn().mockResolvedValue(scoreResult),
+    } as unknown as AuditRunnerService;
+    service = new AuditsService(
+      auditPrisma,
+      auditRunnerForThisTest,
+      realGoogleSearchConsole,
+    );
+
+    const result: any = await service.run(organizationId, websiteId);
+
+    expect(result.status).toBe('completed');
+    expect(result.resultJson.google_search_console).toEqual({
+      status: 'unavailable',
+      source: 'search_console',
+      siteUrl: null,
+      period: null,
+      summary: null,
+      lastSyncedAt: null,
+      unavailableReason: 'temporarily_unavailable',
+    });
   });
 });
