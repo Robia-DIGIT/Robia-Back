@@ -182,7 +182,7 @@ export class ActionExecutionService {
       });
       if (!audit) {
         throw new NotFoundException(
-          "Audit de vérification non trouvé pour le site de cette action",
+          'Audit de vérification non trouvé pour le site de cette action',
         );
       }
     }
