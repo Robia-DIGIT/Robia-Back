@@ -16,6 +16,13 @@ export class ActionExecutionService {
   private async action(organizationId: string, actionId: string) {
     const action = await this.prisma.actionItem.findFirst({
       where: { id: actionId, organizationId },
+      include: {
+        opportunity: {
+          select: {
+            audit: { select: { websiteId: true } },
+          },
+        },
+      },
     });
     if (!action) {
       throw new NotFoundException('Action non trouvée');
@@ -164,13 +171,18 @@ export class ActionExecutionService {
     }
 
     if (dto.verificationAuditId) {
+      const sourceWebsiteId = action.opportunity?.audit.websiteId;
       const audit = await this.prisma.audit.findFirst({
-        where: { id: dto.verificationAuditId, organizationId },
+        where: {
+          id: dto.verificationAuditId,
+          organizationId,
+          ...(sourceWebsiteId ? { websiteId: sourceWebsiteId } : {}),
+        },
         select: { id: true },
       });
       if (!audit) {
         throw new NotFoundException(
-          'Audit de vérification non trouvé pour cette organisation',
+          "Audit de vérification non trouvé pour le site de cette action",
         );
       }
     }
