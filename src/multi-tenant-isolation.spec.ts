@@ -91,9 +91,13 @@ describe('Multi-tenant isolation (RC-16)', () => {
         audit: { findFirst: jest.fn().mockResolvedValue(null) },
       };
       const runner = { runSiteAudit: jest.fn(), runAudit: jest.fn() };
+      const googleSearchConsole = {
+        getSearchConsoleSignalsForAudit: jest.fn(),
+      };
       const service = new AuditsService(
         prisma as unknown as PrismaService,
         runner as unknown as AuditRunnerService,
+        googleSearchConsole as unknown as GoogleSearchConsoleService,
       );
 
       await expect(service.findOne(orgA, 'audit-org-b')).rejects.toBeInstanceOf(
@@ -102,14 +106,21 @@ describe('Multi-tenant isolation (RC-16)', () => {
       expect(prisma.audit.findFirst).toHaveBeenCalledWith({
         where: { id: 'audit-org-b', organizationId: orgA },
       });
+      expect(
+        googleSearchConsole.getSearchConsoleSignalsForAudit,
+      ).not.toHaveBeenCalled();
     });
 
     it('does not list audits for a website owned by another organization', async () => {
       const prisma = { audit: { findMany: jest.fn().mockResolvedValue([]) } };
       const runner = { runSiteAudit: jest.fn(), runAudit: jest.fn() };
+      const googleSearchConsole = {
+        getSearchConsoleSignalsForAudit: jest.fn(),
+      };
       const service = new AuditsService(
         prisma as unknown as PrismaService,
         runner as unknown as AuditRunnerService,
+        googleSearchConsole as unknown as GoogleSearchConsoleService,
       );
 
       const result = await service.findAllForWebsite(orgA, 'website-org-b');
@@ -120,6 +131,9 @@ describe('Multi-tenant isolation (RC-16)', () => {
           where: { organizationId: orgA, websiteId: 'website-org-b' },
         }),
       );
+      expect(
+        googleSearchConsole.getSearchConsoleSignalsForAudit,
+      ).not.toHaveBeenCalled();
     });
 
     it('does not launch a multi-page audit (runSite) for a website owned by another organization', async () => {
@@ -128,9 +142,13 @@ describe('Multi-tenant isolation (RC-16)', () => {
         audit: { create: jest.fn() },
       };
       const runner = { runSiteAudit: jest.fn(), runAudit: jest.fn() };
+      const googleSearchConsole = {
+        getSearchConsoleSignalsForAudit: jest.fn(),
+      };
       const service = new AuditsService(
         prisma as unknown as PrismaService,
         runner as unknown as AuditRunnerService,
+        googleSearchConsole as unknown as GoogleSearchConsoleService,
       );
 
       await expect(
@@ -138,6 +156,9 @@ describe('Multi-tenant isolation (RC-16)', () => {
       ).rejects.toBeInstanceOf(NotFoundException);
       expect(prisma.audit.create).not.toHaveBeenCalled();
       expect(runner.runSiteAudit).not.toHaveBeenCalled();
+      expect(
+        googleSearchConsole.getSearchConsoleSignalsForAudit,
+      ).not.toHaveBeenCalled();
     });
   });
 
