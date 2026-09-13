@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
+import { PinoLogger } from 'nestjs-pino';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   AuditRunnerService,
@@ -13,9 +14,10 @@ export class AuditsService {
     private readonly prisma: PrismaService,
     private readonly auditRunner: AuditRunnerService,
     private readonly googleSearchConsole: GoogleSearchConsoleService,
+    private readonly logger: PinoLogger,
   ) {}
 
-  async run(organizationId: string, websiteId: string) {
+  async run(organizationId: string, websiteId: string, requestId?: string) {
     const website = await this.prisma.website.findFirst({
       where: { id: websiteId, organizationId },
     });
@@ -38,6 +40,11 @@ export class AuditsService {
         status: 'running',
       },
     });
+    // Every log line for the remainder of this request now carries
+    // auditId, alongside requestId/organizationId/userId already bound at
+    // the HTTP layer (see logger.config.ts) — the audit is only known
+    // once created, so it can't be bound any earlier than this.
+    this.logger.assign({ auditId: audit.id });
 
     // Exécution "synchrone" pour le MVP (pas de queue async pour l'instant)
     try {
@@ -47,6 +54,7 @@ export class AuditsService {
         maxDepth: 2,
         city: organization?.city,
         country: organization?.country,
+        requestId,
       });
       this.ensureSitePages(siteResult);
       await this.persistSitePages(website.id, siteResult);
@@ -56,6 +64,7 @@ export class AuditsService {
         sector: organization?.sector,
         city: organization?.city,
         country: organization?.country,
+        requestId,
       });
 
       // RC-13: attaches whatever Search Console signal is already on
@@ -114,6 +123,8 @@ export class AuditsService {
   }
 
   async findOne(organizationId: string, auditId: string) {
+    this.logger.assign({ auditId });
+
     const audit = await this.prisma.audit.findFirst({
       where: { id: auditId, organizationId },
     });
@@ -130,6 +141,7 @@ export class AuditsService {
     websiteId: string,
     maxPages = 20,
     maxDepth = 2,
+    requestId?: string,
   ) {
     const website = await this.prisma.website.findFirst({
       where: { id: websiteId, organizationId },
@@ -153,6 +165,7 @@ export class AuditsService {
         status: 'running',
       },
     });
+    this.logger.assign({ auditId: audit.id });
 
     try {
       const result = await this.auditRunner.runSiteAudit({
@@ -161,6 +174,7 @@ export class AuditsService {
         maxDepth,
         city: organization?.city,
         country: organization?.country,
+        requestId,
       });
 
       this.ensureSitePages(result);

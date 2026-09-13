@@ -17,6 +17,7 @@ import { RunSiteAuditDto } from './dto/run-site-audit.dto';
 interface ScopedRequest extends Request {
   user: { userId: string; email: string };
   organizationId: string;
+  id?: string;
 }
 
 @Controller('audits')
@@ -26,7 +27,7 @@ export class AuditsController {
 
   @Post('run')
   run(@Req() req: ScopedRequest, @Body() dto: RunAuditDto) {
-    return this.auditsService.run(req.organizationId, dto.websiteId);
+    return this.auditsService.run(req.organizationId, dto.websiteId, req.id);
   }
 
   @Post('run-site')
@@ -36,6 +37,7 @@ export class AuditsController {
       dto.websiteId,
       dto.maxPages,
       dto.maxDepth,
+      req.id,
     );
   }
 

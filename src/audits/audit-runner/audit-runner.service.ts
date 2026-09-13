@@ -19,6 +19,8 @@ interface RunAuditParams {
   sector?: string | null;
   city?: string | null;
   country?: string | null;
+  /** Correlates this call with the inbound NestJS request in both services' logs. */
+  requestId?: string;
 }
 
 export interface SitePageDetail {
@@ -155,6 +157,18 @@ interface RunSiteAuditParams {
   maxDepth?: number;
   city?: string | null;
   country?: string | null;
+  /** Correlates this call with the inbound NestJS request in both services' logs. */
+  requestId?: string;
+}
+
+const REQUEST_ID_HEADER = 'X-Request-Id';
+
+function requestHeaders(requestId?: string): Record<string, string> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (requestId) {
+    headers[REQUEST_ID_HEADER] = requestId;
+  }
+  return headers;
 }
 
 @Injectable()
@@ -172,10 +186,11 @@ export class AuditRunnerService {
     sector,
     city,
     country,
+    requestId,
   }: RunAuditParams): Promise<AuditResult> {
     const response = await fetch(`${this.aiEngineUrl}/audit`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: requestHeaders(requestId),
       body: JSON.stringify({ url: websiteUrl, sector, city, country }),
     });
 
@@ -192,10 +207,11 @@ export class AuditRunnerService {
     maxDepth = 2,
     city,
     country,
+    requestId,
   }: RunSiteAuditParams): Promise<SiteAuditResult> {
     const response = await fetch(`${this.aiEngineUrl}/audit/site`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: requestHeaders(requestId),
       body: JSON.stringify({
         url: websiteUrl,
         max_pages: maxPages,

@@ -1,4 +1,5 @@
 import { ConfigService } from '@nestjs/config';
+import { PinoLogger } from 'nestjs-pino';
 import { AuditsService } from './audits.service';
 import { GoogleSearchConsoleService } from '../integrations/google-search-console.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -12,6 +13,7 @@ describe('AuditsService', () => {
   let prisma: any;
   let auditRunner: any;
   let googleSearchConsole: { getSearchConsoleSignalsForAudit: jest.Mock };
+  let logger: { assign: jest.Mock };
   let service: AuditsService;
 
   const page = {
@@ -130,10 +132,12 @@ describe('AuditsService', () => {
         .fn()
         .mockResolvedValue(searchConsoleSignals),
     };
+    logger = { assign: jest.fn() };
     service = new AuditsService(
       prisma,
       auditRunner,
       googleSearchConsole as unknown as GoogleSearchConsoleService,
+      logger as unknown as PinoLogger,
     );
   });
 
@@ -190,6 +194,7 @@ describe('AuditsService', () => {
       googleSearchConsole.getSearchConsoleSignalsForAudit,
     ).toHaveBeenCalledWith(organizationId);
     expect(result.status).toBe('completed');
+    expect(logger.assign).toHaveBeenCalledWith({ auditId });
   });
 
   it('marks the audit failed instead of completing with zero accessible pages', async () => {
@@ -267,10 +272,12 @@ describe('AuditsService', () => {
       runSiteAudit: jest.fn().mockResolvedValue(siteResult),
       runAudit: jest.fn().mockResolvedValue(scoreResult),
     } as unknown as AuditRunnerService;
+    const loggerForThisTest = { assign: jest.fn() } as unknown as PinoLogger;
     service = new AuditsService(
       auditPrisma,
       auditRunnerForThisTest,
       realGoogleSearchConsole,
+      loggerForThisTest,
     );
 
     const result: any = await service.run(organizationId, websiteId);

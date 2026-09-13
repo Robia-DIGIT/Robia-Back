@@ -1,7 +1,9 @@
 import json
+import logging
 import requests
 import re
 import os
+import time
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 from dataclasses import dataclass, field
@@ -11,6 +13,8 @@ from collections import Counter
 from collections import deque
 from urllib.parse import urljoin
 import xml.etree.ElementTree as ET
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -681,6 +685,28 @@ def _fetch_soup_for_discovery(url: str, browser=None) -> BeautifulSoup | None:
     return soup
 
 
+def _log_crawl_metric(
+    started_at: float, site: "ScrapedSite | None", *, success: bool
+) -> None:
+    """Minimal duration/success-failure/provider signal for a full-site
+    crawl, emitted as a structured extra field (see pagespeed.py's
+    _log_external_call_metric for the same pattern on that provider, and
+    logging_config.py's _JsonFormatter for how "extra" is serialized).
+    Not a per-page-fetch metric — one line per crawl_website() call."""
+    logger.info(
+        "external_call_metric",
+        extra={
+            "metric": "external_call",
+            "provider": "site_crawl",
+            "operation": "crawl_website",
+            "durationMs": round((time.monotonic() - started_at) * 1000, 1),
+            "success": success,
+            "pagesFetched": len(site.pages) if site is not None else None,
+            "pagesFailed": len(site.failed_urls) if site is not None else None,
+        },
+    )
+
+
 def crawl_website(url: str, max_pages: int = 30, max_depth: int = 2) -> ScrapedSite:
     """
     Découvre et scrape plusieurs pages d'un même site, en réutilisant
@@ -700,6 +726,7 @@ def crawl_website(url: str, max_pages: int = 30, max_depth: int = 2) -> ScrapedS
 
     Ne lève jamais d'exception : les pages en échec vont dans failed_urls.
     """
+    started_at = time.monotonic()
     base_url = _normalize_base_url(url)
     base_netloc = urlparse(base_url).netloc
 
@@ -752,6 +779,7 @@ def crawl_website(url: str, max_pages: int = 30, max_depth: int = 2) -> ScrapedS
                 else:
                     site.failed_urls.append(page_url)
 
+            _log_crawl_metric(started_at, site, success=True)
             return site
 
         # --- Fallback : BFS sur les liens internes ---
@@ -791,7 +819,12 @@ def crawl_website(url: str, max_pages: int = 30, max_depth: int = 2) -> ScrapedS
                     visited.add(link)
                     queue.append((link, depth + 1))
 
+        _log_crawl_metric(started_at, site, success=True)
         return site
+
+    except Exception:
+        _log_crawl_metric(started_at, site, success=False)
+        raise
 
     finally:
         if browser is not None:

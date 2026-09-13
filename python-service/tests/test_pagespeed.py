@@ -213,6 +213,64 @@ class FetchPageSpeedInsightsTests(unittest.TestCase):
 
         self.assertEqual(mock_get.call_count, 2)
 
+    @patch.dict("os.environ", {"GOOGLE_PAGESPEED_API_KEY": "test-key"}, clear=True)
+    @patch("app.integrations.pagespeed.requests.get")
+    def test_logs_a_success_metric_with_provider_and_duration(
+        self, mock_get: Mock
+    ) -> None:
+        mock_response = Mock()
+        mock_response.raise_for_status = Mock()
+        mock_response.json.return_value = GOOD_PAYLOAD
+        mock_get.return_value = mock_response
+
+        with self.assertLogs("app.integrations.pagespeed", level="INFO") as logs:
+            fetch_pagespeed_insights("https://example.com")
+
+        record = next(
+            r for r in logs.records if r.msg == "external_call_metric"
+        )
+        self.assertEqual(record.provider, "google_pagespeed_insights")
+        self.assertEqual(record.operation, "fetch_pagespeed_insights")
+        self.assertTrue(record.success)
+        self.assertIsNone(record.reason)
+        self.assertIsInstance(record.durationMs, float)
+        self.assertGreaterEqual(record.durationMs, 0)
+
+    @patch.dict("os.environ", {"GOOGLE_PAGESPEED_API_KEY": "test-key"}, clear=True)
+    @patch("app.integrations.pagespeed.requests.get")
+    def test_logs_a_failure_metric_with_the_classified_reason(
+        self, mock_get: Mock
+    ) -> None:
+        mock_get.side_effect = _http_error(429)
+
+        with self.assertLogs("app.integrations.pagespeed", level="INFO") as logs:
+            fetch_pagespeed_insights("https://example.com")
+
+        record = next(
+            r for r in logs.records if r.msg == "external_call_metric"
+        )
+        self.assertEqual(record.provider, "google_pagespeed_insights")
+        self.assertFalse(record.success)
+        self.assertEqual(record.reason, "rate_limited")
+
+    @patch.dict("os.environ", {"GOOGLE_PAGESPEED_API_KEY": "test-key"}, clear=True)
+    @patch("app.integrations.pagespeed.requests.get")
+    def test_does_not_log_a_metric_line_on_a_cache_hit(self, mock_get: Mock) -> None:
+        mock_response = Mock()
+        mock_response.raise_for_status = Mock()
+        mock_response.json.return_value = GOOD_PAYLOAD
+        mock_get.return_value = mock_response
+
+        fetch_pagespeed_insights("https://example.com")
+        with self.assertLogs("app.integrations.pagespeed", level="DEBUG") as logs:
+            # assertLogs requires at least one log line to have been
+            # emitted, so force one and assert it isn't the metric line.
+            pagespeed.logger.debug("cache-hit-probe")
+            fetch_pagespeed_insights("https://example.com")
+
+        metric_records = [r for r in logs.records if r.msg == "external_call_metric"]
+        self.assertEqual(metric_records, [])
+
 
 if __name__ == "__main__":
     unittest.main()

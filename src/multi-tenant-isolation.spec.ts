@@ -1,5 +1,6 @@
 import { NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { PinoLogger } from 'nestjs-pino';
 import { ActionGeneratorService } from './action-items/action-generator/action-generator.service';
 import { ActionItemsService } from './action-items/action-items.service';
 import { AuditRunnerService } from './audits/audit-runner/audit-runner.service';
@@ -94,10 +95,12 @@ describe('Multi-tenant isolation (RC-16)', () => {
       const googleSearchConsole = {
         getSearchConsoleSignalsForAudit: jest.fn(),
       };
+      const logger = { assign: jest.fn() };
       const service = new AuditsService(
         prisma as unknown as PrismaService,
         runner as unknown as AuditRunnerService,
         googleSearchConsole as unknown as GoogleSearchConsoleService,
+        logger as unknown as PinoLogger,
       );
 
       await expect(service.findOne(orgA, 'audit-org-b')).rejects.toBeInstanceOf(
@@ -117,10 +120,12 @@ describe('Multi-tenant isolation (RC-16)', () => {
       const googleSearchConsole = {
         getSearchConsoleSignalsForAudit: jest.fn(),
       };
+      const logger = { assign: jest.fn() };
       const service = new AuditsService(
         prisma as unknown as PrismaService,
         runner as unknown as AuditRunnerService,
         googleSearchConsole as unknown as GoogleSearchConsoleService,
+        logger as unknown as PinoLogger,
       );
 
       const result = await service.findAllForWebsite(orgA, 'website-org-b');
@@ -145,10 +150,12 @@ describe('Multi-tenant isolation (RC-16)', () => {
       const googleSearchConsole = {
         getSearchConsoleSignalsForAudit: jest.fn(),
       };
+      const logger = { assign: jest.fn() };
       const service = new AuditsService(
         prisma as unknown as PrismaService,
         runner as unknown as AuditRunnerService,
         googleSearchConsole as unknown as GoogleSearchConsoleService,
+        logger as unknown as PinoLogger,
       );
 
       await expect(
