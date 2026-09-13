@@ -2,6 +2,15 @@ name: Backend CI
 
 on:
   workflow_dispatch:
+    inputs:
+      confirm_production:
+        description: "Confirmation explicite requise pour déployer en production"
+        required: true
+        type: choice
+        options:
+          - "NO"
+          - "DEPLOY"
+        default: "NO"
   pull_request:
   push:
     branches:
@@ -79,10 +88,13 @@ jobs:
     name: Deploy production over restricted SSH
     needs: [lint, nest-build, python-llm-tests, production-containers, deployment-tests]
     if: >-
+      github.event_name == 'workflow_dispatch' &&
       github.ref == 'refs/heads/main' &&
       github.repository == 'Robia-DIGIT/Robia-Back' &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      inputs.confirm_production == 'DEPLOY' &&
       vars.VPS_DEPLOY_ENABLED == 'true'
+    environment:
+      name: production
     runs-on: ubuntu-latest
     timeout-minutes: 50
     concurrency:
