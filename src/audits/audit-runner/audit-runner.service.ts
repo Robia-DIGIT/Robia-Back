@@ -98,6 +98,26 @@ export interface PageSpeedInsightsResult {
   unavailableReason: string | null;
 }
 
+export interface SeoCategoryScoreV2 {
+  score: number | null;
+  weight: number | null;
+  measured: boolean;
+  findingsEvaluated: number;
+}
+
+/**
+ * Explainable, weighted SEO score (RC-12). Additive alongside the
+ * legacy score fields — does not replace `Audit.globalScore` /
+ * `resultJson.global_score`. See Robia-Back's
+ * python-service/app/agents/scoring.py for the formula and the
+ * migration-decision note (recompute vs. freeze existing audits).
+ */
+export interface SeoScoreV2 {
+  version: string;
+  globalScore: number | null;
+  categories: Record<string, SeoCategoryScoreV2>;
+}
+
 export interface SiteAuditResult {
   base_url: string;
   discovery_method: string;
@@ -124,6 +144,7 @@ export interface SiteAuditResult {
   findings: string[];
   detailed_findings: DetailedAuditFinding[];
   pagespeed_insights: PageSpeedInsightsResult | null;
+  seo_score_v2: SeoScoreV2 | null;
   pages: SitePageDetail[];
   failed_urls: string[];
 }
