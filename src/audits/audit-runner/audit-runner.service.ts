@@ -1,4 +1,3 @@
-/* eslint-disable prettier/prettier */
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
@@ -50,7 +49,6 @@ export interface SitePageDetail {
   main_content: string | null;
   error: string | null;
 }
-
 
 export interface DetailedAuditFinding {
   rule_code: string;
@@ -141,11 +139,17 @@ export class AuditRunnerService {
   private readonly aiEngineUrl: string;
 
   constructor(private readonly configService: ConfigService) {
-    this.aiEngineUrl = this.configService.get<string>('AI_ENGINE_URL') ??
-    'http://localhost:8000';
+    this.aiEngineUrl =
+      this.configService.get<string>('AI_ENGINE_URL') ??
+      'http://localhost:8000';
   }
 
-  async runAudit({ websiteUrl, sector, city, country }: RunAuditParams): Promise<AuditResult> {
+  async runAudit({
+    websiteUrl,
+    sector,
+    city,
+    country,
+  }: RunAuditParams): Promise<AuditResult> {
     const response = await fetch(`${this.aiEngineUrl}/audit`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -153,19 +157,29 @@ export class AuditRunnerService {
     });
 
     if (!response.ok) {
-      throw new Error(
-        `AI engine /audit failed with status ${response.status}`,
-      );
+      throw new Error(`AI engine /audit failed with status ${response.status}`);
     }
 
     return response.json();
   }
 
-  async runSiteAudit({ websiteUrl, maxPages = 20, maxDepth = 2, city, country }: RunSiteAuditParams): Promise<SiteAuditResult> {
+  async runSiteAudit({
+    websiteUrl,
+    maxPages = 20,
+    maxDepth = 2,
+    city,
+    country,
+  }: RunSiteAuditParams): Promise<SiteAuditResult> {
     const response = await fetch(`${this.aiEngineUrl}/audit/site`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: websiteUrl, max_pages: maxPages, max_depth: maxDepth, city, country }),
+      body: JSON.stringify({
+        url: websiteUrl,
+        max_pages: maxPages,
+        max_depth: maxDepth,
+        city,
+        country,
+      }),
     });
 
     if (!response.ok) {

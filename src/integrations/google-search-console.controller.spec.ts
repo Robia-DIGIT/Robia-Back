@@ -25,7 +25,7 @@ describe('GoogleSearchConsoleController', () => {
       cookie: jest.fn(),
       clearCookie: jest.fn(),
       redirect: jest.fn(),
-    };
+    } as unknown as Pick<Response, 'cookie' | 'clearCookie' | 'redirect'>;
   });
 
   it('binds the signed state to a secure, short-lived browser cookie', () => {

@@ -119,12 +119,14 @@ export class BillingService {
 
     switch (event.type) {
       case 'checkout.session.completed':
-        await this.handleCheckoutCompleted(event.data.object);
+        await this.handleCheckoutCompleted(
+          event.data.object as Stripe.Checkout.Session,
+        );
         break;
       case 'customer.subscription.created':
       case 'customer.subscription.updated':
       case 'customer.subscription.deleted':
-        await this.syncSubscription(event.data.object);
+        await this.syncSubscription(event.data.object as Stripe.Subscription);
         break;
       default:
         this.logger.debug(`Événement Stripe ignoré : ${event.type}`);
