@@ -74,6 +74,7 @@ export class N8nWebhookService {
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs());
+    const startedAt = Date.now();
 
     try {
       const response = await fetch(endpoint, {
@@ -90,20 +91,56 @@ export class N8nWebhookService {
         this.logger.warn(
           `Webhook n8n ${path} refusé avec le statut ${response.status}`,
         );
+        this.logExternalCallMetric(
+          path,
+          startedAt,
+          false,
+          `http_${response.status}`,
+        );
         return false;
       }
 
+      this.logExternalCallMetric(path, startedAt, true, null);
       return true;
     } catch (error) {
-      const reason =
-        error instanceof Error && error.name === 'AbortError'
-          ? 'délai dépassé'
-          : 'connexion impossible';
+      const isTimeout = error instanceof Error && error.name === 'AbortError';
+      const reason = isTimeout ? 'délai dépassé' : 'connexion impossible';
       this.logger.warn(`Webhook n8n ${path} non envoyé : ${reason}`);
+      this.logExternalCallMetric(
+        path,
+        startedAt,
+        false,
+        isTimeout ? 'timeout' : 'network_error',
+      );
       return false;
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  /**
+   * Minimal duration/success-failure/provider signal for n8n webhook
+   * deliveries (see the Codex cross-review's RC-15 ask), emitted as a
+   * structured log line rather than a dedicated metrics backend — no
+   * such backend is wired up yet, and choosing/paying for one is a
+   * separate decision (see the RC-15 handoff). Routes through Nest's
+   * Logger, which main.ts wires to nestjs-pino, so this benefits from
+   * the same JSON formatting and redaction as every other log line.
+   */
+  private logExternalCallMetric(
+    operation: string,
+    startedAt: number,
+    success: boolean,
+    reason: string | null,
+  ) {
+    this.logger.log({
+      metric: 'external_call',
+      provider: 'n8n',
+      operation,
+      durationMs: Date.now() - startedAt,
+      success,
+      reason,
+    });
   }
 
   private endpoint(path: string) {

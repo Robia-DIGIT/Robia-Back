@@ -1,3 +1,4 @@
+import { PinoLogger } from 'nestjs-pino';
 import { AuditsService } from './audits.service';
 
 describe('AuditsService', () => {
@@ -7,6 +8,7 @@ describe('AuditsService', () => {
 
   let prisma: any;
   let auditRunner: any;
+  let logger: { assign: jest.Mock };
   let service: AuditsService;
 
   const page = {
@@ -96,9 +98,11 @@ describe('AuditsService', () => {
       },
       audit: {
         create: jest.fn().mockResolvedValue({ id: auditId }),
-        update: jest.fn().mockImplementation(({ data }) =>
-          Promise.resolve({ id: auditId, ...data }),
-        ),
+        update: jest
+          .fn()
+          .mockImplementation(({ data }) =>
+            Promise.resolve({ id: auditId, ...data }),
+          ),
       },
       webPage: {
         upsert: jest.fn().mockResolvedValue({}),
@@ -108,7 +112,12 @@ describe('AuditsService', () => {
       runSiteAudit: jest.fn().mockResolvedValue(siteResult),
       runAudit: jest.fn().mockResolvedValue(scoreResult),
     };
-    service = new AuditsService(prisma, auditRunner);
+    logger = { assign: jest.fn() };
+    service = new AuditsService(
+      prisma,
+      auditRunner,
+      logger as unknown as PinoLogger,
+    );
   });
 
   it('crawls and persists site pages before completing the standard audit', async () => {
@@ -127,9 +136,9 @@ describe('AuditsService', () => {
       city: 'Antananarivo',
       country: 'Madagascar',
     });
-    expect(
-      auditRunner.runSiteAudit.mock.invocationCallOrder[0],
-    ).toBeLessThan(auditRunner.runAudit.mock.invocationCallOrder[0]);
+    expect(auditRunner.runSiteAudit.mock.invocationCallOrder[0]).toBeLessThan(
+      auditRunner.runAudit.mock.invocationCallOrder[0],
+    );
     expect(prisma.webPage.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         where: {
@@ -160,6 +169,7 @@ describe('AuditsService', () => {
       }),
     );
     expect(result.status).toBe('completed');
+    expect(logger.assign).toHaveBeenCalledWith({ auditId });
   });
 
   it('marks the audit failed instead of completing with zero accessible pages', async () => {

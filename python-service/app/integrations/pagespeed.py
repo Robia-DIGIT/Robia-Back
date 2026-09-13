@@ -95,6 +95,28 @@ def _unavailable(url: str, reason: str) -> PageSpeedResult:
     )
 
 
+def _log_external_call_metric(
+    started_at: float, *, success: bool, reason: Optional[str]
+) -> None:
+    """Minimal duration/success-failure/provider signal for the one
+    external call this module makes, emitted as a structured extra field
+    on the JSON log line (see logging_config.py's _JsonFormatter) rather
+    than a dedicated metrics backend — no such backend is wired up yet,
+    and choosing/paying for one is a separate decision, not something to
+    default into here (see the RC-15 handoff)."""
+    logger.info(
+        "external_call_metric",
+        extra={
+            "metric": "external_call",
+            "provider": SOURCE_NAME,
+            "operation": "fetch_pagespeed_insights",
+            "durationMs": round((time.monotonic() - started_at) * 1000, 1),
+            "success": success,
+            "reason": reason,
+        },
+    )
+
+
 def _redact(text: str, secret: Optional[str]) -> str:
     """Strip a known secret value out of free-form text before it is
     logged. requests' own exception messages embed the request URL
@@ -207,6 +229,7 @@ def fetch_pagespeed_insights(
     if api_key:
         params["key"] = api_key
 
+    started_at = time.monotonic()
     try:
         response = requests.get(PAGESPEED_API_URL, params=params, timeout=timeout)
         response.raise_for_status()
@@ -218,9 +241,11 @@ def fetch_pagespeed_insights(
             url,
             _redact(str(exc), api_key),
         )
+        _log_external_call_metric(started_at, success=False, reason=reason)
         return _unavailable(url, reason)
     except ValueError:
         logger.warning("PageSpeed Insights returned invalid JSON for %s.", url)
+        _log_external_call_metric(started_at, success=False, reason="invalid_json")
         return _unavailable(url, "invalid_json")
 
     result = _parse_pagespeed_response(payload, url)
@@ -229,7 +254,11 @@ def fetch_pagespeed_insights(
             "PageSpeed Insights response for %s did not contain the expected fields.",
             url,
         )
+        _log_external_call_metric(
+            started_at, success=False, reason=result["unavailableReason"]
+        )
         return result
 
     _cache[url] = (time.monotonic(), result)
+    _log_external_call_metric(started_at, success=True, reason=None)
     return result

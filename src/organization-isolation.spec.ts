@@ -1,4 +1,5 @@
 import { NotFoundException } from '@nestjs/common';
+import { PinoLogger } from 'nestjs-pino';
 import { ActionItemsService } from './action-items/action-items.service';
 import { AuditsService } from './audits/audits.service';
 import { OrgScopeGuard } from './common/guards/org-scope.guard';
@@ -79,7 +80,12 @@ describe('Organization isolation', () => {
       runSiteAudit: jest.fn(),
       runAudit: jest.fn(),
     };
-    const service = new AuditsService(prisma as any, runner as any);
+    const logger = { assign: jest.fn() };
+    const service = new AuditsService(
+      prisma as any,
+      runner as any,
+      logger as unknown as PinoLogger,
+    );
 
     await expect(
       service.run(requestingOrganizationId, 'website-org-b'),

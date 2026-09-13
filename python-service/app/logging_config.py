@@ -29,15 +29,52 @@ _SENSITIVE_KEY_PATTERN = re.compile(
 )
 _REDACTED = "[REDACTED]"
 
+# Key-based redaction alone lets a secret slip through when it is embedded
+# inside a free-text string under an innocuous key (an exception message
+# quoting a token, a breadcrumb message with a URL's ?api_key=... in it).
+# scrub_text pattern-matches likely secrets inside otherwise ordinary text
+# and is applied to every string leaf redact_sensitive walks, mirroring
+# src/common/logging/redact.ts's scrubText on the NestJS side so both
+# services and Sentry (via sanitize_sentry_event below) get the same
+# guarantee.
+_EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_JWT_PATTERN = re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b")
+_BEARER_TOKEN_PATTERN = re.compile(
+    r"\bBearer\s+[A-Za-z0-9\-._~+/]+=*", re.IGNORECASE
+)
+_INLINE_SECRET_PATTERN = re.compile(
+    r"\b(password|passwd|secret|token|api[-_]?key|authorization|cookie)\b"
+    r"(\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s&,;\"']+)",
+    re.IGNORECASE,
+)
+
+
+def scrub_text(text: str) -> str:
+    """Best-effort scrub of secret-shaped substrings embedded in free text
+    that key-based redaction cannot reach on its own. Complements, never
+    replaces, redact_sensitive's key-based redaction."""
+    text = _JWT_PATTERN.sub(_REDACTED, text)
+    text = _BEARER_TOKEN_PATTERN.sub(f"Bearer {_REDACTED}", text)
+    text = _INLINE_SECRET_PATTERN.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}{_REDACTED}", text
+    )
+    text = _EMAIL_PATTERN.sub(_REDACTED, text)
+    return text
+
 
 def get_request_id() -> str | None:
     return _request_id.get()
 
 
 def redact_sensitive(value: Any, _seen: set[int] | None = None) -> Any:
-    """Deep-redacts dict values whose key matches a sensitive pattern."""
+    """Deep-redacts dict values whose key matches a sensitive pattern, and
+    scrubs secret-shaped substrings out of every string leaf regardless of
+    its key (see scrub_text)."""
     if _seen is None:
         _seen = set()
+
+    if isinstance(value, str):
+        return scrub_text(value)
 
     if isinstance(value, dict):
         obj_id = id(value)
@@ -122,6 +159,18 @@ def configure_logging() -> None:
 _sentry_initialized = False
 
 
+def sanitize_sentry_event(
+    event: dict[str, Any], hint: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Runs the whole outgoing Sentry event through redact_sensitive before
+    it leaves the process — request headers/cookies/body, user, extra,
+    contexts, breadcrumbs, and free text (exception messages, breadcrumb
+    messages) alike. Mirrors sanitizeSentryEvent in
+    src/common/logging/sentry.ts; see that file's docstring for why a
+    key-based redactor alone is not sufficient here."""
+    return redact_sensitive(event)
+
+
 def init_sentry() -> None:
     """No-op unless SENTRY_DSN is set. Error-capture only, no tracing."""
     global _sentry_initialized
@@ -131,7 +180,12 @@ def init_sentry() -> None:
 
     import sentry_sdk
 
-    sentry_sdk.init(dsn=dsn, environment=os.environ.get("ENVIRONMENT", "development"), traces_sample_rate=0)
+    sentry_sdk.init(
+        dsn=dsn,
+        environment=os.environ.get("ENVIRONMENT", "development"),
+        traces_sample_rate=0,
+        before_send=sanitize_sentry_event,
+    )
     _sentry_initialized = True
 
 

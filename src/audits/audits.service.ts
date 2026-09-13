@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
+import { PinoLogger } from 'nestjs-pino';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   AuditRunnerService,
@@ -11,6 +12,7 @@ export class AuditsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly auditRunner: AuditRunnerService,
+    private readonly logger: PinoLogger,
   ) {}
 
   async run(organizationId: string, websiteId: string, requestId?: string) {
@@ -36,6 +38,11 @@ export class AuditsService {
         status: 'running',
       },
     });
+    // Every log line for the remainder of this request now carries
+    // auditId, alongside requestId/organizationId/userId already bound at
+    // the HTTP layer (see logger.config.ts) — the audit is only known
+    // once created, so it can't be bound any earlier than this.
+    this.logger.assign({ auditId: audit.id });
 
     // Exécution "synchrone" pour le MVP (pas de queue async pour l'instant)
     try {
@@ -102,6 +109,8 @@ export class AuditsService {
   }
 
   async findOne(organizationId: string, auditId: string) {
+    this.logger.assign({ auditId });
+
     const audit = await this.prisma.audit.findFirst({
       where: { id: auditId, organizationId },
     });
@@ -142,6 +151,7 @@ export class AuditsService {
         status: 'running',
       },
     });
+    this.logger.assign({ auditId: audit.id });
 
     try {
       const result = await this.auditRunner.runSiteAudit({

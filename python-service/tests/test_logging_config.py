@@ -11,6 +11,8 @@ from app.logging_config import (
     get_request_id,
     redact_sensitive,
     request_id_middleware,
+    sanitize_sentry_event,
+    scrub_text,
 )
 
 
@@ -49,6 +51,40 @@ class RedactSensitiveTests(unittest.TestCase):
         payload["self"] = payload
         result = redact_sensitive(payload)
         self.assertEqual(result["self"], "[Circular]")
+
+    def test_scrubs_a_secret_embedded_in_free_text_under_a_non_sensitive_key(self):
+        payload = {
+            "message": "Invalid request from fake-user@example.test, token=fake-token-abc123"
+        }
+        result = redact_sensitive(payload)
+        self.assertNotIn("fake-user@example.test", result["message"])
+        self.assertNotIn("fake-token-abc123", result["message"])
+
+    def test_leaves_ordinary_free_text_untouched(self):
+        payload = {"message": "Audit completed with 12 pages crawled"}
+        self.assertEqual(redact_sensitive(payload), payload)
+
+
+class ScrubTextTests(unittest.TestCase):
+    def test_redacts_an_email_address_embedded_in_text(self):
+        result = scrub_text("contact fake-user@example.test for details")
+        self.assertNotIn("fake-user@example.test", result)
+
+    def test_redacts_a_bearer_token_embedded_in_text(self):
+        result = scrub_text("sent Authorization: Bearer fake-secret-value")
+        self.assertNotIn("fake-secret-value", result)
+
+    def test_redacts_a_jwt_shaped_string_embedded_in_text(self):
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.fakesignature"
+        result = scrub_text(f"cached token {jwt} for reuse")
+        self.assertNotIn(jwt, result)
+
+    def test_redacts_an_inline_key_value_secret_embedded_in_text(self):
+        result = scrub_text("retrying with token=fake-token-123 after failure")
+        self.assertNotIn("fake-token-123", result)
+
+    def test_leaves_text_with_no_secret_shaped_substring_unchanged(self):
+        self.assertEqual(scrub_text("everything is fine here"), "everything is fine here")
 
 
 class JsonFormatterTests(unittest.TestCase):
@@ -145,6 +181,119 @@ class SentryInitTests(unittest.TestCase):
         mock_init.assert_called_once()
         self.assertEqual(mock_init.call_args.kwargs["dsn"], "https://example.ingest.sentry.io/1")
         self.assertTrue(logging_config.is_sentry_initialized())
+
+    def test_wires_the_shared_sanitizer_in_as_before_send(self):
+        os.environ["SENTRY_DSN"] = "https://example.ingest.sentry.io/1"
+        logging_config = self._reload()
+
+        with patch("sentry_sdk.init") as mock_init:
+            logging_config.init_sentry()
+
+        self.assertIs(
+            mock_init.call_args.kwargs["before_send"],
+            logging_config.sanitize_sentry_event,
+        )
+
+
+class SanitizeSentryEventTests(unittest.TestCase):
+    def test_redacts_request_headers_cookies_and_body(self):
+        event = {
+            "request": {
+                "headers": {
+                    "authorization": "Bearer fake-session-token",
+                    "cookie": "session=fake-cookie-value",
+                },
+                "data": {"password": "fake-password", "username": "jane"},
+            }
+        }
+
+        sanitized = sanitize_sentry_event(event, {})
+
+        self.assertEqual(
+            sanitized["request"]["headers"]["authorization"], "[REDACTED]"
+        )
+        self.assertEqual(sanitized["request"]["headers"]["cookie"], "[REDACTED]")
+        self.assertEqual(sanitized["request"]["data"]["password"], "[REDACTED]")
+        self.assertEqual(sanitized["request"]["data"]["username"], "jane")
+
+    def test_redacts_user_email_but_keeps_non_sensitive_user_id(self):
+        event = {"user": {"id": "user-123", "email": "fake-user@example.test"}}
+
+        sanitized = sanitize_sentry_event(event, {})
+
+        self.assertEqual(sanitized["user"]["email"], "[REDACTED]")
+        self.assertEqual(sanitized["user"]["id"], "user-123")
+
+    def test_redacts_sensitive_keys_inside_extra_and_contexts(self):
+        event = {
+            "extra": {"apiToken": "fake-extra-token", "pagesAnalyzed": 12},
+            "contexts": {
+                "audit": {"organizationSecret": "fake-secret", "auditId": "audit-1"}
+            },
+        }
+
+        sanitized = sanitize_sentry_event(event, {})
+
+        self.assertEqual(sanitized["extra"]["apiToken"], "[REDACTED]")
+        self.assertEqual(sanitized["extra"]["pagesAnalyzed"], 12)
+        self.assertEqual(
+            sanitized["contexts"]["audit"]["organizationSecret"], "[REDACTED]"
+        )
+        self.assertEqual(sanitized["contexts"]["audit"]["auditId"], "audit-1")
+
+    def test_redacts_secrets_in_breadcrumb_data_and_free_text_messages(self):
+        event = {
+            "breadcrumbs": [
+                {
+                    "message": "Retrying request with token=fake-token-999 after 401",
+                    "data": {"authorization": "Bearer fake-breadcrumb-token"},
+                }
+            ]
+        }
+
+        sanitized = sanitize_sentry_event(event, {})
+
+        self.assertNotIn("fake-token-999", sanitized["breadcrumbs"][0]["message"])
+        self.assertEqual(
+            sanitized["breadcrumbs"][0]["data"]["authorization"], "[REDACTED]"
+        )
+
+    def test_scrubs_secret_embedded_in_exception_message(self):
+        event = {
+            "exception": {
+                "values": [
+                    {
+                        "type": "Error",
+                        "value": "Upstream call failed for fake-user@example.test: api_key=fake-api-key-42",
+                    }
+                ]
+            }
+        }
+
+        sanitized = sanitize_sentry_event(event, {})
+
+        value = sanitized["exception"]["values"][0]["value"]
+        self.assertNotIn("fake-user@example.test", value)
+        self.assertNotIn("fake-api-key-42", value)
+
+    def test_never_lets_a_real_shaped_fixture_value_reach_the_event_unredacted(self):
+        event = {
+            "request": {"headers": {"cookie": "session=fake-cookie-xyz"}},
+            "user": {"email": "fake-user@example.test"},
+            "exception": {
+                "values": [
+                    {
+                        "value": "token=fake-token-abc rejected for fake-user@example.test"
+                    }
+                ]
+            },
+        }
+
+        serialized = json.dumps(sanitize_sentry_event(event, {}))
+
+        self.assertNotIn("fake-cookie-xyz", serialized)
+        self.assertNotIn("fake-user@example.test", serialized)
+        self.assertNotIn("fake-token-abc", serialized)
 
 
 if __name__ == "__main__":
