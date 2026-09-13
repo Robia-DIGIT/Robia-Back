@@ -9,7 +9,8 @@ describe('GoogleSearchConsoleController', () => {
     getAuthorizationUrl: jest.fn(() => authorizationUrl),
     completeAuthorization: jest.fn(),
     getDashboardRedirect: jest.fn(
-      (status: string) => `https://app.robiacopilot.site/google-data?google=${status}`,
+      (status: string) =>
+        `https://app.robiacopilot.site/google-data?google=${status}`,
     ),
   };
   let controller: GoogleSearchConsoleController;
@@ -24,7 +25,7 @@ describe('GoogleSearchConsoleController', () => {
       cookie: jest.fn(),
       clearCookie: jest.fn(),
       redirect: jest.fn(),
-    } as unknown as Pick<Response, 'cookie' | 'clearCookie' | 'redirect'>;
+    };
   });
 
   it('binds the signed state to a secure, short-lived browser cookie', () => {
