@@ -1,4 +1,13 @@
-import { Body, Controller, Get, Param, Post, Query, Req, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Param,
+  Post,
+  Query,
+  Req,
+  UseGuards,
+} from '@nestjs/common';
 import { AuditsService } from './audits.service';
 import { RunAuditDto } from './dto/run-audit.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
@@ -39,10 +48,15 @@ export class AuditsController {
   }
 
   @Get('latest')
-  findLatest(@Req() req: ScopedRequest, @Query('website_id') websiteId: string) {
-    return this.auditsService.findLatestForWebsite(req.organizationId, websiteId);
+  findLatest(
+    @Req() req: ScopedRequest,
+    @Query('website_id') websiteId: string,
+  ) {
+    return this.auditsService.findLatestForWebsite(
+      req.organizationId,
+      websiteId,
+    );
   }
-
 
   @Get(':id')
   findOne(@Req() req: ScopedRequest, @Param('id') id: string) {

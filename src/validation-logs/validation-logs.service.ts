@@ -16,7 +16,9 @@ export class ValidationLogsService {
     });
 
     if (!document) {
-      throw new NotFoundException('Document non trouvé pour cette organisation');
+      throw new NotFoundException(
+        'Document non trouvé pour cette organisation',
+      );
     }
 
     const validationLog = await this.prisma.validationLog.create({
