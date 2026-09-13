@@ -31,5 +31,15 @@ if (
   totals.warnings > maxWarnings
 ) {
   console.error('ESLint debt increased or ESLint reported a fatal error.');
+  for (const file of report) {
+    if (file.errorCount === 0 && file.warningCount === 0) continue;
+    console.error(`\n${file.filePath}`);
+    for (const message of file.messages) {
+      const severity = message.severity === 2 ? 'error' : 'warning';
+      console.error(
+        `${severity} ${message.line ?? 0}:${message.column ?? 0} ${message.ruleId ?? 'fatal'} ${message.message}`,
+      );
+    }
+  }
   process.exit(1);
 }
