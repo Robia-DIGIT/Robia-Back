@@ -37,6 +37,6 @@ export class DocumentGeneratorService {
       );
     }
 
-    return response.json()
+    return (await response.json()) as GeneratedDocument;
   }
 }

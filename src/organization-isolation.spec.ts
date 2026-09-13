@@ -2,6 +2,7 @@ import { NotFoundException } from '@nestjs/common';
 import { PinoLogger } from 'nestjs-pino';
 import { ActionItemsService } from './action-items/action-items.service';
 import { AuditsService } from './audits/audits.service';
+import { GoogleSearchConsoleService } from './integrations/google-search-console.service';
 import { OrgScopeGuard } from './common/guards/org-scope.guard';
 import { DocumentsService } from './documents/documents.service';
 import { OpportunitiesService } from './opportunities/opportunities.service';
@@ -80,10 +81,14 @@ describe('Organization isolation', () => {
       runSiteAudit: jest.fn(),
       runAudit: jest.fn(),
     };
+    const googleSearchConsole = {
+      getSearchConsoleSignalsForAudit: jest.fn(),
+    };
     const logger = { assign: jest.fn() };
     const service = new AuditsService(
       prisma as any,
       runner as any,
+      googleSearchConsole as unknown as GoogleSearchConsoleService,
       logger as unknown as PinoLogger,
     );
 
@@ -98,6 +103,9 @@ describe('Organization isolation', () => {
     });
     expect(prisma.audit.create).not.toHaveBeenCalled();
     expect(runner.runSiteAudit).not.toHaveBeenCalled();
+    expect(
+      googleSearchConsole.getSearchConsoleSignalsForAudit,
+    ).not.toHaveBeenCalled();
     expect(runner.runAudit).not.toHaveBeenCalled();
   });
 

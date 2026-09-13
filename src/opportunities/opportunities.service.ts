@@ -5,6 +5,19 @@ import {
   OpportunityGeneratorService,
 } from './opportunity-generator/opportunity-generator.service';
 import { N8nWebhookService } from '../integrations/n8n-webhook.service';
+import { SiteAuditResult } from '../audits/audit-runner/audit-runner.service';
+
+// audit.resultJson is untrusted, raw persisted JSON (see AuditsService) — this
+// only asserts the shape RC-10's evidence-based pipeline actually writes into
+// site_audit; the runtime checks below still guard against anything else
+// having landed there historically.
+function hasSitePages(
+  value: SiteAuditResult | undefined,
+): value is SiteAuditResult {
+  return (
+    !!value && Number(value.pages_analyzed) > 0 && Array.isArray(value.pages)
+  );
+}
 
 @Injectable()
 export class OpportunitiesService {
@@ -28,8 +41,7 @@ export class OpportunitiesService {
       priorityScore: opportunity.priority_score,
       affectedUrls: opportunity.affected_urls ?? [],
       evidence: opportunity.evidence ?? [],
-      whyItMatters:
-        opportunity.why_it_matters ?? opportunity.description,
+      whyItMatters: opportunity.why_it_matters ?? opportunity.description,
       recommendedSteps: opportunity.recommended_steps ?? [],
     };
   }
@@ -66,15 +78,11 @@ export class OpportunitiesService {
       return this.findAllForAudit(organizationId, audit.id);
     }
 
-    const auditResult = audit.resultJson as Record<string, any>;
-    const siteAuditResult = auditResult?.site_audit;
-    const hasSiteEvidence =
-      siteAuditResult &&
-      typeof siteAuditResult === 'object' &&
-      Number(siteAuditResult.pages_analyzed) > 0 &&
-      Array.isArray(siteAuditResult.pages);
+    const auditResult = audit.resultJson as Record<string, unknown>;
+    const siteAuditResult = auditResult?.site_audit as
+      SiteAuditResult | undefined;
 
-    const generated = hasSiteEvidence
+    const generated = hasSitePages(siteAuditResult)
       ? await this.generator.generateForSite({
           siteAuditResult,
           city: organization?.city,

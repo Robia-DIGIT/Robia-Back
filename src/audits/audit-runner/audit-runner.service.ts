@@ -1,4 +1,3 @@
-/* eslint-disable prettier/prettier */
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
@@ -47,12 +46,13 @@ export interface SitePageDetail {
   business_latitude: number | null;
   business_longitude: number | null;
   social_links: Record<string, string>;
+  viewport_present: boolean;
+  html_lang: string | null;
   js_rendering_used: boolean;
   js_rendering_suspected: boolean;
   main_content: string | null;
   error: string | null;
 }
-
 
 export interface DetailedAuditFinding {
   rule_code: string;
@@ -100,6 +100,26 @@ export interface PageSpeedInsightsResult {
   unavailableReason: string | null;
 }
 
+export interface SeoCategoryScoreV2 {
+  score: number | null;
+  weight: number | null;
+  measured: boolean;
+  findingsEvaluated: number;
+}
+
+/**
+ * Explainable, weighted SEO score (RC-12). Additive alongside the
+ * legacy score fields — does not replace `Audit.globalScore` /
+ * `resultJson.global_score`. See Robia-Back's
+ * python-service/app/agents/scoring.py for the formula and the
+ * migration-decision note (recompute vs. freeze existing audits).
+ */
+export interface SeoScoreV2 {
+  version: string;
+  globalScore: number | null;
+  categories: Record<string, SeoCategoryScoreV2>;
+}
+
 export interface SiteAuditResult {
   base_url: string;
   discovery_method: string;
@@ -126,6 +146,7 @@ export interface SiteAuditResult {
   findings: string[];
   detailed_findings: DetailedAuditFinding[];
   pagespeed_insights: PageSpeedInsightsResult | null;
+  seo_score_v2: SeoScoreV2 | null;
   pages: SitePageDetail[];
   failed_urls: string[];
 }
@@ -155,11 +176,18 @@ export class AuditRunnerService {
   private readonly aiEngineUrl: string;
 
   constructor(private readonly configService: ConfigService) {
-    this.aiEngineUrl = this.configService.get<string>('AI_ENGINE_URL') ??
-    'http://localhost:8000';
+    this.aiEngineUrl =
+      this.configService.get<string>('AI_ENGINE_URL') ??
+      'http://localhost:8000';
   }
 
-  async runAudit({ websiteUrl, sector, city, country, requestId }: RunAuditParams): Promise<AuditResult> {
+  async runAudit({
+    websiteUrl,
+    sector,
+    city,
+    country,
+    requestId,
+  }: RunAuditParams): Promise<AuditResult> {
     const response = await fetch(`${this.aiEngineUrl}/audit`, {
       method: 'POST',
       headers: requestHeaders(requestId),
@@ -167,19 +195,30 @@ export class AuditRunnerService {
     });
 
     if (!response.ok) {
-      throw new Error(
-        `AI engine /audit failed with status ${response.status}`,
-      );
+      throw new Error(`AI engine /audit failed with status ${response.status}`);
     }
 
-    return response.json();
+    return (await response.json()) as AuditResult;
   }
 
-  async runSiteAudit({ websiteUrl, maxPages = 20, maxDepth = 2, city, country, requestId }: RunSiteAuditParams): Promise<SiteAuditResult> {
+  async runSiteAudit({
+    websiteUrl,
+    maxPages = 20,
+    maxDepth = 2,
+    city,
+    country,
+    requestId,
+  }: RunSiteAuditParams): Promise<SiteAuditResult> {
     const response = await fetch(`${this.aiEngineUrl}/audit/site`, {
       method: 'POST',
       headers: requestHeaders(requestId),
-      body: JSON.stringify({ url: websiteUrl, max_pages: maxPages, max_depth: maxDepth, city, country }),
+      body: JSON.stringify({
+        url: websiteUrl,
+        max_pages: maxPages,
+        max_depth: maxDepth,
+        city,
+        country,
+      }),
     });
 
     if (!response.ok) {
@@ -188,6 +227,6 @@ export class AuditRunnerService {
       );
     }
 
-    return response.json();
+    return (await response.json()) as SiteAuditResult;
   }
 }

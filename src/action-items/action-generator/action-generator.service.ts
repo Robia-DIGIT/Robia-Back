@@ -34,6 +34,6 @@ export class ActionGeneratorService {
       );
     }
 
-    return response.json();
+    return (await response.json()) as GeneratedAction[];
   }
 }
