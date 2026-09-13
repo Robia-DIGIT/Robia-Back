@@ -1,6 +1,28 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
+interface GooglePlaceGeometry {
+  location?: { lat: number; lng: number };
+}
+
+interface GooglePlaceResult {
+  place_id: string;
+  name: string;
+  formatted_address: string;
+  geometry?: GooglePlaceGeometry;
+  opening_hours?: { weekday_text?: string[] };
+}
+
+interface GooglePlacesTextSearchResponse {
+  status: string;
+  results?: GooglePlaceResult[];
+}
+
+interface GooglePlaceDetailsResponse {
+  status: string;
+  result: GooglePlaceResult;
+}
+
 export interface PlaceCandidate {
   placeId: string;
   name: string;
@@ -41,12 +63,12 @@ export class LocationPlacesService {
       throw new Error(`Places API a échoué avec le statut ${response.status}`);
     }
 
-    const data = await response.json();
+    const data = (await response.json()) as GooglePlacesTextSearchResponse;
     if (data.status !== 'OK' && data.status !== 'ZERO_RESULTS') {
       throw new Error(`Places API a retourné une erreur : ${data.status}`);
     }
 
-    return (data.results ?? []).slice(0, 5).map((result: any) => ({
+    return (data.results ?? []).slice(0, 5).map((result) => ({
       placeId: result.place_id,
       name: result.name,
       formattedAddress: result.formatted_address,
@@ -81,7 +103,7 @@ export class LocationPlacesService {
       );
     }
 
-    const data = await response.json();
+    const data = (await response.json()) as GooglePlaceDetailsResponse;
     if (data.status !== 'OK') {
       throw new Error(
         `Places API (details) a retourné une erreur : ${data.status}`,

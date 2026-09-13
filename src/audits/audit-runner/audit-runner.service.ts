@@ -183,7 +183,7 @@ export class AuditRunnerService {
       throw new Error(`AI engine /audit failed with status ${response.status}`);
     }
 
-    return response.json();
+    return (await response.json()) as AuditResult;
   }
 
   async runSiteAudit({
@@ -211,6 +211,6 @@ export class AuditRunnerService {
       );
     }
 
-    return response.json();
+    return (await response.json()) as SiteAuditResult;
   }
 }

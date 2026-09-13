@@ -5,7 +5,7 @@ import {
   SiteAuditResult,
 } from './audit-runner/audit-runner.service';
 import { GoogleSearchConsoleService } from '../integrations/google-search-console.service';
-//import { Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 
 @Injectable()
 export class AuditsService {
@@ -77,7 +77,7 @@ export class AuditsService {
             ...result,
             site_audit: siteResult,
             google_search_console: googleSearchConsole,
-          } as any,
+          } as unknown as Prisma.InputJsonValue,
           completedAt: new Date(),
         },
       });
@@ -178,7 +178,7 @@ export class AuditsService {
           resultJson: {
             ...result,
             google_search_console: googleSearchConsole,
-          } as any,
+          } as unknown as Prisma.InputJsonValue,
           completedAt: new Date(),
         },
       });

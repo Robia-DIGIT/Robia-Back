@@ -11,6 +11,26 @@ interface OpportunityContext {
   sourceData?: unknown;
 }
 
+// Mirrors the ActionItem Prisma model (prisma/schema.prisma) rather than
+// importing Prisma's generated type directly: enrichAction/enrichActions
+// spread the whole row into their return value (...action), so every real
+// column needs to be named here for that spread — and for what downstream
+// callers (e.g. getActionsForExport) read off the enriched result — to stay
+// typed instead of falling back to an inferred error/any type. `opportunity`
+// is additionally optional: only findAll's include: {opportunity: {...}} row
+// shape carries it.
+interface RawActionItem {
+  id: string;
+  organizationId: string;
+  opportunityId: string | null;
+  documentId: string | null;
+  title: string;
+  status: string;
+  dueDate: Date | null;
+  createdAt: Date;
+  opportunity?: OpportunityContext | null;
+}
+
 @Injectable()
 export class ActionItemsService {
   constructor(
@@ -49,7 +69,7 @@ export class ActionItemsService {
   }
 
   private enrichAction(
-    action: any,
+    action: RawActionItem,
     opportunity: OpportunityContext,
     sequence: number,
   ) {
@@ -90,12 +110,11 @@ export class ActionItemsService {
   }
 
   private enrichActions(
-    actions: any[],
+    actions: RawActionItem[],
     fallbackOpportunity?: OpportunityContext,
   ) {
     const enriched = actions.map((action) => {
-      const opportunity = (action.opportunity as
-        OpportunityContext | undefined) ??
+      const opportunity = action.opportunity ??
         fallbackOpportunity ?? { id: String(action.opportunityId ?? '') };
       const source = this.asRecord(opportunity.sourceData);
       const recommendedSteps = this.stringList(source.recommendedSteps);
