@@ -46,119 +46,128 @@ describe('MetaService hardening', () => {
     );
   });
 
-  it('scopes status reads and disconnect writes to the requested organization', async () => {
-    prisma.metaConnection.findUnique
-      .mockResolvedValueOnce({
-        metaUserId: 'meta-user-a',
-        metaUserName: 'Org A',
-        grantedScopes: 'pages_show_list,pages_read_engagement,instagram_basic',
-        selectedPageId: null,
-        selectedPageName: null,
-        selectedInstagramAccountId: null,
-        selectedInstagramUsername: null,
-        connectedAt: new Date('2026-09-14T00:00:00Z'),
-        lastSyncedAt: null,
-      })
-      .mockResolvedValueOnce({
-        metaUserId: 'meta-user-b',
-        metaUserName: 'Org B',
-        grantedScopes: 'pages_show_list,pages_read_engagement,instagram_basic',
-        selectedPageId: null,
-        selectedPageName: null,
-        selectedInstagramAccountId: null,
-        selectedInstagramUsername: null,
-        connectedAt: new Date('2026-09-14T00:00:00Z'),
-        lastSyncedAt: null,
+  it(
+    'scopes status reads and disconnect writes to the requested organization',
+    async () => {
+      prisma.metaConnection.findUnique
+        .mockResolvedValueOnce({
+          metaUserId: 'meta-user-a',
+          metaUserName: 'Org A',
+          grantedScopes: 'pages_show_list,pages_read_engagement,instagram_basic',
+          selectedPageId: null,
+          selectedPageName: null,
+          selectedInstagramAccountId: null,
+          selectedInstagramUsername: null,
+          connectedAt: new Date('2026-09-14T00:00:00Z'),
+          lastSyncedAt: null,
+        })
+        .mockResolvedValueOnce({
+          metaUserId: 'meta-user-b',
+          metaUserName: 'Org B',
+          grantedScopes: 'pages_show_list,pages_read_engagement,instagram_basic',
+          selectedPageId: null,
+          selectedPageName: null,
+          selectedInstagramAccountId: null,
+          selectedInstagramUsername: null,
+          connectedAt: new Date('2026-09-14T00:00:00Z'),
+          lastSyncedAt: null,
+        });
+      prisma.metaConnection.deleteMany.mockResolvedValue({ count: 1 });
+
+      const orgA = await service.getStatus('org-a');
+      const orgB = await service.getStatus('org-b');
+      await service.disconnect('org-b');
+
+      expect(orgA.metaUserName).toBe('Org A');
+      expect(orgB.metaUserName).toBe('Org B');
+      expect(prisma.metaConnection.findUnique).toHaveBeenNthCalledWith(1, {
+        where: { organizationId: 'org-a' },
+        select: expect.any(Object),
       });
-    prisma.metaConnection.deleteMany.mockResolvedValue({ count: 1 });
+      expect(prisma.metaConnection.findUnique).toHaveBeenNthCalledWith(2, {
+        where: { organizationId: 'org-b' },
+        select: expect.any(Object),
+      });
+      expect(prisma.metaConnection.deleteMany).toHaveBeenCalledWith({
+        where: { organizationId: 'org-b' },
+      });
+    },
+  );
 
-    const orgA = await service.getStatus('org-a');
-    const orgB = await service.getStatus('org-b');
-    await service.disconnect('org-b');
+  it(
+    'returns accessible assets without exposing user or Page access tokens',
+    async () => {
+      const encryptedUserToken = (
+        service as unknown as MetaServiceCrypto
+      ).encrypt('org-b-user-token-never-return');
 
-    expect(orgA.metaUserName).toBe('Org A');
-    expect(orgB.metaUserName).toBe('Org B');
-    expect(prisma.metaConnection.findUnique).toHaveBeenNthCalledWith(1, {
-      where: { organizationId: 'org-a' },
-      select: expect.any(Object),
-    });
-    expect(prisma.metaConnection.findUnique).toHaveBeenNthCalledWith(2, {
-      where: { organizationId: 'org-b' },
-      select: expect.any(Object),
-    });
-    expect(prisma.metaConnection.deleteMany).toHaveBeenCalledWith({
-      where: { organizationId: 'org-b' },
-    });
-  });
+      prisma.metaConnection.findUnique.mockResolvedValue({
+        encryptedUserAccessToken: encryptedUserToken,
+        selectedPageId: 'page-1',
+      });
 
-  it('returns accessible assets without exposing user or Page access tokens', async () => {
-    const encryptedUserToken = (
-      service as unknown as MetaServiceCrypto
-    ).encrypt('org-b-user-token-never-return');
-
-    prisma.metaConnection.findUnique.mockResolvedValue({
-      encryptedUserAccessToken: encryptedUserToken,
-      selectedPageId: 'page-1',
-    });
-
-    jest.spyOn(global, 'fetch').mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          data: [
-            {
-              id: 'page-1',
-              name: 'ROBIA B',
-              access_token: 'page-token-never-return',
-              tasks: ['ANALYZE'],
-              instagram_business_account: {
-                id: 'ig-1',
-                username: 'robiab',
+      jest.spyOn(global, 'fetch').mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            data: [
+              {
+                id: 'page-1',
+                name: 'ROBIA B',
+                access_token: 'page-token-never-return',
+                tasks: ['ANALYZE'],
+                instagram_business_account: {
+                  id: 'ig-1',
+                  username: 'robiab',
+                },
               },
-            },
-          ],
-        }),
+            ],
+          }),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          },
+        ),
+      );
+
+      const assets = await service.listAssets('org-b');
+      const serialized = JSON.stringify(assets);
+
+      expect(prisma.metaConnection.findUnique).toHaveBeenCalledWith({
+        where: { organizationId: 'org-b' },
+      });
+      expect(assets).toEqual([
         {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
+          pageId: 'page-1',
+          pageName: 'ROBIA B',
+          tasks: ['ANALYZE'],
+          instagramAccount: { id: 'ig-1', username: 'robiab' },
+          selected: true,
         },
-      ),
-    );
+      ]);
+      expect(serialized).not.toContain('org-b-user-token-never-return');
+      expect(serialized).not.toContain('page-token-never-return');
+    },
+  );
 
-    const assets = await service.listAssets('org-b');
-    const serialized = JSON.stringify(assets);
+  it(
+    'rejects a valid signed state when the organization is not owned by the signed user before calling Meta',
+    async () => {
+      const state = new URL(
+        service.getAuthorizationUrl('org-a', 'user-a'),
+      ).searchParams.get('state')!;
+      prisma.organization.findFirst.mockResolvedValue(null);
+      const fetchSpy = jest.spyOn(global, 'fetch');
 
-    expect(prisma.metaConnection.findUnique).toHaveBeenCalledWith({
-      where: { organizationId: 'org-b' },
-    });
-    expect(assets).toEqual([
-      {
-        pageId: 'page-1',
-        pageName: 'ROBIA B',
-        tasks: ['ANALYZE'],
-        instagramAccount: { id: 'ig-1', username: 'robiab' },
-        selected: true,
-      },
-    ]);
-    expect(serialized).not.toContain('org-b-user-token-never-return');
-    expect(serialized).not.toContain('page-token-never-return');
-  });
+      await expect(
+        service.completeAuthorization('authorization-code', state),
+      ).rejects.toThrow('Organisation OAuth invalide.');
 
-  it('rejects a valid signed state when the organization is not owned by the signed user before calling Meta', async () => {
-    const state = new URL(
-      service.getAuthorizationUrl('org-a', 'user-a'),
-    ).searchParams.get('state')!;
-    prisma.organization.findFirst.mockResolvedValue(null);
-    const fetchSpy = jest.spyOn(global, 'fetch');
-
-    await expect(
-      service.completeAuthorization('authorization-code', state),
-    ).rejects.toThrow('Organisation OAuth invalide.');
-
-    expect(prisma.organization.findFirst).toHaveBeenCalledWith({
-      where: { id: 'org-a', ownerId: 'user-a' },
-      select: { id: true },
-    });
-    expect(fetchSpy).not.toHaveBeenCalled();
-    expect(prisma.metaConnection.upsert).not.toHaveBeenCalled();
-  });
+      expect(prisma.organization.findFirst).toHaveBeenCalledWith({
+        where: { id: 'org-a', ownerId: 'user-a' },
+        select: { id: true },
+      });
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(prisma.metaConnection.upsert).not.toHaveBeenCalled();
+    },
+  );
 });
