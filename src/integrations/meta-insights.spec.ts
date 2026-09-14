@@ -304,4 +304,98 @@ describe('evaluateMetaFindings', () => {
     expect(['observed', 'heuristic']).toContain(finding.confidence);
     expect(finding.scoreInfluence).toBe(false);
   });
+
+  it("keeps every rule's impact/effort on the same 0-10 scale as SEO findings — never a different scale that could distort ranking (Codex review)", () => {
+    // python-service/app/agents/audit_rules.py assigns impact_score/
+    // effort_score as small ints in [0, 10] (e.g. 4, 5, 6, 8, 9) for every
+    // SEO finding. oppPriorityScore()'s frontend fallback
+    // (impactScore * 10) and findAllForAudit()'s top-5 ranking both
+    // assume that scale uniformly across every opportunity source — a
+    // Meta finding using a different scale would silently distort both.
+    const scenarios: MetaAuditSignals[] = [
+      baseSignals({
+        status: 'unavailable',
+        connected: true,
+        pageSelected: false,
+        instagramLinked: false,
+        facebook: null,
+        instagram: null,
+        recentMedia: null,
+        unavailableReason: 'no_page_selected',
+      }),
+      baseSignals({
+        instagramLinked: false,
+        instagram: null,
+        recentMedia: null,
+      }),
+      baseSignals({ recentMedia: { observed: true, items: [] } }),
+      baseSignals({
+        recentMedia: {
+          observed: true,
+          items: [
+            {
+              timestamp: '2026-07-16T00:00:00.000Z',
+              likeCount: 1,
+              commentsCount: 0,
+            },
+          ],
+        },
+      }),
+      baseSignals({
+        facebook: {
+          fanCount: null,
+          followersCount: null,
+          talkingAboutCount: null,
+        },
+      }),
+    ];
+
+    const allFindings = scenarios.flatMap((signals) =>
+      evaluateMetaFindings(
+        signals,
+        DEFAULT_META_INSIGHTS_THRESHOLDS,
+        new Date('2026-09-14T00:00:00.000Z'),
+      ),
+    );
+
+    expect(allFindings.length).toBeGreaterThanOrEqual(5);
+    allFindings.forEach((finding) => {
+      expect(finding.impactScore).toBeGreaterThanOrEqual(0);
+      expect(finding.impactScore).toBeLessThanOrEqual(10);
+      expect(finding.effortScore).toBeGreaterThanOrEqual(0);
+      expect(finding.effortScore).toBeLessThanOrEqual(10);
+      expect(Number.isInteger(finding.impactScore)).toBe(true);
+      expect(Number.isInteger(finding.effortScore)).toBe(true);
+    });
+  });
+
+  it('does not fire META_LOW_RECENT_ACTIVITY when the observed post count exactly meets a threshold at the 10-item fetch ceiling', () => {
+    // Clamping the *configured* threshold to that ceiling is
+    // MetaService.getInsightsThresholds()'s job (see
+    // meta-insights-signals.spec.ts) — this only proves the comparison
+    // itself is a plain >= at the boundary, not an off-by-one.
+    const now = new Date('2026-09-14T00:00:00.000Z');
+    const signals = baseSignals({
+      recentMedia: {
+        observed: true,
+        items: Array.from({ length: 10 }, (_, i) => ({
+          timestamp: new Date(
+            now.getTime() - i * 24 * 60 * 60 * 1000,
+          ).toISOString(),
+          likeCount: 1,
+          commentsCount: 0,
+        })),
+      },
+    });
+
+    const findings = evaluateMetaFindings(
+      signals,
+      { lowActivityWindowDays: 30, lowActivityMinPosts: 10 },
+      now,
+    );
+
+    expect(findings.map((f) => f.ruleCode)).not.toContain(
+      'META_LOW_RECENT_ACTIVITY',
+    );
+  });
 });

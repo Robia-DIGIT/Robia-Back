@@ -1,4 +1,40 @@
 import { OpportunitiesService } from './opportunities.service';
+import { PrismaService } from '../prisma/prisma.service';
+import { OpportunityGeneratorService } from './opportunity-generator/opportunity-generator.service';
+import { N8nWebhookService } from '../integrations/n8n-webhook.service';
+import { MetaService } from '../integrations/meta.service';
+
+// Precisely-typed mocks (not `any`) for every constructor dependency —
+// every no-unsafe-* ESLint finding in this file traced back to these being
+// `any`; typing them here, once, fixes every call site below without
+// touching the ESLint baseline (Codex review).
+interface MockPrisma {
+  audit: { findFirst: jest.Mock; update: jest.Mock };
+  organization: { findUnique: jest.Mock };
+  opportunity: {
+    count: jest.Mock;
+    deleteMany: jest.Mock;
+    findFirst: jest.Mock;
+    findMany: jest.Mock;
+    update: jest.Mock;
+    create: jest.Mock<
+      Promise<Record<string, unknown>>,
+      [{ data: Record<string, unknown> }]
+    >;
+  };
+  $transaction: jest.Mock;
+}
+interface MockGenerator {
+  generate: jest.Mock;
+  generateForSite: jest.Mock;
+}
+interface MockWebhooks {
+  notifyAuditCompleted: jest.Mock;
+}
+interface MockMeta {
+  getInsightSignals: jest.Mock;
+  getInsightsThresholds: jest.Mock;
+}
 
 describe('OpportunitiesService', () => {
   const organizationId = 'org-1';
@@ -15,10 +51,10 @@ describe('OpportunitiesService', () => {
     },
   ];
 
-  let prisma: any;
-  let generator: any;
-  let webhooks: any;
-  let meta: any;
+  let prisma: MockPrisma;
+  let generator: MockGenerator;
+  let webhooks: MockWebhooks;
+  let meta: MockMeta;
   let service: OpportunitiesService;
 
   beforeEach(() => {
@@ -40,14 +76,19 @@ describe('OpportunitiesService', () => {
         findMany: jest.fn().mockResolvedValue([]),
         update: jest.fn(),
         create: jest
-          .fn()
+          .fn<
+            Promise<Record<string, unknown>>,
+            [{ data: Record<string, unknown> }]
+          >()
           .mockImplementation(({ data }) =>
             Promise.resolve({ id: 'opportunity-1', ...data }),
           ),
       },
       $transaction: jest
         .fn()
-        .mockImplementation((operations) => Promise.all(operations)),
+        .mockImplementation((operations: Array<Promise<unknown>>) =>
+          Promise.all(operations),
+        ),
     };
     generator = {
       generate: jest.fn().mockResolvedValue(generated),
@@ -71,8 +112,16 @@ describe('OpportunitiesService', () => {
         lastSyncedAt: null,
         unavailableReason: 'not_connected',
       }),
+      getInsightsThresholds: jest
+        .fn()
+        .mockReturnValue({ lowActivityWindowDays: 30, lowActivityMinPosts: 1 }),
     };
-    service = new OpportunitiesService(prisma, generator, webhooks, meta);
+    service = new OpportunitiesService(
+      prisma as unknown as PrismaService,
+      generator as unknown as OpportunityGeneratorService,
+      webhooks as unknown as N8nWebhookService,
+      meta as unknown as MetaService,
+    );
   });
 
   it('uses attached multi-page evidence for new standard audits', async () => {
@@ -110,7 +159,7 @@ describe('OpportunitiesService', () => {
         organizationId,
         auditId,
         title: generated[0].title,
-      }),
+      }) as Record<string, unknown>,
     });
     expect(webhooks.notifyAuditCompleted).toHaveBeenCalledWith({
       auditId,
@@ -148,7 +197,7 @@ describe('OpportunitiesService', () => {
     expect(generator.generateForSite).not.toHaveBeenCalled();
   });
 
-  it('does not send another audit email when opportunities already exist', async () => {
+  it('does not regenerate SEO opportunities or send another audit email when opportunities already exist, but still checks for missing Meta ones (RC-19)', async () => {
     prisma.audit.findFirst.mockResolvedValue({
       id: auditId,
       globalScore: 62,
@@ -172,7 +221,11 @@ describe('OpportunitiesService', () => {
     expect(generator.generate).not.toHaveBeenCalled();
     expect(generator.generateForSite).not.toHaveBeenCalled();
     expect(prisma.opportunity.deleteMany).not.toHaveBeenCalled();
-    expect(meta.getInsightSignals).not.toHaveBeenCalled();
+    // Meta is not connected in this test (the default mock) — nothing new
+    // to add — but the check itself must still run so a later Meta
+    // connection can be picked up without a fresh audit.
+    expect(meta.getInsightSignals).toHaveBeenCalledWith(organizationId);
+    expect(prisma.opportunity.create).not.toHaveBeenCalled();
   });
 
   it('persists a status change only after checking organization ownership', async () => {
@@ -202,6 +255,8 @@ describe('OpportunitiesService', () => {
       organizationId: string;
       auditId: string;
       title: string;
+      impactScore?: number;
+      effortScore?: number;
       sourceData?: {
         source?: string;
         ruleCode?: string;
@@ -265,10 +320,101 @@ describe('OpportunitiesService', () => {
       );
       expect(Array.isArray(metaOpportunity?.sourceData?.evidence)).toBe(true);
       expect(typeof metaOpportunity?.sourceData?.recommendation).toBe('string');
+      // Same 0-10 scale as every SEO opportunity (Codex review) — never a
+      // different scale that would distort oppPriorityScore()'s fallback
+      // or findAllForAudit()'s top-5 ranking.
+      expect(metaOpportunity?.impactScore).toBeGreaterThanOrEqual(0);
+      expect(metaOpportunity?.impactScore).toBeLessThanOrEqual(10);
+      expect(metaOpportunity?.effortScore).toBeGreaterThanOrEqual(0);
+      expect(metaOpportunity?.effortScore).toBeLessThanOrEqual(10);
       // Still generates the unrelated SEO opportunity from the same audit.
       expect(
         opportunities.some((opp) => opp.title === generated[0].title),
       ).toBe(true);
+    });
+
+    it('adds a missing Meta opportunity to an audit that already has SEO opportunities, without regenerating or deleting the existing ones (Codex review)', async () => {
+      mockAudit({ global_score: 62 });
+      prisma.opportunity.count.mockResolvedValue(1);
+      const existingSeoOpportunity = {
+        id: 'existing-seo-opportunity',
+        organizationId,
+        auditId,
+        title: generated[0].title,
+        sourceData: { ruleCode: 'content.meta_description_missing' },
+      };
+      prisma.opportunity.findMany.mockResolvedValue([existingSeoOpportunity]);
+      meta.getInsightSignals.mockResolvedValue({
+        status: 'unavailable',
+        source: 'meta',
+        readOnly: true,
+        scoreInfluence: false,
+        connected: true,
+        pageSelected: true,
+        instagramLinked: false,
+        facebook: { fanCount: 10, followersCount: 10, talkingAboutCount: null },
+        instagram: null,
+        recentMedia: null,
+        lastSyncedAt: new Date('2026-09-01T00:00:00.000Z'),
+        unavailableReason: null,
+      });
+
+      await service.generateFromAudit(organizationId, auditId);
+
+      // The SEO generator is never re-run on this path — the whole point
+      // of idempotency is to avoid destroying existing actions/documents
+      // linked to the SEO opportunity that's already there.
+      expect(generator.generate).not.toHaveBeenCalled();
+      expect(generator.generateForSite).not.toHaveBeenCalled();
+      expect(prisma.opportunity.deleteMany).not.toHaveBeenCalled();
+      // Exactly one new (Meta) opportunity gets created — the missing
+      // META_INSTAGRAM_NOT_LINKED finding — never a duplicate of the
+      // existing SEO one.
+      expect(prisma.opportunity.create).toHaveBeenCalledTimes(1);
+      const createdData = prisma.opportunity.create.mock.calls[0][0]
+        .data as unknown as TestOpportunity;
+      expect(createdData.sourceData?.source).toBe('meta');
+      expect(createdData.sourceData?.ruleCode).toBe(
+        'META_INSTAGRAM_NOT_LINKED',
+      );
+    });
+
+    it('creates no new opportunity when every current Meta finding already has one recorded for this audit (idempotent re-run)', async () => {
+      mockAudit({ global_score: 62 });
+      prisma.opportunity.count.mockResolvedValue(2);
+      prisma.opportunity.findMany.mockResolvedValue([
+        {
+          id: 'existing-seo-opportunity',
+          organizationId,
+          auditId,
+          sourceData: { ruleCode: 'content.meta_description_missing' },
+        },
+        {
+          id: 'existing-meta-opportunity',
+          organizationId,
+          auditId,
+          sourceData: { source: 'meta', ruleCode: 'META_INSTAGRAM_NOT_LINKED' },
+        },
+      ]);
+      meta.getInsightSignals.mockResolvedValue({
+        status: 'unavailable',
+        source: 'meta',
+        readOnly: true,
+        scoreInfluence: false,
+        connected: true,
+        pageSelected: true,
+        instagramLinked: false,
+        facebook: { fanCount: 10, followersCount: 10, talkingAboutCount: null },
+        instagram: null,
+        recentMedia: null,
+        lastSyncedAt: new Date('2026-09-01T00:00:00.000Z'),
+        unavailableReason: null,
+      });
+
+      await service.generateFromAudit(organizationId, auditId);
+
+      expect(prisma.opportunity.create).not.toHaveBeenCalled();
+      expect(prisma.$transaction).not.toHaveBeenCalled();
     });
 
     it('generates no Meta opportunity when Meta is not connected', async () => {

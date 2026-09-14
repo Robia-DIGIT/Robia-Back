@@ -25,10 +25,20 @@ export interface MetaInsightsThresholds {
 }
 
 /**
+ * getInsightSignals() only ever reads the 10 most recent Instagram media
+ * items (see meta.service.ts's graphGet(`${id}/media`, ..., { limit: '10' })).
+ * A configured lowActivityMinPosts above this ceiling could never be
+ * satisfied and would always fire — MetaService.getInsightsThresholds()
+ * clamps against this constant rather than trust raw env input.
+ */
+export const RECENT_MEDIA_FETCH_LIMIT = 10;
+
+/**
  * Heuristic, not business truth: 30 days / 1 post is a documented default,
  * not a measured engagement benchmark. Configurable via
- * META_LOW_ACTIVITY_WINDOW_DAYS / META_LOW_ACTIVITY_MIN_POSTS (see
- * MetaService.insightsThresholds()).
+ * META_LOW_ACTIVITY_WINDOW_DAYS / META_LOW_ACTIVITY_MIN_POSTS — see
+ * MetaService.getInsightsThresholds(), which validates and clamps these
+ * before they ever reach evaluateMetaFindings().
  */
 export const DEFAULT_META_INSIGHTS_THRESHOLDS: MetaInsightsThresholds = {
   lowActivityWindowDays: 30,
@@ -103,8 +113,13 @@ export function evaluateMetaFindings(
       severity: 'medium',
       confidence: 'observed',
       confidenceScore: 0.95,
-      impactScore: 40,
-      effortScore: 10,
+      // Impact/effort share the same 0-10 scale as SEO findings
+      // (python-service/app/agents/audit_rules.py) — never a different
+      // scale, since oppPriorityScore()'s frontend fallback and
+      // findAllForAudit()'s top-5 ranking both assume 0-10 uniformly
+      // across every opportunity source.
+      impactScore: 4,
+      effortScore: 1,
       scoreInfluence: false,
       evidence: [
         {
@@ -132,8 +147,8 @@ export function evaluateMetaFindings(
       severity: 'low',
       confidence: 'observed',
       confidenceScore: 0.9,
-      impactScore: 30,
-      effortScore: 20,
+      impactScore: 3,
+      effortScore: 2,
       scoreInfluence: false,
       evidence: [
         {
@@ -162,8 +177,8 @@ export function evaluateMetaFindings(
         severity: 'medium',
         confidence: 'observed',
         confidenceScore: 0.85,
-        impactScore: 50,
-        effortScore: 40,
+        impactScore: 5,
+        effortScore: 4,
         scoreInfluence: false,
         evidence: [
           {
@@ -195,8 +210,8 @@ export function evaluateMetaFindings(
           severity: 'low',
           confidence: 'heuristic',
           confidenceScore: 0.5,
-          impactScore: 35,
-          effortScore: 40,
+          impactScore: 4,
+          effortScore: 4,
           scoreInfluence: false,
           evidence: [
             {
@@ -222,24 +237,25 @@ export function evaluateMetaFindings(
     findings.push({
       source: 'meta',
       ruleCode: 'META_PROFILE_DATA_INCOMPLETE',
-      title: 'Données de profil Facebook incomplètes',
+      title: 'Métriques de profil Facebook non retournées',
       description:
-        "La Page Facebook a été lue avec succès, mais Meta n'a renvoyé aucun nombre de fans ni d'abonnés pour cette Page.",
+        "La Page Facebook a été lue avec succès, mais l'API Meta n'a renvoyé ni nombre de fans ni nombre d'abonnés pour cette Page à cette lecture. Cette absence peut venir des permissions accordées, d'une limitation temporaire de l'API Meta, ou du type de Page — elle ne prouve pas à elle seule un problème de configuration du profil.",
       category: 'social',
       severity: 'info',
       confidence: 'observed',
       confidenceScore: 0.7,
-      impactScore: 20,
-      effortScore: 15,
+      impactScore: 2,
+      effortScore: 2,
       scoreInfluence: false,
       evidence: [
         {
-          observed: 'fanCount et followersCount absents de la réponse Meta',
-          expected: 'Au moins un des deux compteurs de profil renseigné',
+          observed:
+            "fanCount et followersCount non retournés par l'API Meta pour cette lecture",
+          expected: 'Au moins un des deux compteurs retourné par Meta',
         },
       ],
       recommendation:
-        'Vérifiez la visibilité publique du profil de la Page dans les paramètres Facebook.',
+        "Vérifiez les permissions Meta accordées à ROBIA et réessayez plus tard ; si l'absence persiste, contactez le support Meta pour confirmer la disponibilité de ces métriques pour ce type de Page.",
     });
   }
 

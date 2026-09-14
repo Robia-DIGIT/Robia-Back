@@ -58,14 +58,19 @@ export class OpportunitiesService {
   // attachment, this call is intentionally not wrapped in an extra
   // try/catch here: opportunity generation must never fail because a Meta
   // side-signal read hiccuped.
-  private async generateMetaOpportunities(
+  private async evaluateCurrentMetaFindings(
+    organizationId: string,
+  ): Promise<MetaFinding[]> {
+    const signals = await this.meta.getInsightSignals(organizationId);
+    return evaluateMetaFindings(signals, this.meta.getInsightsThresholds());
+  }
+
+  private buildMetaOpportunityData(
     organizationId: string,
     auditId: string,
+    finding: MetaFinding,
   ) {
-    const signals = await this.meta.getInsightSignals(organizationId);
-    const findings = evaluateMetaFindings(signals);
-
-    return findings.map((finding) => ({
+    return {
       organizationId,
       auditId,
       title: finding.title,
@@ -76,7 +81,63 @@ export class OpportunitiesService {
       confidenceScore: finding.confidenceScore,
       sourceData: this.buildMetaSourceData(finding),
       status: 'open' as const,
-    }));
+    };
+  }
+
+  // RC-19: identifies which Meta rules already have an opportunity recorded
+  // for this audit, keyed by ruleCode — the stable identity a Meta finding
+  // carries across re-evaluations (see buildMetaSourceData). Used so a
+  // regeneration call can add newly-missing Meta opportunities without
+  // ever duplicating one that already exists.
+  private async existingMetaRuleCodes(auditId: string): Promise<Set<string>> {
+    const existing = await this.prisma.opportunity.findMany({
+      where: { auditId },
+      select: { sourceData: true },
+    });
+    const ruleCodes = new Set<string>();
+    for (const opportunity of existing) {
+      const data = opportunity.sourceData as {
+        source?: unknown;
+        ruleCode?: unknown;
+      } | null;
+      if (
+        data &&
+        typeof data === 'object' &&
+        data.source === 'meta' &&
+        typeof data.ruleCode === 'string'
+      ) {
+        ruleCodes.add(data.ruleCode);
+      }
+    }
+    return ruleCodes;
+  }
+
+  // RC-19: called on the idempotent "already generated" path — preserves
+  // every existing SEO and Meta opportunity (and anything already linked to
+  // them: actions, documents, validations) untouched, and inserts only the
+  // Meta findings that are not yet represented for this audit. Never
+  // touches the SEO generator or re-runs it.
+  private async syncMissingMetaOpportunities(
+    organizationId: string,
+    auditId: string,
+  ) {
+    const [existingRuleCodes, findings] = await Promise.all([
+      this.existingMetaRuleCodes(auditId),
+      this.evaluateCurrentMetaFindings(organizationId),
+    ]);
+    const missing = findings.filter(
+      (finding) => !existingRuleCodes.has(finding.ruleCode),
+    );
+    if (missing.length === 0) {
+      return;
+    }
+    await this.prisma.$transaction(
+      missing.map((finding) =>
+        this.prisma.opportunity.create({
+          data: this.buildMetaOpportunityData(organizationId, auditId, finding),
+        }),
+      ),
+    );
   }
 
   private buildSourceData(opportunity: GeneratedOpportunity) {
@@ -124,9 +185,13 @@ export class OpportunitiesService {
       where: { auditId: audit.id },
     });
 
-    // La génération est idempotente : les opportunités peuvent déjà avoir des
-    // actions, documents et validations liés qu'une régénération détruirait.
+    // La génération SEO est idempotente : les opportunités peuvent déjà
+    // avoir des actions, documents et validations liés qu'une régénération
+    // détruirait. RC-19 : les opportunités Meta manquantes sont néanmoins
+    // ajoutées à un audit déjà généré (Meta a pu être connecté après coup) —
+    // jamais de suppression ni de régénération du SEO existant.
     if (existingOpportunityCount > 0) {
+      await this.syncMissingMetaOpportunities(organizationId, audit.id);
       return this.findAllForAudit(organizationId, audit.id);
     }
 
@@ -145,10 +210,7 @@ export class OpportunitiesService {
     // RC-19: additive only — Meta findings never replace or reorder the SEO
     // opportunities above; they are read-only, social-presence evidence
     // (scoreInfluence: false) attached to the same completed audit.
-    const metaOpportunities = await this.generateMetaOpportunities(
-      organizationId,
-      audit.id,
-    );
+    const metaFindings = await this.evaluateCurrentMetaFindings(organizationId);
 
     const opportunities = await this.prisma.$transaction([
       ...generated.map((opp) =>
@@ -167,8 +229,14 @@ export class OpportunitiesService {
           },
         }),
       ),
-      ...metaOpportunities.map((data) =>
-        this.prisma.opportunity.create({ data }),
+      ...metaFindings.map((finding) =>
+        this.prisma.opportunity.create({
+          data: this.buildMetaOpportunityData(
+            organizationId,
+            audit.id,
+            finding,
+          ),
+        }),
       ),
     ]);
 
@@ -205,6 +273,7 @@ export class OpportunitiesService {
     });
 
     if (existingOpportunityCount > 0) {
+      await this.syncMissingMetaOpportunities(organizationId, audit.id);
       return this.findAllForAudit(organizationId, audit.id);
     }
 
@@ -220,10 +289,7 @@ export class OpportunitiesService {
     });
 
     // RC-19: additive only, same as generateFromAudit() above.
-    const metaOpportunities = await this.generateMetaOpportunities(
-      organizationId,
-      audit.id,
-    );
+    const metaFindings = await this.evaluateCurrentMetaFindings(organizationId);
 
     return this.prisma.$transaction([
       ...generated.map((opp) =>
@@ -242,8 +308,14 @@ export class OpportunitiesService {
           },
         }),
       ),
-      ...metaOpportunities.map((data) =>
-        this.prisma.opportunity.create({ data }),
+      ...metaFindings.map((finding) =>
+        this.prisma.opportunity.create({
+          data: this.buildMetaOpportunityData(
+            organizationId,
+            audit.id,
+            finding,
+          ),
+        }),
       ),
     ]);
   }

@@ -325,3 +325,67 @@ describe('MetaService.getInsightSignals', () => {
     });
   });
 });
+
+describe('MetaService.getInsightsThresholds', () => {
+  const values: Record<string, string> = {
+    META_APP_ID: '1234567890',
+    META_APP_SECRET: 'meta-secret',
+    META_OAUTH_REDIRECT_URI:
+      'https://api.robiacopilot.site/integrations/meta/callback',
+    META_TOKEN_ENCRYPTION_KEY: 'c'.repeat(64),
+    META_OAUTH_STATE_SECRET: 'd'.repeat(64),
+  };
+  const config = { get: jest.fn((name: string) => values[name]) };
+  const prisma = { metaConnection: { findUnique: jest.fn() } };
+  let service: MetaService;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    delete values.META_LOW_ACTIVITY_WINDOW_DAYS;
+    delete values.META_LOW_ACTIVITY_MIN_POSTS;
+    config.get.mockImplementation((name: string) => values[name]);
+    service = new MetaService(
+      prisma as unknown as PrismaService,
+      config as unknown as ConfigService,
+    );
+  });
+
+  it('falls back to the documented default (30 days / 1 post) when unset', () => {
+    expect(service.getInsightsThresholds()).toEqual({
+      lowActivityWindowDays: 30,
+      lowActivityMinPosts: 1,
+    });
+  });
+
+  it('reads a valid, in-range configured threshold', () => {
+    values.META_LOW_ACTIVITY_WINDOW_DAYS = '14';
+    values.META_LOW_ACTIVITY_MIN_POSTS = '3';
+
+    expect(service.getInsightsThresholds()).toEqual({
+      lowActivityWindowDays: 14,
+      lowActivityMinPosts: 3,
+    });
+  });
+
+  it('clamps lowActivityMinPosts back to the default when configured above the 10-item recent-media fetch ceiling (Codex review)', () => {
+    // getInsightSignals() only ever reads the 10 most recent Instagram
+    // media items — a configured minimum above that could never be
+    // satisfied and would make META_LOW_RECENT_ACTIVITY fire
+    // unconditionally, a misleading always-on signal rather than a
+    // genuine heuristic.
+    values.META_LOW_ACTIVITY_MIN_POSTS = '25';
+
+    expect(service.getInsightsThresholds().lowActivityMinPosts).toBe(1);
+  });
+
+  it('falls back to the default when the configured window is out of range or not a number', () => {
+    values.META_LOW_ACTIVITY_WINDOW_DAYS = '0';
+    expect(service.getInsightsThresholds().lowActivityWindowDays).toBe(30);
+
+    values.META_LOW_ACTIVITY_WINDOW_DAYS = '9999';
+    expect(service.getInsightsThresholds().lowActivityWindowDays).toBe(30);
+
+    values.META_LOW_ACTIVITY_WINDOW_DAYS = 'not-a-number';
+    expect(service.getInsightsThresholds().lowActivityWindowDays).toBe(30);
+  });
+});

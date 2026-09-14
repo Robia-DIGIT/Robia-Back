@@ -16,6 +16,11 @@ import {
   timingSafeEqual,
 } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
+import {
+  DEFAULT_META_INSIGHTS_THRESHOLDS,
+  MetaInsightsThresholds,
+  RECENT_MEDIA_FETCH_LIMIT,
+} from './meta-insights';
 
 const STATE_MAX_AGE_MS = 10 * 60 * 1000;
 const DEFAULT_SCOPES = [
@@ -564,7 +569,10 @@ export class MetaService {
         const media = await this.graphGet<MetaInstagramMediaResponse>(
           `${connection.selectedInstagramAccountId}/media`,
           pageToken,
-          { fields: 'id,timestamp,like_count,comments_count', limit: '10' },
+          {
+            fields: 'id,timestamp,like_count,comments_count',
+            limit: String(RECENT_MEDIA_FETCH_LIMIT),
+          },
         );
         recentMedia = {
           observed: true,
@@ -914,6 +922,44 @@ export class MetaService {
     return Number.isFinite(value) && value >= 1000 && value <= 30000
       ? value
       : 10000;
+  }
+
+  /**
+   * RC-19: reads META_LOW_ACTIVITY_WINDOW_DAYS / META_LOW_ACTIVITY_MIN_POSTS
+   * for evaluateMetaFindings()'s META_LOW_RECENT_ACTIVITY heuristic.
+   * Invalid, out-of-range, or unset values fall back to
+   * DEFAULT_META_INSIGHTS_THRESHOLDS rather than throwing — a misconfigured
+   * heuristic threshold must never fail opportunity generation.
+   *
+   * lowActivityMinPosts is clamped to [1, RECENT_MEDIA_FETCH_LIMIT]:
+   * getInsightSignals() only ever reads the 10 most recent Instagram media
+   * items, so a configured minimum above that ceiling could never be
+   * satisfied and would make META_LOW_RECENT_ACTIVITY fire unconditionally
+   * — a misleading, always-on signal rather than a genuine heuristic.
+   */
+  getInsightsThresholds(): MetaInsightsThresholds {
+    const windowDaysRaw = Number(
+      this.config.get<string>('META_LOW_ACTIVITY_WINDOW_DAYS')?.trim(),
+    );
+    const minPostsRaw = Number(
+      this.config.get<string>('META_LOW_ACTIVITY_MIN_POSTS')?.trim(),
+    );
+
+    const lowActivityWindowDays =
+      Number.isFinite(windowDaysRaw) &&
+      windowDaysRaw >= 1 &&
+      windowDaysRaw <= 365
+        ? Math.round(windowDaysRaw)
+        : DEFAULT_META_INSIGHTS_THRESHOLDS.lowActivityWindowDays;
+
+    const lowActivityMinPosts =
+      Number.isFinite(minPostsRaw) &&
+      minPostsRaw >= 1 &&
+      minPostsRaw <= RECENT_MEDIA_FETCH_LIMIT
+        ? Math.round(minPostsRaw)
+        : DEFAULT_META_INSIGHTS_THRESHOLDS.lowActivityMinPosts;
+
+    return { lowActivityWindowDays, lowActivityMinPosts };
   }
 
   private required(name: string) {
