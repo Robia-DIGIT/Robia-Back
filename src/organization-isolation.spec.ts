@@ -6,6 +6,10 @@ import { GoogleSearchConsoleService } from './integrations/google-search-console
 import { OrgScopeGuard } from './common/guards/org-scope.guard';
 import { DocumentsService } from './documents/documents.service';
 import { OpportunitiesService } from './opportunities/opportunities.service';
+import { OpportunityGeneratorService } from './opportunities/opportunity-generator/opportunity-generator.service';
+import { N8nWebhookService } from './integrations/n8n-webhook.service';
+import { MetaService } from './integrations/meta.service';
+import { PrismaService } from './prisma/prisma.service';
 import { ValidationLogsService } from './validation-logs/validation-logs.service';
 import { WebsitesService } from './websites/websites.service';
 
@@ -114,9 +118,10 @@ describe('Organization isolation', () => {
       opportunity: { findFirst: jest.fn().mockResolvedValue(null) },
     };
     const service = new OpportunitiesService(
-      prisma as any,
-      {} as any,
-      {} as any,
+      prisma as unknown as PrismaService,
+      {} as unknown as OpportunityGeneratorService,
+      {} as unknown as N8nWebhookService,
+      {} as unknown as MetaService,
     );
 
     await expect(

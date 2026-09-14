@@ -16,6 +16,11 @@ import {
   timingSafeEqual,
 } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
+import {
+  DEFAULT_META_INSIGHTS_THRESHOLDS,
+  MetaInsightsThresholds,
+  RECENT_MEDIA_FETCH_LIMIT,
+} from './meta-insights';
 
 const STATE_MAX_AGE_MS = 10 * 60 * 1000;
 const DEFAULT_SCOPES = [
@@ -111,6 +116,55 @@ interface MetaGraphErrorResponse {
     type?: string;
     code?: number;
   };
+}
+
+type MetaInsightsUnavailableReason =
+  'not_connected' | 'no_page_selected' | 'temporarily_unavailable';
+
+export interface MetaFacebookAuditSignal {
+  fanCount: number | null;
+  followersCount: number | null;
+  talkingAboutCount: number | null;
+}
+
+export interface MetaInstagramAuditSignal {
+  followersCount: number | null;
+  followsCount: number | null;
+  mediaCount: number | null;
+}
+
+export interface MetaRecentMediaAuditSignal {
+  /** true once Instagram genuinely answered the media query (even with zero results) — false when the read itself failed (permissions/API), never conflated with "no media". */
+  observed: boolean;
+  items: Array<{
+    timestamp: string | null;
+    likeCount: number | null;
+    commentsCount: number | null;
+  }>;
+}
+
+/**
+ * Additive, opportunity-time Meta evidence (RC-19). Same never-throws,
+ * status/unavailableReason contract as SearchConsoleAuditSignals (RC-13):
+ * never influences global_score/seo_score_v2. Closed product boundary:
+ * Meta is outcome/social-presence evidence, read-only, and feeds
+ * OpportunitiesService's Meta-sourced findings (see meta-insights.ts) — it
+ * never touches python-service's scoring pipeline. Any field the Graph API
+ * genuinely did not return stays `null`; it is never coerced to `0`.
+ */
+export interface MetaAuditSignals {
+  status: 'ok' | 'unavailable';
+  source: 'meta';
+  readOnly: true;
+  scoreInfluence: false;
+  connected: boolean;
+  pageSelected: boolean;
+  instagramLinked: boolean;
+  facebook: MetaFacebookAuditSignal | null;
+  instagram: MetaInstagramAuditSignal | null;
+  recentMedia: MetaRecentMediaAuditSignal | null;
+  lastSyncedAt: Date | null;
+  unavailableReason: MetaInsightsUnavailableReason | null;
 }
 
 @Injectable()
@@ -404,6 +458,184 @@ export class MetaService {
     };
   }
 
+  /**
+   * RC-19: genuinely never throws, mirrors
+   * GoogleSearchConsoleService.getSearchConsoleSignalsForAudit (RC-13) —
+   * every I/O step below (Prisma read, token decrypt, each Graph call) is
+   * independently wrapped, so a transient failure anywhere degrades to
+   * `status: 'unavailable'` instead of ever failing opportunity
+   * generation. Unlike Search Console's persisted daily-metric table,
+   * Meta has no background sync yet (RC-18 scope): this performs the same
+   * live, read-only Graph reads as getPerformance(), kept as a separate
+   * method so RC-18's own dashboard path is untouched.
+   */
+  async getInsightSignals(organizationId: string): Promise<MetaAuditSignals> {
+    let connection: {
+      selectedPageId: string | null;
+      encryptedPageAccessToken: string | null;
+      selectedInstagramAccountId: string | null;
+      lastSyncedAt: Date | null;
+    } | null;
+    try {
+      connection = await this.prisma.metaConnection.findUnique({
+        where: { organizationId },
+        select: {
+          selectedPageId: true,
+          encryptedPageAccessToken: true,
+          selectedInstagramAccountId: true,
+          lastSyncedAt: true,
+        },
+      });
+    } catch {
+      this.logger.warn('Meta : lecture de la connexion indisponible');
+      return this.unavailableInsightSignals('temporarily_unavailable', {
+        connected: false,
+        pageSelected: false,
+        lastSyncedAt: null,
+      });
+    }
+
+    if (!connection) {
+      return this.unavailableInsightSignals('not_connected', {
+        connected: false,
+        pageSelected: false,
+        lastSyncedAt: null,
+      });
+    }
+
+    if (!connection.selectedPageId || !connection.encryptedPageAccessToken) {
+      return this.unavailableInsightSignals('no_page_selected', {
+        connected: true,
+        pageSelected: false,
+        lastSyncedAt: connection.lastSyncedAt,
+      });
+    }
+
+    const instagramLinked = Boolean(connection.selectedInstagramAccountId);
+
+    let pageToken: string;
+    try {
+      pageToken = this.decrypt(connection.encryptedPageAccessToken);
+    } catch {
+      this.logger.warn('Meta : jeton de Page indisponible');
+      return this.unavailableInsightSignals('temporarily_unavailable', {
+        connected: true,
+        pageSelected: true,
+        instagramLinked,
+        lastSyncedAt: connection.lastSyncedAt,
+      });
+    }
+
+    let page: MetaPageProfile;
+    try {
+      page = await this.graphGet<MetaPageProfile>(
+        connection.selectedPageId,
+        pageToken,
+        { fields: 'id,name,fan_count,followers_count,talking_about_count' },
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Meta : lecture du profil Page indisponible pour organization=${organizationId}: ${error instanceof Error ? error.message : 'erreur inconnue'}`,
+      );
+      return this.unavailableInsightSignals('temporarily_unavailable', {
+        connected: true,
+        pageSelected: true,
+        instagramLinked,
+        lastSyncedAt: connection.lastSyncedAt,
+      });
+    }
+
+    let instagram: MetaInstagramAuditSignal | null = null;
+    let recentMedia: MetaRecentMediaAuditSignal | null = null;
+    if (instagramLinked && connection.selectedInstagramAccountId) {
+      try {
+        const igProfile = await this.graphGet<MetaInstagramProfile>(
+          connection.selectedInstagramAccountId,
+          pageToken,
+          { fields: 'id,username,followers_count,follows_count,media_count' },
+        );
+        instagram = {
+          followersCount: igProfile.followers_count ?? null,
+          followsCount: igProfile.follows_count ?? null,
+          mediaCount: igProfile.media_count ?? null,
+        };
+      } catch (error) {
+        this.logger.warn(
+          `Meta : lecture du profil Instagram indisponible pour organization=${organizationId}: ${error instanceof Error ? error.message : 'erreur inconnue'}`,
+        );
+      }
+
+      try {
+        const media = await this.graphGet<MetaInstagramMediaResponse>(
+          `${connection.selectedInstagramAccountId}/media`,
+          pageToken,
+          {
+            fields: 'id,timestamp,like_count,comments_count',
+            limit: String(RECENT_MEDIA_FETCH_LIMIT),
+          },
+        );
+        recentMedia = {
+          observed: true,
+          items: (media.data ?? []).map((item) => ({
+            timestamp: item.timestamp ?? null,
+            likeCount: item.like_count ?? null,
+            commentsCount: item.comments_count ?? null,
+          })),
+        };
+      } catch (error) {
+        this.logger.warn(
+          `Meta : lecture des médias récents indisponible pour organization=${organizationId}: ${error instanceof Error ? error.message : 'erreur inconnue'}`,
+        );
+        // Explicitly "read failed", never conflated with a genuine empty list.
+        recentMedia = { observed: false, items: [] };
+      }
+    }
+
+    return {
+      status: 'ok',
+      source: 'meta',
+      readOnly: true,
+      scoreInfluence: false,
+      connected: true,
+      pageSelected: true,
+      instagramLinked,
+      facebook: {
+        fanCount: page.fan_count ?? null,
+        followersCount: page.followers_count ?? null,
+        talkingAboutCount: page.talking_about_count ?? null,
+      },
+      instagram,
+      recentMedia,
+      lastSyncedAt: connection.lastSyncedAt,
+      unavailableReason: null,
+    };
+  }
+
+  private unavailableInsightSignals(
+    reason: MetaInsightsUnavailableReason,
+    state: {
+      connected: boolean;
+      pageSelected: boolean;
+      instagramLinked?: boolean;
+      lastSyncedAt: Date | null;
+    },
+  ): MetaAuditSignals {
+    return {
+      status: 'unavailable',
+      source: 'meta',
+      readOnly: true,
+      scoreInfluence: false,
+      connected: state.connected,
+      pageSelected: state.pageSelected,
+      instagramLinked: state.instagramLinked ?? false,
+      facebook: null,
+      instagram: null,
+      recentMedia: null,
+      lastSyncedAt: state.lastSyncedAt,
+      unavailableReason: reason,
+    };
+  }
+
   async disconnect(organizationId: string) {
     await this.prisma.metaConnection.deleteMany({ where: { organizationId } });
     return { disconnected: true };
@@ -690,6 +922,44 @@ export class MetaService {
     return Number.isFinite(value) && value >= 1000 && value <= 30000
       ? value
       : 10000;
+  }
+
+  /**
+   * RC-19: reads META_LOW_ACTIVITY_WINDOW_DAYS / META_LOW_ACTIVITY_MIN_POSTS
+   * for evaluateMetaFindings()'s META_LOW_RECENT_ACTIVITY heuristic.
+   * Invalid, out-of-range, or unset values fall back to
+   * DEFAULT_META_INSIGHTS_THRESHOLDS rather than throwing — a misconfigured
+   * heuristic threshold must never fail opportunity generation.
+   *
+   * lowActivityMinPosts is clamped to [1, RECENT_MEDIA_FETCH_LIMIT]:
+   * getInsightSignals() only ever reads the 10 most recent Instagram media
+   * items, so a configured minimum above that ceiling could never be
+   * satisfied and would make META_LOW_RECENT_ACTIVITY fire unconditionally
+   * — a misleading, always-on signal rather than a genuine heuristic.
+   */
+  getInsightsThresholds(): MetaInsightsThresholds {
+    const windowDaysRaw = Number(
+      this.config.get<string>('META_LOW_ACTIVITY_WINDOW_DAYS')?.trim(),
+    );
+    const minPostsRaw = Number(
+      this.config.get<string>('META_LOW_ACTIVITY_MIN_POSTS')?.trim(),
+    );
+
+    const lowActivityWindowDays =
+      Number.isFinite(windowDaysRaw) &&
+      windowDaysRaw >= 1 &&
+      windowDaysRaw <= 365
+        ? Math.round(windowDaysRaw)
+        : DEFAULT_META_INSIGHTS_THRESHOLDS.lowActivityWindowDays;
+
+    const lowActivityMinPosts =
+      Number.isFinite(minPostsRaw) &&
+      minPostsRaw >= 1 &&
+      minPostsRaw <= RECENT_MEDIA_FETCH_LIMIT
+        ? Math.round(minPostsRaw)
+        : DEFAULT_META_INSIGHTS_THRESHOLDS.lowActivityMinPosts;
+
+    return { lowActivityWindowDays, lowActivityMinPosts };
   }
 
   private required(name: string) {
