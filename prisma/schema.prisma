@@ -63,6 +63,7 @@ model Organization {
   actionExecutionEvents ActionExecutionEvent[]
   locations Location[] 
   googleSearchConsoleConnection GoogleSearchConsoleConnection?
+  metaConnection MetaConnection?
   stripeSubscription StripeSubscription?
   createdAt DateTime @default(now()) @map("created_at")
 
@@ -122,6 +123,27 @@ model GoogleSearchConsoleDailyMetric {
   @@unique([connectionId, date])
   @@index([connectionId, date])
   @@map("google_search_console_daily_metrics")
+}
+
+model MetaConnection {
+  id                         String   @id @default(cuid())
+  organizationId             String   @unique @map("organization_id")
+  organization               Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  metaUserId                 String?  @map("meta_user_id")
+  metaUserName               String?  @map("meta_user_name")
+  encryptedUserAccessToken   String   @map("encrypted_user_access_token")
+  grantedScopes              String?  @map("granted_scopes")
+  selectedPageId             String?  @map("selected_page_id")
+  selectedPageName           String?  @map("selected_page_name")
+  encryptedPageAccessToken   String?  @map("encrypted_page_access_token")
+  selectedInstagramAccountId String?  @map("selected_instagram_account_id")
+  selectedInstagramUsername  String?  @map("selected_instagram_username")
+  connectedAt                DateTime @default(now()) @map("connected_at")
+  lastSyncedAt               DateTime? @map("last_synced_at")
+  createdAt                  DateTime @default(now()) @map("created_at")
+  updatedAt                  DateTime @updatedAt @map("updated_at")
+
+  @@map("meta_connections")
 }
 
 model Website {
