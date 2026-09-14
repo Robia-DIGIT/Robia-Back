@@ -9,6 +9,7 @@ import { DocumentGeneratorService } from './documents/document-generator/documen
 import { DocumentsService } from './documents/documents.service';
 import { GenerateDocumentDto } from './documents/dto/generate-document.dto';
 import { GoogleSearchConsoleService } from './integrations/google-search-console.service';
+import { MetaService } from './integrations/meta.service';
 import { N8nWebhookService } from './integrations/n8n-webhook.service';
 import { LocationPlacesService } from './locations/location-places/location-places.service';
 import { LocationWeatherService } from './locations/location-weather/location-weather.service';
@@ -174,10 +175,12 @@ describe('Multi-tenant isolation (RC-16)', () => {
       const prisma = {
         opportunity: { findMany: jest.fn().mockResolvedValue([]) },
       };
+      const meta = { getInsightSignals: jest.fn() };
       const service = new OpportunitiesService(
         prisma as unknown as PrismaService,
         {} as unknown as OpportunityGeneratorService,
         {} as unknown as N8nWebhookService,
+        meta as unknown as MetaService,
       );
 
       const result = await service.findAllForAudit(orgA, 'audit-org-b');
@@ -188,6 +191,7 @@ describe('Multi-tenant isolation (RC-16)', () => {
           where: { organizationId: orgA, auditId: 'audit-org-b' },
         }),
       );
+      expect(meta.getInsightSignals).not.toHaveBeenCalled();
     });
 
     it('does not generate opportunities from an audit owned by another organization', async () => {
@@ -196,10 +200,12 @@ describe('Multi-tenant isolation (RC-16)', () => {
         opportunity: { count: jest.fn(), create: jest.fn() },
       };
       const generator = { generate: jest.fn(), generateForSite: jest.fn() };
+      const meta = { getInsightSignals: jest.fn() };
       const service = new OpportunitiesService(
         prisma as unknown as PrismaService,
         generator as unknown as OpportunityGeneratorService,
         {} as unknown as N8nWebhookService,
+        meta as unknown as MetaService,
       );
 
       await expect(
@@ -208,6 +214,7 @@ describe('Multi-tenant isolation (RC-16)', () => {
       expect(prisma.opportunity.count).not.toHaveBeenCalled();
       expect(generator.generate).not.toHaveBeenCalled();
       expect(generator.generateForSite).not.toHaveBeenCalled();
+      expect(meta.getInsightSignals).not.toHaveBeenCalled();
     });
 
     it('does not change the status of an opportunity owned by another organization', async () => {
@@ -217,16 +224,19 @@ describe('Multi-tenant isolation (RC-16)', () => {
           update: jest.fn(),
         },
       };
+      const meta = { getInsightSignals: jest.fn() };
       const service = new OpportunitiesService(
         prisma as unknown as PrismaService,
         {} as unknown as OpportunityGeneratorService,
         {} as unknown as N8nWebhookService,
+        meta as unknown as MetaService,
       );
 
       await expect(
         service.updateStatus(orgA, 'opportunity-org-b', 'done'),
       ).rejects.toBeInstanceOf(NotFoundException);
       expect(prisma.opportunity.update).not.toHaveBeenCalled();
+      expect(meta.getInsightSignals).not.toHaveBeenCalled();
     });
   });
 

@@ -117,6 +117,7 @@ describe('Organization isolation', () => {
       prisma as any,
       {} as any,
       {} as any,
+      {} as any,
     );
 
     await expect(

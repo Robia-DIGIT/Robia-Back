@@ -6,6 +6,12 @@ import {
 } from './opportunity-generator/opportunity-generator.service';
 import { N8nWebhookService } from '../integrations/n8n-webhook.service';
 import { SiteAuditResult } from '../audits/audit-runner/audit-runner.service';
+import { MetaService } from '../integrations/meta.service';
+import {
+  evaluateMetaFindings,
+  MetaFinding,
+} from '../integrations/meta-insights';
+import { Prisma } from '@prisma/client';
 
 // audit.resultJson is untrusted, raw persisted JSON (see AuditsService) — this
 // only asserts the shape RC-10's evidence-based pipeline actually writes into
@@ -25,7 +31,53 @@ export class OpportunitiesService {
     private readonly prisma: PrismaService,
     private readonly generator: OpportunityGeneratorService,
     private readonly webhooks: N8nWebhookService,
+    private readonly meta: MetaService,
   ) {}
+
+  // RC-19: source_data shape for a Meta-originated opportunity. Deliberately
+  // separate from buildSourceData()'s SEO-oriented shape (rule_code/severity/
+  // priority_score/affected_urls) rather than overloading it — Meta findings
+  // have a different evidence model and must always self-identify as
+  // `source: 'meta'` / `scoreInfluence: false` so nothing downstream can
+  // mistake them for score-influencing SEO findings.
+  private buildMetaSourceData(finding: MetaFinding) {
+    return {
+      version: 1,
+      source: finding.source,
+      ruleCode: finding.ruleCode,
+      confidence: finding.confidence,
+      evidence: finding.evidence,
+      recommendation: finding.recommendation,
+      scoreInfluence: finding.scoreInfluence,
+    } as unknown as Prisma.InputJsonValue;
+  }
+
+  // RC-19: MetaService.getInsightSignals() never throws (mirrors
+  // GoogleSearchConsoleService's RC-13 guarantee) and evaluateMetaFindings()
+  // is a pure, exception-free function — so, like AuditsService's GSC
+  // attachment, this call is intentionally not wrapped in an extra
+  // try/catch here: opportunity generation must never fail because a Meta
+  // side-signal read hiccuped.
+  private async generateMetaOpportunities(
+    organizationId: string,
+    auditId: string,
+  ) {
+    const signals = await this.meta.getInsightSignals(organizationId);
+    const findings = evaluateMetaFindings(signals);
+
+    return findings.map((finding) => ({
+      organizationId,
+      auditId,
+      title: finding.title,
+      description: finding.description,
+      category: finding.category,
+      impactScore: finding.impactScore,
+      effortScore: finding.effortScore,
+      confidenceScore: finding.confidenceScore,
+      sourceData: this.buildMetaSourceData(finding),
+      status: 'open' as const,
+    }));
+  }
 
   private buildSourceData(opportunity: GeneratedOpportunity) {
     if (!opportunity.rule_code) {
@@ -90,8 +142,16 @@ export class OpportunitiesService {
         })
       : await this.generator.generate(auditResult, organization?.city);
 
-    const opportunities = await this.prisma.$transaction(
-      generated.map((opp) =>
+    // RC-19: additive only — Meta findings never replace or reorder the SEO
+    // opportunities above; they are read-only, social-presence evidence
+    // (scoreInfluence: false) attached to the same completed audit.
+    const metaOpportunities = await this.generateMetaOpportunities(
+      organizationId,
+      audit.id,
+    );
+
+    const opportunities = await this.prisma.$transaction([
+      ...generated.map((opp) =>
         this.prisma.opportunity.create({
           data: {
             organizationId,
@@ -107,7 +167,10 @@ export class OpportunitiesService {
           },
         }),
       ),
-    );
+      ...metaOpportunities.map((data) =>
+        this.prisma.opportunity.create({ data }),
+      ),
+    ]);
 
     const scoreCandidate = audit.globalScore ?? auditResult?.global_score;
     const score = Number(scoreCandidate);
@@ -156,8 +219,14 @@ export class OpportunitiesService {
       country: organization?.country,
     });
 
-    return this.prisma.$transaction(
-      generated.map((opp) =>
+    // RC-19: additive only, same as generateFromAudit() above.
+    const metaOpportunities = await this.generateMetaOpportunities(
+      organizationId,
+      audit.id,
+    );
+
+    return this.prisma.$transaction([
+      ...generated.map((opp) =>
         this.prisma.opportunity.create({
           data: {
             organizationId,
@@ -173,7 +242,10 @@ export class OpportunitiesService {
           },
         }),
       ),
-    );
+      ...metaOpportunities.map((data) =>
+        this.prisma.opportunity.create({ data }),
+      ),
+    ]);
   }
 
   async findAllForAudit(organizationId: string, auditId: string) {
