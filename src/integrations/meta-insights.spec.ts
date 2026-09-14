@@ -213,7 +213,11 @@ describe('evaluateMetaFindings', () => {
     );
   });
 
-  it('ignores a post with an unparseable timestamp rather than assuming it is recent', () => {
+  it('never fires META_LOW_RECENT_ACTIVITY when an unparseable-timestamp post could itself satisfy the threshold (Codex review)', () => {
+    // Unknown is not proof of "old": an unparseable timestamp does not
+    // establish that the post falls outside the window. Firing here would
+    // assert an absence ("low activity") that was never actually observed —
+    // exactly the "absence != 0" rule RC-19 is built on.
     const now = new Date('2026-09-14T00:00:00.000Z');
     const signals = baseSignals({
       recentMedia: {
@@ -224,7 +228,79 @@ describe('evaluateMetaFindings', () => {
 
     const findings = evaluateMetaFindings(
       signals,
+      DEFAULT_META_INSIGHTS_THRESHOLDS, // lowActivityMinPosts: 1
+      now,
+    );
+
+    expect(findings.map((f) => f.ruleCode)).not.toContain(
+      'META_LOW_RECENT_ACTIVITY',
+    );
+  });
+
+  it('never fires META_LOW_RECENT_ACTIVITY when a null-timestamp post could itself satisfy the threshold (Codex review)', () => {
+    const now = new Date('2026-09-14T00:00:00.000Z');
+    const signals = baseSignals({
+      recentMedia: {
+        observed: true,
+        items: [{ timestamp: null, likeCount: 5, commentsCount: 2 }],
+      },
+    });
+
+    const findings = evaluateMetaFindings(
+      signals,
       DEFAULT_META_INSIGHTS_THRESHOLDS,
+      now,
+    );
+
+    expect(findings.map((f) => f.ruleCode)).not.toContain(
+      'META_LOW_RECENT_ACTIVITY',
+    );
+  });
+
+  it('never fires META_LOW_RECENT_ACTIVITY on a mix of a confirmed-old post and an unknown-timestamp post that alone could meet the threshold (Codex review)', () => {
+    const now = new Date('2026-09-14T00:00:00.000Z');
+    const signals = baseSignals({
+      recentMedia: {
+        observed: true,
+        items: [
+          // Confirmed old: 60 days back, outside the default 30-day window.
+          {
+            timestamp: '2026-07-16T00:00:00.000Z',
+            likeCount: 1,
+            commentsCount: 0,
+          },
+          // Unknown — could be recent, could be old. Best case: recent.
+          { timestamp: 'not-a-date', likeCount: 2, commentsCount: 1 },
+        ],
+      },
+    });
+
+    const findings = evaluateMetaFindings(
+      signals,
+      DEFAULT_META_INSIGHTS_THRESHOLDS, // lowActivityMinPosts: 1
+      now,
+    );
+
+    expect(findings.map((f) => f.ruleCode)).not.toContain(
+      'META_LOW_RECENT_ACTIVITY',
+    );
+  });
+
+  it('still fires META_LOW_RECENT_ACTIVITY when even the most generous reading of unknown timestamps stays below the threshold (Codex review)', () => {
+    const now = new Date('2026-09-14T00:00:00.000Z');
+    const signals = baseSignals({
+      recentMedia: {
+        observed: true,
+        // A single unknown-timestamp post can satisfy at most 1 — with a
+        // threshold of 5, that best case is still short, so the absence is
+        // genuinely provable even accounting for the uncertainty.
+        items: [{ timestamp: 'not-a-date', likeCount: 1, commentsCount: 0 }],
+      },
+    });
+
+    const findings = evaluateMetaFindings(
+      signals,
+      { lowActivityWindowDays: 30, lowActivityMinPosts: 5 },
       now,
     );
 

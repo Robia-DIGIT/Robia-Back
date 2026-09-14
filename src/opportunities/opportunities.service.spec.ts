@@ -524,5 +524,51 @@ describe('OpportunitiesService', () => {
         },
       });
     });
+
+    it('keeps a Meta opportunity visible in the listing even when 5 higher-impact SEO opportunities already fill the top-5 cap (Codex review)', async () => {
+      // findAllForAudit() previously did one `orderBy: impactScore desc,
+      // take: 5` over SEO + Meta combined — a full slate of higher-impact
+      // SEO opportunities could silently evict every Meta one, which would
+      // still exist in the database (created by
+      // syncMissingMetaOpportunities()) but never show up here, and
+      // disappear again on reload.
+      const seoOpportunities = Array.from({ length: 5 }, (_, index) => ({
+        id: `seo-${index}`,
+        organizationId,
+        auditId,
+        title: `Opportunité SEO ${index}`,
+        impactScore: 9,
+        sourceData: { ruleCode: `content.rule_${index}` },
+      }));
+      const metaOpportunity = {
+        id: 'meta-1',
+        organizationId,
+        auditId,
+        title: 'Aucun compte Instagram professionnel lié',
+        impactScore: 3,
+        sourceData: { source: 'meta', ruleCode: 'META_INSTAGRAM_NOT_LINKED' },
+      };
+      prisma.opportunity.findMany.mockResolvedValue([
+        ...seoOpportunities,
+        metaOpportunity,
+      ]);
+
+      const result = asTestOpportunities(
+        await service.findAllForAudit(organizationId, auditId),
+      );
+
+      // SEO keeps its own top-5 cap, unchanged...
+      expect(
+        result.filter((opp) => opp.sourceData?.source !== 'meta'),
+      ).toHaveLength(5);
+      // ...but the lower-impact Meta opportunity is never evicted by it.
+      expect(
+        result.some(
+          (opp) =>
+            opp.sourceData?.source === 'meta' &&
+            opp.sourceData?.ruleCode === 'META_INSTAGRAM_NOT_LINKED',
+        ),
+      ).toBe(true);
+    });
   });
 });

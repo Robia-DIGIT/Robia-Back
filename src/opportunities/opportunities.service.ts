@@ -84,6 +84,20 @@ export class OpportunitiesService {
     };
   }
 
+  // RC-19: reads sourceData defensively (it is untrusted, persisted JSON —
+  // same caveat as AuditsService.resultJson) to tell a Meta-sourced
+  // opportunity apart from an SEO one, without relying on Prisma's Json
+  // path-filtering (unused elsewhere in this codebase).
+  private isMetaSourceData(
+    sourceData: unknown,
+  ): sourceData is { source: 'meta'; ruleCode?: unknown } {
+    return (
+      !!sourceData &&
+      typeof sourceData === 'object' &&
+      (sourceData as { source?: unknown }).source === 'meta'
+    );
+  }
+
   // RC-19: identifies which Meta rules already have an opportunity recorded
   // for this audit, keyed by ruleCode — the stable identity a Meta finding
   // carries across re-evaluations (see buildMetaSourceData). Used so a
@@ -96,16 +110,8 @@ export class OpportunitiesService {
     });
     const ruleCodes = new Set<string>();
     for (const opportunity of existing) {
-      const data = opportunity.sourceData as {
-        source?: unknown;
-        ruleCode?: unknown;
-      } | null;
-      if (
-        data &&
-        typeof data === 'object' &&
-        data.source === 'meta' &&
-        typeof data.ruleCode === 'string'
-      ) {
+      const data = opportunity.sourceData;
+      if (this.isMetaSourceData(data) && typeof data.ruleCode === 'string') {
         ruleCodes.add(data.ruleCode);
       }
     }
@@ -320,12 +326,26 @@ export class OpportunitiesService {
     ]);
   }
 
+  // RC-19 (Codex review): a plain `take: 5` over SEO + Meta combined let a
+  // full slate of SEO opportunities silently evict every Meta one from the
+  // listing — Meta could be created in the database by
+  // syncMissingMetaOpportunities() yet never appear here, and disappear
+  // again after a reload. The listing must stay source-aware: keep SEO's
+  // own top-5 cap unchanged, and always surface every Meta opportunity for
+  // this audit alongside it (Meta findings are capped at 5 rules total by
+  // evaluateMetaFindings(), so this can never grow unbounded).
   async findAllForAudit(organizationId: string, auditId: string) {
-    return this.prisma.opportunity.findMany({
+    const opportunities = await this.prisma.opportunity.findMany({
       where: { organizationId, auditId },
       orderBy: { impactScore: 'desc' },
-      take: 5,
     });
+    const seoOpportunities = opportunities.filter(
+      (opportunity) => !this.isMetaSourceData(opportunity.sourceData),
+    );
+    const metaOpportunities = opportunities.filter((opportunity) =>
+      this.isMetaSourceData(opportunity.sourceData),
+    );
+    return [...seoOpportunities.slice(0, 5), ...metaOpportunities];
   }
 
   async findOne(organizationId: string, opportunityId: string) {

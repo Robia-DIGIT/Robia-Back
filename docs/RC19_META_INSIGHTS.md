@@ -59,6 +59,24 @@ vide). Couvert par tests dédiés dans `opportunities.service.spec.ts` :
 ajout d'une Meta manquante sur un audit déjà généré, et absence totale
 d'écriture quand tout est déjà présent (ré-exécution idempotente).
 
+### Le listing reste source-aware (Codex review)
+
+Une Meta peut désormais être créée en base sur un audit qui a déjà 5
+opportunités SEO ou plus (via `syncMissingMetaOpportunities()`
+ci-dessus) — mais `findAllForAudit()` faisait un simple
+`orderBy: impactScore desc, take: 5` sur SEO **et** Meta confondues :
+avec 5 opportunités SEO à impact plus élevé déjà présentes, la Meta
+nouvellement créée pouvait être exclue du résultat retourné, bien que
+présente en base, et donc réapparaître comme « invisible » après
+rechargement. `findAllForAudit()` sépare maintenant les deux ensembles :
+le top 5 SEO garde son classement et son plafond inchangés, et **toutes**
+les opportunités Meta de l'audit (au plus 5, une par règle) sont
+toujours ajoutées au résultat, sans jamais évincer le SEO ni être
+évincées par lui. Couvert par un test dédié
+(`opportunities.service.spec.ts`, « Codex review ») : 5 opportunités SEO
+à impact 9 + 1 opportunité Meta à impact 3, la Meta reste présente dans
+le résultat.
+
 ## Les 5 règles
 
 Chaque règle ne se déclenche que lorsque l'absence est réellement
@@ -107,6 +125,24 @@ absence fabriquée.
   configuration valide, clampage au-delà de 10, configuration invalide.
 - Présentée à l'utilisateur comme un seuil configurable, pas comme une
   vérité business — voir `confidence: 'heuristic'` dans le finding.
+
+### Horodatage inconnu ≠ publication ancienne (Codex review)
+
+`countPostsWithinWindow()` distingue deux quantités : le nombre de
+publications **confirmées récentes** (horodatage présent, valide, dans la
+fenêtre) et le nombre de publications à **horodatage inexploitable**
+(absent ou invalide). Un horodatage inexploitable ne prouve pas que la
+publication est ancienne — ce n'est qu'une absence de preuve, jamais une
+preuve d'absence. `META_LOW_RECENT_ACTIVITY` ne se déclenche donc que si,
+même en supposant que **toutes** les publications à horodatage
+inexploitable sont en réalité récentes (l'hypothèse la plus favorable),
+le total reste sous `lowActivityMinPosts`. Si les publications inconnues
+pourraient à elles seules atteindre le seuil, la règle ne se déclenche
+pas — l'absence ne serait pas réellement établie. Couvert par des tests
+dédiés (`meta-insights.spec.ts`) : horodatage `null` seul, horodatage
+invalide seul, mélange horodatage confirmé-ancien + inconnu, et le cas où
+la règle se déclenche malgré une incertitude (le pire des cas ne suffit
+toujours pas à atteindre un seuil élevé).
 
 ### `META_NO_RECENT_MEDIA` vs. échec de lecture
 
@@ -192,6 +228,18 @@ revue :
 5. `META_PROFILE_DATA_INCOMPLETE` reformulée pour ne plus affirmer un
    défaut de profil à partir d'une simple absence de deux compteurs (voir
    section dédiée ci-dessus).
+
+## Revue Codex — second passage
+
+Deux points bloquants supplémentaires, corrigés avant re-soumission :
+
+6. `META_LOW_RECENT_ACTIVITY` ne se déclenche plus sur la seule base
+   d'horodatages inconnus qui pourraient, dans le pire des cas, suffire à
+   atteindre le seuil configuré — voir « Horodatage inconnu ≠ publication
+   ancienne » ci-dessus.
+7. `findAllForAudit()` ne peut plus faire disparaître une opportunité
+   Meta déjà créée en base derrière 5 opportunités SEO à impact plus
+   élevé — voir « Le listing reste source-aware » ci-dessus.
 
 ## Ce qui n'est pas fait dans RC19
 

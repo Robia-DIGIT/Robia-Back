@@ -75,17 +75,32 @@ export interface MetaFinding {
   recommendation: string;
 }
 
+interface WindowPostCounts {
+  /** Items whose timestamp is present, parseable, and inside the window. */
+  knownRecentCount: number;
+  /** Items whose timestamp is missing or unparseable — genuinely unknown, not "old". */
+  unknownTimestampCount: number;
+}
+
 function countPostsWithinWindow(
   items: Array<{ timestamp: string | null }>,
   windowDays: number,
   now: Date,
-): number {
+): WindowPostCounts {
   const cutoff = now.getTime() - windowDays * 24 * 60 * 60 * 1000;
-  return items.filter((item) => {
-    if (!item.timestamp) return false;
-    const parsed = Date.parse(item.timestamp);
-    return Number.isFinite(parsed) && parsed >= cutoff;
-  }).length;
+  let knownRecentCount = 0;
+  let unknownTimestampCount = 0;
+  for (const item of items) {
+    const parsed = item.timestamp ? Date.parse(item.timestamp) : NaN;
+    if (!Number.isFinite(parsed)) {
+      // Absence of a usable timestamp is not proof the post is old — it is
+      // simply unknown, and RC-19 never treats "unknown" as "0"/"absent".
+      unknownTimestampCount += 1;
+    } else if (parsed >= cutoff) {
+      knownRecentCount += 1;
+    }
+  }
+  return { knownRecentCount, unknownTimestampCount };
 }
 
 export function evaluateMetaFindings(
@@ -194,12 +209,20 @@ export function evaluateMetaFindings(
       signals.recentMedia.observed &&
       signals.recentMedia.items.length > 0
     ) {
-      const recentCount = countPostsWithinWindow(
-        signals.recentMedia.items,
-        thresholds.lowActivityWindowDays,
-        now,
-      );
-      if (recentCount < thresholds.lowActivityMinPosts) {
+      const { knownRecentCount, unknownTimestampCount } =
+        countPostsWithinWindow(
+          signals.recentMedia.items,
+          thresholds.lowActivityWindowDays,
+          now,
+        );
+      // Conservative by construction (Codex review): an unknown timestamp is
+      // not proof a post is old, so it must count in the *best case* for
+      // "recent" — only claim low activity when even that best case (every
+      // unknown-timestamp post counted as recent) still falls short of the
+      // threshold. Otherwise the unknown posts could themselves satisfy it,
+      // and firing would assert an absence that was never actually observed.
+      const maxPossibleRecentCount = knownRecentCount + unknownTimestampCount;
+      if (maxPossibleRecentCount < thresholds.lowActivityMinPosts) {
         findings.push({
           source: 'meta',
           ruleCode: 'META_LOW_RECENT_ACTIVITY',
@@ -215,7 +238,10 @@ export function evaluateMetaFindings(
           scoreInfluence: false,
           evidence: [
             {
-              observed: `${recentCount} publication(s) Instagram sur les ${thresholds.lowActivityWindowDays} derniers jours`,
+              observed:
+                unknownTimestampCount > 0
+                  ? `${knownRecentCount} publication(s) Instagram confirmée(s) sur les ${thresholds.lowActivityWindowDays} derniers jours (+ ${unknownTimestampCount} publication(s) à horodatage inexploitable, exclue(s) du calcul)`
+                  : `${knownRecentCount} publication(s) Instagram sur les ${thresholds.lowActivityWindowDays} derniers jours`,
               expected: `Au moins ${thresholds.lowActivityMinPosts} publication(s) sur ${thresholds.lowActivityWindowDays} jours (seuil heuristique configurable, pas une vérité métier)`,
             },
           ],
