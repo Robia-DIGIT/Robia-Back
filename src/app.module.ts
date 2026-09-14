@@ -21,6 +21,7 @@ import { LocationsModule } from './locations/locations.module';
 import { IntegrationsModule } from './integrations/integrations.module';
 import { ProspectsModule } from './prospects/prospects.module';
 import { BillingModule } from './billing/billing.module';
+import { OpsAutomationModule } from './ops-automation/ops-automation.module';
 
 @Module({
   imports: [
@@ -46,6 +47,7 @@ import { BillingModule } from './billing/billing.module';
     LocationsModule,
     ProspectsModule,
     BillingModule,
+    OpsAutomationModule,
   ],
   controllers: [AppController],
   providers: [
