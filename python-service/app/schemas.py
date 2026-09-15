@@ -80,6 +80,8 @@ class PageDetail(BaseModel):
     business_latitude: Optional[float] = None
     business_longitude: Optional[float] = None
     social_links: Dict[str, str] = {}
+    viewport_present: bool = False
+    html_lang: Optional[str] = None
     js_rendering_used: bool = False
     js_rendering_suspected: bool = False
     main_content: Optional[str] = None
@@ -107,6 +109,51 @@ class DetailedFinding(BaseModel):
     source_data: str
     why_it_matters: str
     recommended_steps: list[str] = Field(default_factory=list)
+
+
+class PageSpeedMetrics(BaseModel):
+    # Deliberately camelCase: this mirrors the cross-service PSI
+    # contract field names (RC-10/RC-11), not this file's usual
+    # snake_case convention.
+    lcpMs: Optional[float] = None
+    cls: Optional[float] = None
+    tbtMs: Optional[float] = None  # lab proxy for interactivity, not a Core Web Vital
+    fcpMs: Optional[float] = None
+
+
+class PageSpeedInsightsResult(BaseModel):
+    """Structured PageSpeed Insights contract exposed on SiteAuditResult
+    for RC-11 to consume directly, without re-deriving values from the
+    "performance" finding's evidence text. Never influences the audit's
+    overall SEO score."""
+
+    status: str  # "ok" | "unavailable"
+    strategy: str
+    performanceScore: Optional[int] = None
+    metrics: PageSpeedMetrics
+    fetchedAt: str
+    analyzedUrl: str
+    finalUrl: Optional[str] = None
+    source: str
+    unavailableReason: Optional[str] = None
+
+
+class SeoCategoryScoreV2(BaseModel):
+    score: Optional[int] = None
+    weight: Optional[float] = None
+    measured: bool
+    findingsEvaluated: int
+
+
+class SeoScoreV2(BaseModel):
+    """Explainable, weighted SEO score (RC-12). Additive: does not
+    replace SiteAuditResult's legacy scoring (there isn't one on this
+    v2 payload) nor AuditResult.global_score (the older single-page
+    path, untouched). See app.agents.scoring for the formula."""
+
+    version: str
+    globalScore: Optional[int] = None
+    categories: dict[str, SeoCategoryScoreV2]
 
 
 class SiteAuditResult(BaseModel):
@@ -139,6 +186,8 @@ class SiteAuditResult(BaseModel):
 
     findings: list[str]
     detailed_findings: list[DetailedFinding] = Field(default_factory=list)
+    pagespeed_insights: Optional[PageSpeedInsightsResult] = None
+    seo_score_v2: Optional[SeoScoreV2] = None
     pages: list[PageDetail]
     failed_urls: list[str] = []
 

@@ -4,6 +4,8 @@ from app.agents.prioritization import generate_opportunities, generate_site_oppo
 from app.agents.action_generation import generate_actions
 from app.agents.generation import generate_document_content, generate_social_post_suggestions
 from app.agents.audit_rules import evaluate_site_audit
+from app.agents.scoring import compute_seo_score_v2
+from app.integrations.pagespeed import fetch_pagespeed_insights
 
 
 def run_audit(url: str, sector: str | None = None, city: str | None = None, country: str | None = None) -> dict:
@@ -91,6 +93,8 @@ def run_site_audit(url: str, max_pages: int = 20, max_depth: int = 2, city: str 
             "business_latitude": p.business_latitude,
             "business_longitude": p.business_longitude,
             "social_links": p.social_links,
+            "viewport_present": p.viewport_present,
+            "html_lang": p.html_lang,
             "js_rendering_used": p.js_rendering_used,
             "js_rendering_suspected": p.js_rendering_suspected,
             "main_content": p.main_content,
@@ -126,7 +130,18 @@ def run_site_audit(url: str, max_pages: int = 20, max_depth: int = 2, city: str 
         "pages": pages_detail,
         "failed_urls": site.failed_urls,
     }
-
+    psi_result = fetch_pagespeed_insights(result["base_url"])
+    result["pagespeed_insights"] = psi_result
+    result["detailed_findings"] = evaluate_site_audit(
+        result, city, country, psi_result=psi_result
+    )
+    # Additive only (RC-12): exposed alongside the legacy score, does not
+    # replace resultJson.global_score / Audit.globalScore. Closed product
+    # decision (Romeo/Landry): no historical recompute — existing audits
+    # keep their legacy score exactly as stored; new audits get both
+    # legacy and v2, additively, until a final display-migration decision
+    # is made separately.
+    result["seo_score_v2"] = compute_seo_score_v2(result["detailed_findings"])
     return result
 
 def run_social_post_generation(

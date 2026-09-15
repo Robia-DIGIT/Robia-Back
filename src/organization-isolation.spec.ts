@@ -1,9 +1,15 @@
 import { NotFoundException } from '@nestjs/common';
+import { PinoLogger } from 'nestjs-pino';
 import { ActionItemsService } from './action-items/action-items.service';
 import { AuditsService } from './audits/audits.service';
+import { GoogleSearchConsoleService } from './integrations/google-search-console.service';
 import { OrgScopeGuard } from './common/guards/org-scope.guard';
 import { DocumentsService } from './documents/documents.service';
 import { OpportunitiesService } from './opportunities/opportunities.service';
+import { OpportunityGeneratorService } from './opportunities/opportunity-generator/opportunity-generator.service';
+import { N8nWebhookService } from './integrations/n8n-webhook.service';
+import { MetaService } from './integrations/meta.service';
+import { PrismaService } from './prisma/prisma.service';
 import { ValidationLogsService } from './validation-logs/validation-logs.service';
 import { WebsitesService } from './websites/websites.service';
 
@@ -79,7 +85,16 @@ describe('Organization isolation', () => {
       runSiteAudit: jest.fn(),
       runAudit: jest.fn(),
     };
-    const service = new AuditsService(prisma as any, runner as any);
+    const googleSearchConsole = {
+      getSearchConsoleSignalsForAudit: jest.fn(),
+    };
+    const logger = { assign: jest.fn() };
+    const service = new AuditsService(
+      prisma as any,
+      runner as any,
+      googleSearchConsole as unknown as GoogleSearchConsoleService,
+      logger as unknown as PinoLogger,
+    );
 
     await expect(
       service.run(requestingOrganizationId, 'website-org-b'),
@@ -92,6 +107,9 @@ describe('Organization isolation', () => {
     });
     expect(prisma.audit.create).not.toHaveBeenCalled();
     expect(runner.runSiteAudit).not.toHaveBeenCalled();
+    expect(
+      googleSearchConsole.getSearchConsoleSignalsForAudit,
+    ).not.toHaveBeenCalled();
     expect(runner.runAudit).not.toHaveBeenCalled();
   });
 
@@ -100,9 +118,10 @@ describe('Organization isolation', () => {
       opportunity: { findFirst: jest.fn().mockResolvedValue(null) },
     };
     const service = new OpportunitiesService(
-      prisma as any,
-      {} as any,
-      {} as any,
+      prisma as unknown as PrismaService,
+      {} as unknown as OpportunityGeneratorService,
+      {} as unknown as N8nWebhookService,
+      {} as unknown as MetaService,
     );
 
     await expect(

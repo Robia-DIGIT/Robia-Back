@@ -2,6 +2,15 @@ name: Backend CI
 
 on:
   workflow_dispatch:
+    inputs:
+      confirm_production:
+        description: 'Confirmation explicite requise pour déployer en production'
+        required: true
+        type: choice
+        options:
+          - 'NO'
+          - 'DEPLOY'
+        default: 'NO'
   pull_request:
   push:
     branches:
@@ -15,6 +24,23 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate
+      - name: Enforce the current ESLint debt baseline
+        shell: bash
+        run: |
+          npx eslint "{src,apps,libs,test}/**/*.ts" --format json --output-file eslint-report.json || true
+          node scripts/check-eslint-baseline.mjs eslint-report.json 74 23
+
   nest-build:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -34,7 +60,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: python-service/requirements.txt
+      - run: pip install -r python-service/requirements.txt
       - run: python -m compileall -q python-service/app python-service/main.py
       - run: PYTHONPATH=python-service python -m unittest discover -s python-service/tests -p "test_*.py"
 
@@ -57,12 +86,22 @@ jobs:
 
   deploy:
     name: Deploy production over restricted SSH
-    needs: [nest-build, python-llm-tests, production-containers, deployment-tests]
+    needs:
+      [
+        lint,
+        nest-build,
+        python-llm-tests,
+        production-containers,
+        deployment-tests,
+      ]
     if: >-
+      github.event_name == 'workflow_dispatch' &&
       github.ref == 'refs/heads/main' &&
       github.repository == 'Robia-DIGIT/Robia-Back' &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      inputs.confirm_production == 'DEPLOY' &&
       vars.VPS_DEPLOY_ENABLED == 'true'
+    environment:
+      name: production
     runs-on: ubuntu-latest
     timeout-minutes: 50
     concurrency:

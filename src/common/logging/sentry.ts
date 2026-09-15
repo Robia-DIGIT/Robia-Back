@@ -1,0 +1,60 @@
+import * as Sentry from '@sentry/node';
+import { redactSensitive } from './redact';
+
+let initialized = false;
+
+/**
+ * Runs the entire outgoing Sentry event through the same deep redactor
+ * used for every application log line — key-based redaction of
+ * passwords/tokens/secrets/API keys/authorization/cookies/emails,
+ * wherever they sit in the object graph (request headers, cookies, body,
+ * user, extra, contexts, breadcrumbs, ...), plus free-text scrubbing of
+ * secret-shaped substrings inside strings that aren't under a sensitive
+ * key at all (an exception message, a breadcrumb message). A key-based
+ * redactor alone is not sufficient here — see redact.ts and
+ * redact.spec.ts for what the free-text pass additionally catches, and
+ * sentry.spec.ts for the Sentry-event-shaped proof of the same guarantee.
+ */
+export function sanitizeSentryEvent(
+  event: Sentry.ErrorEvent,
+): Sentry.ErrorEvent | null {
+  return redactSensitive(event) as Sentry.ErrorEvent;
+}
+
+/**
+ * Optional, like GOOGLE_PAGESPEED_API_KEY (RC-10): SENTRY_DSN unset
+ * means Sentry stays inert and this is a no-op, not a startup failure.
+ */
+export function initSentry(): void {
+  const dsn = process.env.SENTRY_DSN?.trim();
+  if (!dsn) {
+    return;
+  }
+
+  Sentry.init({
+    dsn,
+    environment: process.env.NODE_ENV || 'development',
+    // Error capture only in this slice - performance tracing and its
+    // sampling rate are a separate decision (see the RC-15 handoff),
+    // not something to enable by default alongside error reporting.
+    tracesSampleRate: 0,
+    beforeSend: sanitizeSentryEvent,
+  });
+  initialized = true;
+}
+
+export function isSentryInitialized(): boolean {
+  return initialized;
+}
+
+/**
+ * Only ever called for genuinely unexpected/5xx failures (see
+ * AllExceptionsFilter) - never for ordinary 4xx HttpExceptions, which
+ * are expected client-facing outcomes, not incidents.
+ */
+export function captureException(exception: unknown): void {
+  if (!initialized) {
+    return;
+  }
+  Sentry.captureException(exception);
+}

@@ -1,9 +1,27 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
+import { NestExpressApplication } from '@nestjs/platform-express';
+import { Logger } from 'nestjs-pino';
+import helmet from 'helmet';
 import { AppModule } from './app.module';
+import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
+import { initSentry } from './common/logging/sentry';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, { rawBody: true });
+  // No-op unless SENTRY_DSN is set; must run before anything that could throw.
+  initSentry();
+
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+    rawBody: true,
+    bufferLogs: true,
+  });
+  app.useLogger(app.get(Logger));
+
+  // Caddy is the only reverse-proxy hop in production. This makes req.ip,
+  // and therefore @nestjs/throttler, identify the real client forwarded by Caddy.
+  app.set('trust proxy', 1);
+  app.use(helmet());
+  app.useGlobalFilters(new AllExceptionsFilter());
 
   const configuredOrigins =
     process.env.FRONTEND_URLS ??
@@ -31,14 +49,7 @@ async function bootstrap() {
 
     credentials: true,
 
-    methods: [
-      'GET',
-      'POST',
-      'PUT',
-      'DELETE',
-      'PATCH',
-      'OPTIONS',
-    ],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
 
     allowedHeaders: [
       'Origin',
@@ -62,4 +73,4 @@ async function bootstrap() {
   await app.listen(process.env.PORT ?? 3001);
 }
 
-bootstrap();
+void bootstrap();

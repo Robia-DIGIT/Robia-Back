@@ -34,7 +34,7 @@ export class OpportunityGeneratorService {
   private readonly aiEngineUrl: string;
 
   constructor(private readonly configService: ConfigService) {
-    this.aiEngineUrl = 
+    this.aiEngineUrl =
       this.configService.get<string>('AI_ENGINE_URL') ??
       'http://localhost:8000';
   }
@@ -47,7 +47,7 @@ export class OpportunityGeneratorService {
     auditResult: Record<string, any>,
     organizationCity?: string | null,
   ): Promise<GeneratedOpportunity[]> {
-    const response = await fetch (`${this.aiEngineUrl}/opportunities`, {
+    const response = await fetch(`${this.aiEngineUrl}/opportunities`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -64,9 +64,9 @@ export class OpportunityGeneratorService {
       );
     }
 
-    return response.json();
+    return (await response.json()) as GeneratedOpportunity[];
   }
-  
+
   /**
    * Équivalent de generate() pour un audit multi-pages (SiteAuditResult).
    * Même contrat de retour (GeneratedOpportunity[]) — les opportunités sont
@@ -96,6 +96,6 @@ export class OpportunityGeneratorService {
       );
     }
 
-    return response.json();
+    return (await response.json()) as GeneratedOpportunity[];
   }
 }

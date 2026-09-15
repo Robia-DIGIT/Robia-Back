@@ -1,5 +1,10 @@
 import { Module } from '@nestjs/common';
+import { APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 import { ConfigModule } from '@nestjs/config';
+import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+import { LoggerModule } from 'nestjs-pino';
+import { buildPinoHttpOptions } from './common/logging/logger.config';
+import { RequestIdInterceptor } from './common/logging/request-id.interceptor';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { PrismaModule } from './prisma/prisma.module';
@@ -24,6 +29,10 @@ import { BillingModule } from './billing/billing.module';
       isGlobal: true,
       envFilePath: '.env',
     }),
+    ThrottlerModule.forRoot({
+      throttlers: [{ ttl: 60_000, limit: 100 }],
+    }),
+    LoggerModule.forRoot({ pinoHttp: buildPinoHttpOptions() }),
     PrismaModule,
     IntegrationsModule,
     AuthModule,
@@ -41,6 +50,16 @@ import { BillingModule } from './billing/billing.module';
     BillingModule,
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [
+    AppService,
+    {
+      provide: APP_GUARD,
+      useClass: ThrottlerGuard,
+    },
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: RequestIdInterceptor,
+    },
+  ],
 })
 export class AppModule {}

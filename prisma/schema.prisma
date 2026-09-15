@@ -60,10 +60,12 @@ model Organization {
   documents     Document[]
   validationLogs ValidationLog[]
   actionItems    ActionItem[]
+  actionExecutionEvents ActionExecutionEvent[]
   locations Location[] 
   stripeSubscription            StripeSubscription?
   googleSearchConsoleConnection GoogleSearchConsoleConnection?
   posts                         Post[]
+  metaConnection MetaConnection?
   createdAt DateTime @default(now()) @map("created_at")
 
   @@map("organizations")
@@ -122,6 +124,27 @@ model GoogleSearchConsoleDailyMetric {
   @@unique([connectionId, date])
   @@index([connectionId, date])
   @@map("google_search_console_daily_metrics")
+}
+
+model MetaConnection {
+  id                         String   @id @default(cuid())
+  organizationId             String   @unique @map("organization_id")
+  organization               Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  metaUserId                 String?  @map("meta_user_id")
+  metaUserName               String?  @map("meta_user_name")
+  encryptedUserAccessToken   String   @map("encrypted_user_access_token")
+  grantedScopes              String?  @map("granted_scopes")
+  selectedPageId             String?  @map("selected_page_id")
+  selectedPageName           String?  @map("selected_page_name")
+  encryptedPageAccessToken   String?  @map("encrypted_page_access_token")
+  selectedInstagramAccountId String?  @map("selected_instagram_account_id")
+  selectedInstagramUsername  String?  @map("selected_instagram_username")
+  connectedAt                DateTime @default(now()) @map("connected_at")
+  lastSyncedAt               DateTime? @map("last_synced_at")
+  createdAt                  DateTime @default(now()) @map("created_at")
+  updatedAt                  DateTime @updatedAt @map("updated_at")
+
+  @@map("meta_connections")
 }
 
 model Website {
@@ -277,19 +300,43 @@ model ValidationLog {
 }
 
 model ActionItem {
-  id             String    @id @default(cuid())
-  organizationId String    @map("organization_id")
-  organization   Organization @relation(fields: [organizationId], references: [id])
-  opportunityId  String?   @map("opportunity_id")
-  opportunity    Opportunity? @relation(fields: [opportunityId], references: [id])
-  documentId     String?   @map("document_id")
-  document       Document? @relation(fields: [documentId], references: [id])
-  title          String
-  status         String    @default("todo") // todo | in_progress | done | blocked | ignored
-  dueDate        DateTime? @map("due_date")
-  createdAt      DateTime  @default(now()) @map("created_at")
+  id                  String    @id @default(cuid())
+  organizationId      String    @map("organization_id")
+  organization        Organization @relation(fields: [organizationId], references: [id])
+  opportunityId       String?   @map("opportunity_id")
+  opportunity         Opportunity? @relation(fields: [opportunityId], references: [id])
+  documentId          String?   @map("document_id")
+  document            Document? @relation(fields: [documentId], references: [id])
+  title               String
+  status              String    @default("todo") // todo | in_progress | done | blocked | ignored
+  dueDate             DateTime? @map("due_date")
+  approvalStatus      String    @default("draft") @map("approval_status") // draft | pending | approved | rejected
+  approvalReason      String?   @map("approval_reason")
+  executionStatus     String    @default("not_started") @map("execution_status") // not_started | ready | succeeded | failed
+  executionEvidence   Json?     @map("execution_evidence")
+  verificationAuditId String?   @map("verification_audit_id")
+  attemptCount        Int       @default(0) @map("attempt_count")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
+  executionEvents     ActionExecutionEvent[]
 
   @@map("action_items")
+}
+
+model ActionExecutionEvent {
+  id             String       @id @default(cuid())
+  organizationId String       @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  actionItemId   String       @map("action_item_id")
+  actionItem     ActionItem   @relation(fields: [actionItemId], references: [id], onDelete: Cascade)
+  userId         String       @map("user_id")
+  eventType      String       @map("event_type") // submitted | approved | rejected | execution_succeeded | execution_failed
+  idempotencyKey String       @unique @map("idempotency_key")
+  payload        Json?
+  createdAt      DateTime     @default(now()) @map("created_at")
+
+  @@index([organizationId, actionItemId, createdAt])
+  @@map("action_execution_events")
 }
 
 model Location {

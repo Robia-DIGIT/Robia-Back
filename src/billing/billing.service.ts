@@ -27,7 +27,7 @@ export class BillingService {
     });
     const hasPaidAccess = Boolean(
       subscription &&
-        ['active', 'trialing', 'past_due'].includes(subscription.status),
+      ['active', 'trialing', 'past_due'].includes(subscription.status),
     );
 
     return {
@@ -119,14 +119,12 @@ export class BillingService {
 
     switch (event.type) {
       case 'checkout.session.completed':
-        await this.handleCheckoutCompleted(
-          event.data.object as Stripe.Checkout.Session,
-        );
+        await this.handleCheckoutCompleted(event.data.object);
         break;
       case 'customer.subscription.created':
       case 'customer.subscription.updated':
       case 'customer.subscription.deleted':
-        await this.syncSubscription(event.data.object as Stripe.Subscription);
+        await this.syncSubscription(event.data.object);
         break;
       default:
         this.logger.debug(`Événement Stripe ignoré : ${event.type}`);

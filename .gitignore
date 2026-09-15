@@ -65,5 +65,10 @@ python-service/**/__pycache__/
 python-service/*.pyc
 python-service/.env
 
+# Python bytecode cache anywhere (e.g. deploy/tests/)
+__pycache__/
+**/__pycache__/
+*.pyc
+
 # Local test outputs
 site_result.json
