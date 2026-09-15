@@ -71,6 +71,26 @@ describe('condition-engine — validation', () => {
     ).toThrow(InvalidConditionError);
   });
 
+  it('rejects "in" when an array element does not match the field type', () => {
+    expect(() =>
+      validateConditionTree({
+        field: 'audit.status',
+        operator: 'in',
+        value: ['completed', 42],
+      }),
+    ).toThrow(InvalidConditionError);
+  });
+
+  it('rejects "notIn" when an array element does not match the field type', () => {
+    expect(() =>
+      validateConditionTree({
+        field: 'opportunity.count',
+        operator: 'notIn',
+        value: [1, 'not-a-number'],
+      }),
+    ).toThrow(InvalidConditionError);
+  });
+
   it('rejects a group with more than one of all/any/not', () => {
     expect(() =>
       validateConditionTree({

@@ -33,6 +33,11 @@ export class InvalidOpsActionInputError extends Error {}
 interface OpsActionDescriptor {
   type: OpsActionType;
   description: string;
+  // The exhaustive list of input keys this action ever reads. Anything else
+  // present on the caller-supplied input — a stray `token`/`apiKey`, or any
+  // other extraneous field — is never persisted or executed: see
+  // canonicalizeInput().
+  inputSchema: string[];
   execute: (
     organizationId: string,
     input: OpsActionInput | null | undefined,
@@ -73,6 +78,36 @@ export class OpsActionsRegistryService {
     return this.actions.has(actionType as OpsActionType);
   }
 
+  /**
+   * Validates the required fields for this action and returns a brand-new
+   * object containing *only* the keys this action's schema declares —
+   * anything else on `input` (a secret pasted into the wrong field, a stray
+   * debug flag, whatever) is dropped, never copied through. Call this before
+   * persisting a step definition/input and again before persisting or
+   * executing a resolved step input: it is the single choke point that
+   * guarantees nothing outside an action's own declared inputs ever reaches
+   * storage or execution.
+   */
+  canonicalizeInput(
+    actionType: string,
+    input: OpsActionInput | null | undefined,
+  ): OpsActionInput {
+    const action = this.actions.get(actionType as OpsActionType);
+    if (!action) {
+      throw new UnknownOpsActionError(
+        `Action type "${actionType}" is not in the Ops action allowlist.`,
+      );
+    }
+    for (const field of action.inputSchema) {
+      this.requireStringInput(input, field);
+    }
+    const canonical: OpsActionInput = {};
+    for (const field of action.inputSchema) {
+      canonical[field] = (input as OpsActionInput)[field];
+    }
+    return canonical;
+  }
+
   async execute(
     actionType: string,
     organizationId: string,
@@ -109,6 +144,7 @@ export class OpsActionsRegistryService {
       type: 'robia.audit.run_diagnostic',
       description:
         "Lance un nouveau diagnostic (audit) sur un site déjà connecté à l'organisation.",
+      inputSchema: ['websiteId'],
       execute: async (organizationId, input) => {
         const websiteId = this.requireStringInput(input, 'websiteId');
         const audit = await this.audits.run(organizationId, websiteId);
@@ -131,6 +167,7 @@ export class OpsActionsRegistryService {
       type: 'robia.opportunities.regenerate',
       description:
         'Génère ou complète les opportunités ROBIA (SEO + Meta) pour un audit déjà terminé.',
+      inputSchema: ['auditId'],
       execute: async (organizationId, input) => {
         const auditId = this.requireStringInput(input, 'auditId');
         const opportunities = await this.opportunities.generateFromAudit(
@@ -155,6 +192,7 @@ export class OpsActionsRegistryService {
       type: 'robia.report.prepare_organization_summary',
       description:
         "Prépare un résumé en lecture seule de l'organisation (sites, dernier audit, opportunités ouvertes, tâches en attente).",
+      inputSchema: [],
       execute: async (organizationId) => {
         const [
           websiteCount,
@@ -209,6 +247,7 @@ export class OpsActionsRegistryService {
       type: 'robia.action_items.create_internal_task',
       description:
         'Crée une tâche ROBIA interne (ActionItem) en brouillon — jamais approuvée ni exécutée automatiquement.',
+      inputSchema: ['title'],
       execute: async (organizationId, input) => {
         const title = this.requireStringInput(input, 'title');
         const actionItem = await this.prisma.actionItem.create({

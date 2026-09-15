@@ -202,4 +202,44 @@ describe('OpsActionsRegistryService', () => {
       expect(prisma.actionItem.create).not.toHaveBeenCalled();
     });
   });
+
+  describe('canonicalizeInput', () => {
+    it('strips any key not declared by the action, keeping only its own allowlisted fields', () => {
+      const canonical = registry.canonicalizeInput(
+        'robia.action_items.create_internal_task',
+        { title: 'Vérifier le site', token: 'super-secret', apiKey: 'sk-123' },
+      );
+      expect(canonical).toEqual({ title: 'Vérifier le site' });
+    });
+
+    it('returns an empty object for an action that declares no input fields, dropping everything passed in', () => {
+      const canonical = registry.canonicalizeInput(
+        'robia.report.prepare_organization_summary',
+        { anything: 'goes-here', password: 'hunter2' },
+      );
+      expect(canonical).toEqual({});
+    });
+
+    it('still enforces the required-field check before canonicalizing', () => {
+      expect(() =>
+        registry.canonicalizeInput('robia.audit.run_diagnostic', {
+          token: 'super-secret',
+        }),
+      ).toThrow(InvalidOpsActionInputError);
+    });
+
+    it('rejects a non-allowlisted action type', () => {
+      expect(() =>
+        registry.canonicalizeInput('shell.exec', { cmd: 'rm -rf /' }),
+      ).toThrow(UnknownOpsActionError);
+    });
+
+    it('never lets a templated placeholder value be rejected as invalid — it is still just a non-empty string', () => {
+      const canonical = registry.canonicalizeInput(
+        'robia.opportunities.regenerate',
+        { auditId: '{{event.auditId}}' },
+      );
+      expect(canonical).toEqual({ auditId: '{{event.auditId}}' });
+    });
+  });
 });

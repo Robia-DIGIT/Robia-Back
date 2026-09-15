@@ -19,7 +19,11 @@ import {
 } from './condition-engine';
 import { AutomationContextService } from './automation-context.service';
 import { resolveStepInput } from './automation-templating';
-import { OpsActionsRegistryService } from './actions/ops-actions-registry.service';
+import {
+  InvalidOpsActionInputError,
+  OpsActionsRegistryService,
+  UnknownOpsActionError,
+} from './actions/ops-actions-registry.service';
 import {
   AutomationLoopError,
   AutomationRunConflictError,
@@ -33,6 +37,7 @@ import {
 import {
   AutomationRunWithSteps,
   AutomationWithTrigger,
+  StoredAutomationStep,
   readStoredSteps,
 } from './automation.types';
 
@@ -224,21 +229,29 @@ export class AutomationsService {
     runId: string,
     reason?: string,
   ): Promise<AutomationRunWithSteps> {
+    // getRun() is only for the org-scope check and the friendly 404/409
+    // messages below — the actual approve decision is claimed atomically by
+    // the conditional updateMany just after, never by this read.
     const run = await this.getRun(organizationId, runId);
     if (run.status !== 'waiting_approval') {
       throw new ConflictException("Ce run n'est pas en attente d'approbation.");
     }
 
-    const automation = await this.prisma.automation.findFirst({
-      where: { id: run.automationId, organizationId },
-      include: { trigger: true },
-    });
-    if (!automation) {
-      throw new NotFoundException('Automation non trouvée.');
-    }
-
-    const approved = await this.prisma.automationRun.update({
-      where: { id: run.id },
+    // Compare-and-swap: only a run still (status='waiting_approval',
+    // approvalStatus='pending') at the moment this single UPDATE statement
+    // runs gets claimed. Two concurrent approve calls — or an approve racing
+    // a reject — can both pass the read above, but at most one of these
+    // conditional updates ever matches a row: Postgres serializes concurrent
+    // UPDATEs against the same row, and the loser's WHERE no longer matches
+    // once the winner's write is visible. This is what actually prevents
+    // double-execution and execute-after-reject, not the read above.
+    const claim = await this.prisma.automationRun.updateMany({
+      where: {
+        id: run.id,
+        organizationId,
+        status: 'waiting_approval',
+        approvalStatus: 'pending',
+      },
       data: {
         approvalStatus: 'approved',
         approvedById: userId,
@@ -247,10 +260,13 @@ export class AutomationsService {
         status: 'running',
         startedAt: new Date(),
       },
-      include: { steps: true },
     });
+    if (claim.count === 0) {
+      throw new ConflictException("Ce run n'est pas en attente d'approbation.");
+    }
 
-    return this.executeSteps(automation, approved);
+    const approved = await this.getRun(organizationId, runId);
+    return this.executeSteps(approved);
   }
 
   async rejectRun(
@@ -264,10 +280,17 @@ export class AutomationsService {
       throw new ConflictException("Ce run n'est pas en attente d'approbation.");
     }
 
-    // Rejected means rejected: status goes straight to 'cancelled' and
-    // executeSteps() is never called — no step is ever created for this run.
-    return this.prisma.automationRun.update({
-      where: { id: run.id },
+    // Same compare-and-swap as approveRun() — see the comment there. Rejected
+    // means rejected: status goes straight to 'cancelled' and executeSteps()
+    // is never called, and this claim can never succeed after an approve (or
+    // another reject) has already won the race.
+    const claim = await this.prisma.automationRun.updateMany({
+      where: {
+        id: run.id,
+        organizationId,
+        status: 'waiting_approval',
+        approvalStatus: 'pending',
+      },
       data: {
         approvalStatus: 'rejected',
         approvedById: userId,
@@ -276,8 +299,12 @@ export class AutomationsService {
         status: 'cancelled',
         finishedAt: new Date(),
       },
-      include: { steps: { orderBy: { sequence: 'asc' } } },
     });
+    if (claim.count === 0) {
+      throw new ConflictException("Ce run n'est pas en attente d'approbation.");
+    }
+
+    return this.getRun(organizationId, runId);
   }
 
   // ---------------------------------------------------------------------
@@ -313,11 +340,15 @@ export class AutomationsService {
     for (const automation of automations) {
       const run = await this.startRun(automation, {
         triggerType: 'event',
-        // Deterministic from the event's own identity: emitting the exact
-        // same (organizationId, eventKey) pair twice always resolves to the
-        // same underlying AutomationEvent row, so this key never changes
-        // across duplicate emissions — the run is created at most once.
-        dedupKey: `event:${event.id}`,
+        // Deterministic from the event's own identity *and* the automation
+        // it belongs to: (organizationId, dedupKey) is the run's whole
+        // identity, so a dedupKey shared across automations would make a
+        // second matching automation collide with — and silently reuse —
+        // the first automation's run instead of getting its own. Scoping by
+        // automation.id keeps each automation's dedup independent while
+        // still deduping a single automation's re-emissions of the same
+        // event to exactly one run.
+        dedupKey: `automation:${automation.id}:event:${event.id}`,
         sourceEventId: event.id,
       });
       runs.push(run);
@@ -344,7 +375,12 @@ export class AutomationsService {
           organizationId,
           eventType,
           eventKey,
-          payload: (payload ?? Prisma.JsonNull) as Prisma.InputJsonValue,
+          // Never trust the emitter: a payload can come from a future
+          // integration webhook we don't control. Redact before this is
+          // ever written to disk, the same way context/evidence/errors are.
+          payload: (payload
+            ? (redactSensitive(payload) as Prisma.InputJsonValue)
+            : Prisma.JsonNull) as Prisma.InputJsonValue,
         },
       });
     } catch (error) {
@@ -409,10 +445,25 @@ export class AutomationsService {
       throw new AutomationRunConflictError();
     }
 
-    const steps = readStoredSteps(automation.steps);
-    if (steps.length > MAX_STEPS_PER_AUTOMATION) {
+    const rawSteps = readStoredSteps(automation.steps);
+    if (rawSteps.length > MAX_STEPS_PER_AUTOMATION) {
       throw new AutomationTooManyStepsError(MAX_STEPS_PER_AUTOMATION);
     }
+
+    // Freeze the execution plan now, at trigger time: canonical (allowlisted
+    // keys only) action inputs, snapshotted before anything about the
+    // automation can change underneath this run. executeSteps() runs this
+    // snapshot — never the automation's live `steps` — so an edit made while
+    // a run sits at `waiting_approval` can never change what an approver's
+    // click actually executes.
+    const plannedSteps: StoredAutomationStep[] = rawSteps.map((step) => ({
+      actionType: step.actionType,
+      input: this.actionsRegistry.canonicalizeInput(
+        step.actionType,
+        step.input,
+      ),
+    }));
+    const plannedStepsJson = plannedSteps as unknown as Prisma.InputJsonValue;
 
     const context = await this.context.build(automation.organizationId);
     const conditionsPass = evaluateConditions(
@@ -430,6 +481,7 @@ export class AutomationsService {
       return this.persistRun(automation, opts, {
         status: 'skipped',
         context: sanitizedContext,
+        plannedSteps: plannedStepsJson,
         startedAt: new Date(),
         finishedAt: new Date(),
       });
@@ -441,6 +493,7 @@ export class AutomationsService {
         requiresApproval: true,
         approvalStatus: 'pending',
         context: sanitizedContext,
+        plannedSteps: plannedStepsJson,
       });
       return run;
     }
@@ -448,9 +501,10 @@ export class AutomationsService {
     const run = await this.persistRun(automation, opts, {
       status: 'running',
       context: sanitizedContext,
+      plannedSteps: plannedStepsJson,
       startedAt: new Date(),
     });
-    return this.executeSteps(automation, run);
+    return this.executeSteps(run);
   }
 
   private async persistRun(
@@ -490,16 +544,27 @@ export class AutomationsService {
           include: { steps: { orderBy: { sequence: 'asc' } } },
         });
         if (raced) return raced;
+        // A P2002 that ISN'T the dedupKey race can only be the partial
+        // unique index enforcing "at most one active run per automation"
+        // (automation_runs_one_active_per_automation, see the migration) —
+        // those are the only two unique constraints on this table. The
+        // pre-check in startRun() is a fast, friendly failure path; this is
+        // the actual DB-enforced guarantee, closing the check-then-create
+        // race a plain findFirst() can never fully close on its own.
+        throw new AutomationRunConflictError();
       }
       throw error;
     }
   }
 
   private async executeSteps(
-    automation: AutomationWithTrigger,
     run: AutomationRunWithSteps,
   ): Promise<AutomationRunWithSteps> {
-    const steps = readStoredSteps(automation.steps);
+    // Never the automation's current `steps` — always this run's own frozen
+    // plan (see startRun()), so an edit made after trigger time (in
+    // particular, while a run sits at `waiting_approval`) can never change
+    // what actually executes.
+    const steps = readStoredSteps(run.plannedSteps);
     if (steps.length > MAX_STEPS_PER_AUTOMATION) {
       return this.finishRun(
         run.id,
@@ -560,7 +625,7 @@ export class AutomationsService {
       try {
         const evidence = await this.actionsRegistry.execute(
           step.actionType,
-          automation.organizationId,
+          run.organizationId,
           resolvedInput,
         );
         await this.prisma.automationStepRun.update({
@@ -623,6 +688,11 @@ export class AutomationsService {
     }
   }
 
+  // Mutates each step's `input` in place, replacing it with the action's own
+  // canonical (allowlisted keys only) version — so whatever gets persisted
+  // into Automation.steps can never carry a stray secret-shaped field
+  // (a `token`/`apiKey` pasted into the wrong place, or anything else the
+  // action itself never reads) through to storage or, later, execution.
   private validateSteps(steps: AutomationStepDto[]) {
     if (!steps || steps.length === 0) {
       throw new AutomationValidationError(
@@ -633,10 +703,19 @@ export class AutomationsService {
       throw new AutomationTooManyStepsError(MAX_STEPS_PER_AUTOMATION);
     }
     for (const step of steps) {
-      if (!this.actionsRegistry.isAllowed(step.actionType)) {
-        throw new AutomationValidationError(
-          `Action type "${step.actionType}" is not in the Ops action allowlist.`,
+      try {
+        step.input = this.actionsRegistry.canonicalizeInput(
+          step.actionType,
+          step.input,
         );
+      } catch (error) {
+        if (
+          error instanceof UnknownOpsActionError ||
+          error instanceof InvalidOpsActionInputError
+        ) {
+          throw new AutomationValidationError(error.message);
+        }
+        throw error;
       }
     }
   }

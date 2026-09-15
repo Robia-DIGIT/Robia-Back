@@ -477,6 +477,12 @@ model AutomationRun {
   errorMessage     String?  @map("error_message")
   // Sanitized snapshot of the condition-evaluation context at trigger time.
   context          Json?
+  // Immutable snapshot of the automation's steps (canonical/allowlisted
+  // input only) taken at trigger time. executeSteps() runs this, never the
+  // automation's current (possibly since-edited) `steps` — otherwise an
+  // approver could unknowingly execute different actions than the ones
+  // that were actually reviewed before approval.
+  plannedSteps     Json?    @map("planned_steps")
   createdAt        DateTime @default(now()) @map("created_at")
 
   steps AutomationStepRun[]
@@ -502,6 +508,6 @@ model AutomationStepRun {
   finishedAt DateTime? @map("finished_at")
   createdAt  DateTime @default(now()) @map("created_at")
 
-  @@index([runId, sequence])
+  @@unique([runId, sequence])
   @@map("automation_step_runs")
 }

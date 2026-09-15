@@ -2,7 +2,11 @@ import { ConflictException, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { AutomationsService } from './automations.service';
 import { AutomationContextService } from './automation-context.service';
-import { OpsActionsRegistryService } from './actions/ops-actions-registry.service';
+import {
+  InvalidOpsActionInputError,
+  OpsActionsRegistryService,
+  UnknownOpsActionError,
+} from './actions/ops-actions-registry.service';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   AutomationLoopError,
@@ -32,6 +36,12 @@ interface FakeRecord {
 function baseId(prefix: string, seq: number) {
   return `${prefix}-${seq}`;
 }
+
+// Mirrors AutomationsService's own ACTIVE_RUN_STATUSES — FakePrisma simulates
+// the real `automation_runs_one_active_per_automation` partial unique index
+// against these same statuses, so a concurrency test here exercises the same
+// guarantee the migration provides in Postgres.
+const ACTIVE_RUN_STATUSES = ['queued', 'running', 'waiting_approval'];
 
 // Real Postgres round-trips Prisma.JsonNull/Prisma.DbNull to a genuine JS
 // `null` on read — FakePrisma stores raw JS values, so it must simulate
@@ -266,10 +276,25 @@ class FakePrisma {
     }) => {
       const organizationId = data.organizationId as string;
       const dedupKey = data.dedupKey as string;
-      const clash = Array.from(this.runs.values()).find(
+      const automationId = data.automationId as string;
+      const dedupClash = Array.from(this.runs.values()).find(
         (r) => r.organizationId === organizationId && r.dedupKey === dedupKey,
       );
-      if (clash) {
+      // One active run per automation — a real, DB-shaped uniqueness check,
+      // not just an app-level pre-check: this is what makes a concurrency
+      // test here actually exercise the same guarantee the partial unique
+      // index (automation_runs_one_active_per_automation) provides for real
+      // in Postgres. A newly-created row's own status counts too, since a
+      // create() call always specifies a status (see persistRun()).
+      const activeClash =
+        !dedupClash &&
+        ACTIVE_RUN_STATUSES.includes((data.status as string) ?? 'queued') &&
+        Array.from(this.runs.values()).some(
+          (r) =>
+            r.automationId === automationId &&
+            ACTIVE_RUN_STATUSES.includes(r.status as string),
+        );
+      if (dedupClash || activeClash) {
         throw new Prisma.PrismaClientKnownRequestError(
           'Unique constraint failed',
           {
@@ -310,6 +335,41 @@ class FakePrisma {
       if (!record) throw new Error('FakePrisma: run not found');
       Object.assign(record, normalizeJsonSentinels(data));
       return this.withSteps(record, include);
+    },
+    // A real single-statement conditional UPDATE...WHERE is atomic in
+    // Postgres: only a row still matching every `where` clause at the
+    // instant the statement runs gets touched. This synchronous
+    // find-then-mutate call is the fake's equivalent — it never awaits
+    // between reading and writing, so two "concurrent" callers racing via
+    // Promise.all can never both see status='waiting_approval' AND both
+    // win: whichever's turn comes up first in the microtask queue claims
+    // the row and flips its status, so the other's own where-clause no
+    // longer matches when its turn comes.
+    updateMany: ({
+      where,
+      data,
+    }: {
+      where: {
+        id: string;
+        organizationId?: string;
+        status?: string;
+        approvalStatus?: string;
+      };
+      data: Record<string, unknown>;
+    }) => {
+      const record = this.runs.get(where.id);
+      const matches =
+        !!record &&
+        (where.organizationId === undefined ||
+          record.organizationId === where.organizationId) &&
+        (where.status === undefined || record.status === where.status) &&
+        (where.approvalStatus === undefined ||
+          record.approvalStatus === where.approvalStatus);
+      if (!matches) {
+        return { count: 0 };
+      }
+      Object.assign(record, normalizeJsonSentinels(data));
+      return { count: 1 };
     },
   };
 
@@ -409,9 +469,27 @@ describe('AutomationsService', () => {
   const orgB = 'org-b';
   const userA = 'user-a';
 
+  // The real per-action allowlisted-key schemas — kept in lockstep with
+  // OpsActionsRegistryService's own `inputSchema`s, see
+  // ops-actions-registry.service.spec.ts for the registry's own dedicated
+  // canonicalization tests. Duplicated (rather than importing the real
+  // service) so this file keeps testing AutomationsService's own plumbing —
+  // that it calls canonicalizeInput and actually persists/executes what it
+  // returns — independent of the registry's implementation.
+  const ACTION_INPUT_SCHEMAS: Record<string, string[]> = {
+    'robia.audit.run_diagnostic': ['websiteId'],
+    'robia.opportunities.regenerate': ['auditId'],
+    'robia.report.prepare_organization_summary': [],
+    'robia.action_items.create_internal_task': ['title'],
+  };
+
   let prisma: FakePrisma;
   let context: { build: jest.Mock };
-  let actionsRegistry: { isAllowed: jest.Mock; execute: jest.Mock };
+  let actionsRegistry: {
+    isAllowed: jest.Mock;
+    execute: jest.Mock;
+    canonicalizeInput: jest.Mock;
+  };
   let service: AutomationsService;
 
   beforeEach(() => {
@@ -420,15 +498,36 @@ describe('AutomationsService', () => {
     actionsRegistry = {
       isAllowed: jest
         .fn()
-        .mockImplementation((type: string) =>
-          [
-            'robia.audit.run_diagnostic',
-            'robia.opportunities.regenerate',
-            'robia.report.prepare_organization_summary',
-            'robia.action_items.create_internal_task',
-          ].includes(type),
-        ),
+        .mockImplementation((type: string) => type in ACTION_INPUT_SCHEMAS),
       execute: jest.fn().mockResolvedValue({ ok: true }),
+      canonicalizeInput: jest
+        .fn()
+        .mockImplementation(
+          (
+            actionType: string,
+            input: Record<string, unknown> | null | undefined,
+          ) => {
+            const schema = ACTION_INPUT_SCHEMAS[actionType];
+            if (!schema) {
+              throw new UnknownOpsActionError(
+                `Action type "${actionType}" is not in the Ops action allowlist.`,
+              );
+            }
+            for (const field of schema) {
+              const value = input?.[field];
+              if (typeof value !== 'string' || value.trim().length === 0) {
+                throw new InvalidOpsActionInputError(
+                  `Missing or invalid "${field}" input.`,
+                );
+              }
+            }
+            const canonical: Record<string, unknown> = {};
+            for (const field of schema) {
+              canonical[field] = (input as Record<string, unknown>)[field];
+            }
+            return canonical;
+          },
+        ),
     };
     service = new AutomationsService(
       prisma as unknown as PrismaService,
@@ -774,6 +873,197 @@ describe('AutomationsService', () => {
     ).rejects.toBeInstanceOf(AutomationRunConflictError);
   });
 
+  it('lets only one of two truly concurrent manual triggers create a run, enforced at the persistence layer', async () => {
+    // Each manual trigger gets its own random dedupKey (manual:<uuid>), so
+    // this exercises the DB-level "one active run per automation" guard
+    // specifically — not the dedupKey idempotency path.
+    const automation = await service.create(
+      orgA,
+      userA,
+      createDto({ requiresApproval: true }),
+    );
+
+    const results = await Promise.allSettled([
+      service.triggerManual(orgA, userA, automation.id),
+      service.triggerManual(orgA, userA, automation.id),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === 'fulfilled');
+    const rejected = results.filter((r) => r.status === 'rejected');
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0].reason).toBeInstanceOf(AutomationRunConflictError);
+
+    const allRuns = await service.listRuns(orgA, automation.id);
+    expect(allRuns).toHaveLength(1);
+  });
+
+  describe('atomic approve/reject transitions', () => {
+    it('lets only one of a concurrent approve/reject pair win, never both', async () => {
+      const automation = await service.create(
+        orgA,
+        userA,
+        createDto({ requiresApproval: true }),
+      );
+      const run = await service.triggerManual(orgA, userA, automation.id);
+      expect(run.status).toBe('waiting_approval');
+
+      const results = await Promise.allSettled([
+        service.approveRun(orgA, 'approver-1', run.id),
+        service.rejectRun(orgA, 'approver-2', run.id, 'Pas maintenant'),
+      ]);
+
+      const fulfilled = results.filter((r) => r.status === 'fulfilled');
+      const rejected = results.filter((r) => r.status === 'rejected');
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      expect(rejected[0].reason).toBeInstanceOf(ConflictException);
+
+      const finalRun = await service.getRun(orgA, run.id);
+      expect(['succeeded', 'cancelled']).toContain(finalRun.status);
+      if (finalRun.status === 'succeeded') {
+        expect(actionsRegistry.execute).toHaveBeenCalledTimes(1);
+      } else {
+        expect(actionsRegistry.execute).not.toHaveBeenCalled();
+      }
+    });
+
+    it('lets only one of two concurrent approve calls execute the steps', async () => {
+      const automation = await service.create(
+        orgA,
+        userA,
+        createDto({ requiresApproval: true }),
+      );
+      const run = await service.triggerManual(orgA, userA, automation.id);
+
+      const results = await Promise.allSettled([
+        service.approveRun(orgA, 'approver-1', run.id),
+        service.approveRun(orgA, 'approver-2', run.id),
+      ]);
+
+      const fulfilled = results.filter((r) => r.status === 'fulfilled');
+      const rejected = results.filter((r) => r.status === 'rejected');
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      expect(rejected[0].reason).toBeInstanceOf(ConflictException);
+      expect(actionsRegistry.execute).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // Approval is bound to an immutable snapshot of the plan
+  // ---------------------------------------------------------------------
+
+  it('executes only the originally-triggered step snapshot, even if the automation is edited before approval', async () => {
+    const automation = await service.create(
+      orgA,
+      userA,
+      createDto({
+        requiresApproval: true,
+        steps: [
+          {
+            actionType: 'robia.action_items.create_internal_task',
+            input: { title: 'Original' },
+          },
+        ],
+      }),
+    );
+    const run = await service.triggerManual(orgA, userA, automation.id);
+    expect(run.status).toBe('waiting_approval');
+
+    await service.update(orgA, automation.id, {
+      steps: [
+        {
+          actionType: 'robia.action_items.create_internal_task',
+          input: { title: 'Edited-after-trigger' },
+        },
+      ],
+    });
+
+    const approved = await service.approveRun(orgA, 'approver-1', run.id);
+    expect(approved.status).toBe('succeeded');
+    expect(actionsRegistry.execute).toHaveBeenCalledTimes(1);
+    expect(actionsRegistry.execute).toHaveBeenCalledWith(
+      'robia.action_items.create_internal_task',
+      orgA,
+      { title: 'Original' },
+    );
+    expect(approved.steps[0].input).toEqual({ title: 'Original' });
+  });
+
+  // ---------------------------------------------------------------------
+  // Secrets never persist
+  // ---------------------------------------------------------------------
+
+  describe('secrets never persist', () => {
+    it('never stores a non-allowlisted (secret-shaped) field from a step input', async () => {
+      const automation = await service.create(
+        orgA,
+        userA,
+        createDto({
+          steps: [
+            {
+              actionType: 'robia.action_items.create_internal_task',
+              input: { title: 'x', token: 'super-secret', apiKey: 'sk-123' },
+            },
+          ],
+        }),
+      );
+      const storedSteps = automation.steps as unknown as Array<{
+        input?: Record<string, unknown>;
+      }>;
+      expect(storedSteps[0].input).toEqual({ title: 'x' });
+
+      const started = await service.triggerManual(orgA, userA, automation.id);
+      const run = await service.getRun(orgA, started.id);
+      expect(run.steps[0].input).toEqual({ title: 'x' });
+      expect(actionsRegistry.execute).toHaveBeenCalledWith(
+        'robia.action_items.create_internal_task',
+        orgA,
+        { title: 'x' },
+      );
+    });
+
+    it('rejects creating a step whose action requires a field that is missing, before persisting anything', async () => {
+      await expect(
+        service.create(
+          orgA,
+          userA,
+          createDto({
+            steps: [
+              {
+                actionType: 'robia.action_items.create_internal_task',
+                input: { token: 'super-secret' },
+              },
+            ],
+          }),
+        ),
+      ).rejects.toBeInstanceOf(AutomationValidationError);
+    });
+
+    it('redacts secret-shaped fields out of an emitted event payload before persisting it', async () => {
+      const automation = await service.create(
+        orgA,
+        userA,
+        createDto({
+          trigger: { type: 'event', eventType: 'audit.completed' },
+        }),
+      );
+      await service.setEnabled(orgA, automation.id, true);
+
+      await service.emitEvent(orgA, 'audit.completed', 'audit-secret', {
+        auditId: 'a1',
+        apiKey: 'sk-super-secret',
+      });
+
+      const events = Array.from(prisma.events.values());
+      expect(events).toHaveLength(1);
+      const payload = events[0].payload as Record<string, unknown>;
+      expect(payload.auditId).toBe('a1');
+      expect(JSON.stringify(payload)).not.toContain('sk-super-secret');
+    });
+  });
+
   // ---------------------------------------------------------------------
   // Idempotency / duplicate event
   // ---------------------------------------------------------------------
@@ -832,6 +1122,55 @@ describe('AutomationsService', () => {
       );
       expect(runs).toHaveLength(1);
       expect(runs[0].automationId).toBe(matching.id);
+    });
+
+    it('gives each of several automations matching the same event its own run, and dedupes each independently on re-emission', async () => {
+      const first = await service.create(
+        orgA,
+        userA,
+        createDto({ trigger: { type: 'event', eventType: 'audit.completed' } }),
+      );
+      const second = await service.create(
+        orgA,
+        userA,
+        createDto({
+          trigger: { type: 'event', eventType: 'audit.completed' },
+          steps: [
+            {
+              actionType: 'robia.report.prepare_organization_summary',
+              input: {},
+            },
+          ],
+        }),
+      );
+
+      const firstEmission = await service.emitEvent(
+        orgA,
+        'audit.completed',
+        'audit-multi',
+        {},
+      );
+      expect(firstEmission.runs).toHaveLength(2);
+      expect(new Set(firstEmission.runs.map((r) => r.automationId))).toEqual(
+        new Set([first.id, second.id]),
+      );
+      // Distinct runs, not the same row returned twice.
+      expect(firstEmission.runs[0].id).not.toBe(firstEmission.runs[1].id);
+
+      const secondEmission = await service.emitEvent(
+        orgA,
+        'audit.completed',
+        'audit-multi',
+        {},
+      );
+      expect(secondEmission.runs.map((r) => r.id).sort()).toEqual(
+        firstEmission.runs.map((r) => r.id).sort(),
+      );
+
+      expect(await service.listRuns(orgA, first.id)).toHaveLength(1);
+      expect(await service.listRuns(orgA, second.id)).toHaveLength(1);
+      // Once each, despite 2 emissions of the same event.
+      expect(actionsRegistry.execute).toHaveBeenCalledTimes(2);
     });
 
     it('resolves a {{event.<key>}} step input placeholder from the emitted event payload', async () => {

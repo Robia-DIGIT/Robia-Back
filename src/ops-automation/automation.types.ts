@@ -14,7 +14,7 @@ export type AutomationRunWithSteps = Prisma.AutomationRunGetPayload<{
 }>;
 
 export function readStoredSteps(
-  value: Prisma.JsonValue,
+  value: Prisma.JsonValue | null | undefined,
 ): StoredAutomationStep[] {
   if (!Array.isArray(value)) {
     return [];

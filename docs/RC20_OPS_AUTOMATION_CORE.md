@@ -13,6 +13,15 @@ n'agit sur un service externe. Le scheduler est préparé dans le modèle de
 données (`AutomationTrigger.type === 'scheduled'`) mais **rien ne
 l'exécute encore** — voir « Ce qui n'est pas fait » plus bas.
 
+> **Round 2 (revue Codex).** Codex a identifié 5 problèmes bloquants sur la
+> première version de ce PR : `dedupKey` d'événement non scopé par
+> automation, approbation non liée à un plan d'exécution immuable,
+> transition approve/reject non atomique, garantie « un seul run actif »
+> non imposée en base, et champs non allowlistés persistables dans les
+> inputs de step / payloads d'événement. Les cinq sont corrigés — voir les
+> sections « Modèle d'idempotence », « Garde-fous » et « Tests »
+> ci-dessous, qui reflètent l'état corrigé.
+
 ## Architecture
 
 ```
@@ -33,7 +42,9 @@ event`, `cronExpression?`, `eventType?`).
 - **`AutomationRun`** — une exécution : `status`, `triggerType`,
   `dedupKey` (unique par organisation), `sourceEventId`, champs
   d'approbation, `context` (snapshot des conditions évaluées, redacted),
-  `errorMessage` (redacted).
+  `plannedSteps` (snapshot immuable des steps — action + input canonique —
+  figé au déclenchement, voir « Modèle d'idempotence »), `errorMessage`
+  (redacted).
 - **`AutomationStepRun`** — un step exécuté : `sequence`, `actionType`,
   `input` (résolu), `status`, `evidence` (redacted), `error` (redacted),
   timestamps.
@@ -100,11 +111,14 @@ Deux niveaux, tous deux imposés par une contrainte unique en base
    ligne n'est créée.
 2. **Run** — `AutomationRun` est unique par `(organizationId,
 dedupKey)`. Pour un déclenchement événementiel, `dedupKey =
-event:<eventId>` — donc le même événement ne peut jamais produire
-   deux runs pour la même automation, même si `emitEvent()` est rappelé
-   plusieurs fois. Pour un déclenchement manuel, `dedupKey` est un UUID
-   frais à chaque appel : un clic manuel est une action volontaire et
-   distincte, jamais un doublon à dédupliquer.
+automation:<automationId>:event:<eventId>` — scopé par automation, pas
+   seulement par événement : si plusieurs automations correspondent au même
+   événement, chacune obtient son propre run indépendamment dédupliqué,
+   au lieu qu'une seconde automation ne « récupère » par erreur le run de
+   la première (bug identifié en revue Codex, corrigé). Pour un
+   déclenchement manuel, `dedupKey` est un UUID frais à chaque appel : un
+   clic manuel est une action volontaire et distincte, jamais un doublon à
+   dédupliquer.
 
 `AutomationsService.startRun()` vérifie d'abord l'existence d'un run pour
 ce `dedupKey` **avant** toute autre logique (avant même de vérifier si
@@ -113,6 +127,71 @@ déjà décidé, jamais un nouveau résultat. Une course (deux requêtes
 concurrentes avec le même `dedupKey`) est absorbée en récupérant la ligne
 créée par l'autre requête après une violation de contrainte unique
 (`P2002`), jamais par un verrou applicatif.
+
+### Snapshot immuable du plan d'exécution
+
+`startRun()` fige, au moment du déclenchement, un `plannedSteps` :
+chaque step avec son `actionType` et son input **canonique** (voir
+« Entrées canoniques allowlistées » ci-dessous), calculé une seule fois et
+stocké sur le run lui-même. `executeSteps()` exécute **toujours**
+`run.plannedSteps` — jamais `automation.steps` — donc éditer une
+automation pendant qu'un de ses runs attend une approbation (`waiting_
+approval`) ne change jamais ce que l'approbateur exécute réellement en
+cliquant « approuver ». C'est la correction du deuxième problème bloquant
+identifié en revue Codex : avant ce correctif, `approveRun()` relisait
+l'automation courante (potentiellement déjà modifiée), rompant le lien
+entre ce qui avait été revu et ce qui s'exécutait.
+
+### Transitions approve/reject atomiques
+
+`approveRun()`/`rejectRun()` ne font plus un `read` puis un `update`
+inconditionnel (une course entre deux appels concurrents pouvait upstream
+faire exécuter deux fois les mêmes steps, ou exécuter un run pourtant déjà
+rejeté). La transition réelle est un `updateMany` conditionnel — `WHERE
+status = 'waiting_approval' AND approvalStatus = 'pending'` — dont le
+résultat (`count`) dit si CET appel a gagné la course ; en Postgres, deux
+`UPDATE` concurrents sur la même ligne se sérialisent, donc au plus un des
+deux peut jamais matcher. Le `getRun()` initial ne sert plus qu'au
+contrôle d'accès organisation et au message d'erreur ; il ne décide plus
+rien.
+
+### Un seul run actif — imposé en base, pas seulement vérifié en amont
+
+Un index unique partiel (`automation_runs_one_active_per_automation`, voir
+la migration `20260914175102_rc20_snapshot_and_concurrency_guards`) sur
+`automation_runs(automation_id) WHERE status IN ('queued', 'running',
+'waiting_approval')` empêche physiquement deux runs actifs simultanés pour
+la même automation — y compris sous deux déclenchements manuels vraiment
+concurrents (deux `dedupKey` différents, donc le dédup par `dedupKey` seul
+ne les aurait pas arrêtés). Le `findFirst` dans `startRun()` reste un
+échec rapide et convivial (message clair sans attendre une violation de
+contrainte), mais la garantie réelle est cet index : `persistRun()`
+distingue un `P2002` dû au `dedupKey` (course d'idempotence, ligne
+existante renvoyée) d'un `P2002` dû à cet index (`AutomationRunConflictError`).
+
+### Entrées canoniques allowlistées
+
+Chaque action du registre déclare son propre `inputSchema` — la liste
+exhaustive des clés qu'elle lit jamais rien d'autre. `OpsActionsRegistryService.
+canonicalizeInput(actionType, input)` valide les champs requis puis
+retourne un **nouvel objet** ne contenant que ces clés : tout champ
+supplémentaire (un `token`/`apiKey` collé au mauvais endroit, un flag de
+debug oublié) est éliminé, jamais copié. `AutomationsService` appelle ce
+choke point à deux moments :
+
+1. À la création/modification d'une automation (`validateSteps()`) — donc
+   `Automation.steps` en base ne peut déjà contenir que les clés
+   allowlistées, quel que soit ce que le client a envoyé.
+2. Au déclenchement (`startRun()`, au moment de figer `plannedSteps`) — une
+   seconde passe, défensive, avant que quoi que ce soit ne soit persisté
+   dans `AutomationRun.plannedSteps` ou exécuté.
+
+Le payload d'un `AutomationEvent` (fourni par l'émetteur de l'événement,
+pas par l'utilisateur qui définit l'automation) passe par
+`redactSensitive()` (RC-15) avant d'être écrit — même garantie que pour
+`context`/`evidence`/`errorMessage`, appliquée ici pour la première fois
+à ce nouveau point d'entrée (corrige le cinquième problème bloquant
+identifié en revue Codex).
 
 ## Garde-fous
 
@@ -124,11 +203,14 @@ créée par l'autre requête après une violation de contrainte unique
 | Cross-tenant            | Chaque requête Prisma filtre par `organizationId` ; `findOne`/`getRun` renvoient `NotFoundException` (jamais `Forbidden`, pour ne pas révéler l'existence d'une ressource d'une autre organisation)                                         |
 | Fuite de secret         | `redactSensitive()` (RC-15) appliqué à `context`, `evidence`, `error`, `errorMessage` avant toute écriture en base                                                                                                                          |
 | Erreurs                 | Le filtre global (`AllExceptionsFilter`) redacte déjà toute erreur 5xx ; en plus, RC-20 ne persiste jamais un message d'erreur brut (toujours passé par `redactSensitive`)                                                                  |
-| Concurrence             | Un seul run actif (`queued`/`running`/`waiting_approval`) par automation à la fois — `AutomationRunConflictError` sinon                                                                                                                     |
+| Concurrence             | Un seul run actif (`queued`/`running`/`waiting_approval`) par automation à la fois, **imposé par un index unique partiel en base** (`automation_runs_one_active_per_automation`) — pas seulement un pré-contrôle applicatif — `AutomationRunConflictError` sinon |
 | Boucle d'automatisation | `MAX_TRIGGER_DEPTH` (3) sur le paramètre interne `triggerDepth` de `startRun()` — non atteignable aujourd'hui (aucune action n'émet encore d'événement), mais posé pour ne jamais permettre une chaîne de déclenchement qui s'auto-alimente |
 | Nombre de steps         | `MAX_STEPS_PER_AUTOMATION` (20), vérifié à la création **et** à l'exécution (défense en profondeur)                                                                                                                                         |
 | Action arbitraire       | Voir « Catalogue d'actions autorisées » — toute chaîne non enregistrée est rejetée à la création (`AutomationValidationError`) et, en défense en profondeur, à l'exécution                                                                  |
+| Entrée de step non allowlistée | `canonicalizeInput()` — voir « Entrées canoniques allowlistées » — ne laisse jamais un champ hors schéma atteindre le stockage ou l'exécution                                                                                       |
 | Condition dynamique     | Aucun `eval`/`Function` — voir `condition-engine.ts`                                                                                                                                                                                        |
+| Approbation liée à un plan figé | `plannedSteps` — voir « Snapshot immuable du plan d'exécution » — un edit après déclenchement ne change jamais ce qu'exécute une approbation                                                                                        |
+| Transition approve/reject | `updateMany` conditionnel (compare-and-swap) — voir « Transitions approve/reject atomiques » — jamais un `read` puis `update` inconditionnel                                                                                             |
 
 ### RBAC — état actuel
 
@@ -187,6 +269,10 @@ simple entrée de configuration.
 | Une automation en boucle sature le système                                                       | `MAX_TRIGGER_DEPTH`, `MAX_STEPS_PER_AUTOMATION`, un seul run actif par automation                                                                                                          |
 | Une action non approuvée s'exécute quand même                                                    | `requiresApproval: true` bloque la création de tout `AutomationStepRun` tant que `approveRun()` n'a pas été appelé ; `rejectRun()` marque `cancelled` sans jamais appeler `executeSteps()` |
 | Une automation désactivée s'exécute quand même                                                   | `startRun()` vérifie `automation.enabled` avant toute évaluation de conditions et avant tout step                                                                                          |
+| Deux automations partagent par erreur le run d'un même événement (une automation « vole » le résultat d'une autre) | `dedupKey` d'un run déclenché par événement inclut `automationId` — chaque automation obtient son propre run, dédupliqué indépendamment                                                   |
+| Une automation est modifiée pendant qu'un run attend une approbation, et l'approbateur exécute sans le savoir des actions différentes de celles revues | `plannedSteps` fige le plan (action + input canonique) au déclenchement ; `executeSteps()` n'exécute jamais que ce snapshot                                                                |
+| Deux requêtes concurrentes (approve+approve, approve+reject) exécutent deux fois les mêmes steps, ou exécutent un run déjà rejeté | Transition `updateMany` conditionnelle (compare-and-swap) — une seule des deux peut jamais matcher la ligne                                                                                |
+| Un champ hors-schéma (secret collé au mauvais endroit) est stocké dans un input de step ou un payload d'événement | `canonicalizeInput()` (steps) et `redactSensitive()` (payload d'événement) avant toute persistance                                                                                         |
 
 ## Ce qui n'est pas fait dans RC20
 
@@ -243,18 +329,32 @@ chargera.
 
 ## Tests
 
-- `condition-engine.spec.ts` — validation et évaluation (20 tests).
-- `actions/ops-actions-registry.service.spec.ts` — chaque action + rejet
-  des actions non allowlistées (16 tests).
+- `condition-engine.spec.ts` — validation et évaluation, y compris le
+  typage des éléments d'un tableau `in`/`notIn` (22 tests).
+- `actions/ops-actions-registry.service.spec.ts` — chaque action, rejet
+  des actions non allowlistées, et `canonicalizeInput()` (strip d'un
+  champ hors schéma, action sans champ requis, action non allowlistée,
+  placeholder templaté jamais rejeté) (21 tests).
 - `automation-templating.spec.ts` — résolution `{{event.*}}` (7 tests).
 - `automations.service.spec.ts` — isolation organisation, accès non
-  autorisé, conditions vrai/faux, idempotence (événement dupliqué),
-  automation désactivée, échec de step, cycle d'approbation complet
+  autorisé, conditions vrai/faux, idempotence (événement dupliqué **et**
+  plusieurs automations sur le même événement, chacune avec son propre
+  run), automation désactivée, échec de step, cycle d'approbation complet
   (attente / approbation / rejet / aucune exécution après rejet),
-  concurrence, boucle interdite, redaction des secrets, historique
-  append-only (26 tests).
+  concurrence (un seul run actif y compris sous deux déclenchements
+  manuels réellement concurrents via `Promise.allSettled`), transitions
+  approve/reject atomiques (approve+reject concurrents, deux approve
+  concurrents — un seul gagne, jamais une double exécution), snapshot de
+  plan immuable (edit après déclenchement, l'approbation exécute
+  l'original), boucle interdite, secrets jamais persistés (input de step,
+  payload d'événement), historique append-only (35 tests).
 - `examples/automation-examples.spec.ts` — les 3 exemples restent valides
   contre le moteur réel (7 tests).
+
+Chaque test de concurrence a été vérifié comme réellement discriminant en
+retirant temporairement le correctif correspondant et en confirmant que le
+test échoue alors de la façon attendue (double exécution / double run actif),
+avant de restaurer le correctif.
 
 **NO MERGE. NO DEPLOY.** En attente de revue Codex puis d'autorisation
 explicite Romeo/Landry.

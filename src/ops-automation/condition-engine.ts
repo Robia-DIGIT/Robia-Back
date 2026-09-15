@@ -172,6 +172,11 @@ export function validateConditionTree(node: ConditionNode, depth = 0): void {
           `Operator "${node.operator}" requires a non-empty array value.`,
         );
       }
+      if (node.value.some((item) => typeof item !== descriptor.type)) {
+        throw new InvalidConditionError(
+          `Operator "${node.operator}" on field "${node.field}" requires every array element to be a ${descriptor.type}.`,
+        );
+      }
     } else if (node.operator !== 'exists' && node.operator !== 'notExists') {
       if (
         node.value === undefined ||
