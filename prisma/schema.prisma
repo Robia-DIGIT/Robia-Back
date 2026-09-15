@@ -443,7 +443,13 @@ model AutomationEvent {
 
   runs AutomationRun[]
 
-  @@unique([organizationId, eventKey])
+  // Scoped by eventType, not just eventKey: an eventKey is only guaranteed
+  // unique within its own event type (e.g. an audit id and an unrelated
+  // integration id could coincidentally collide as strings). Without this,
+  // reusing the same eventKey for a different eventType would silently
+  // return the wrong row — the wrong payload — to whatever automations
+  // match the new type (see AutomationsService.getOrCreateEvent()).
+  @@unique([organizationId, eventType, eventKey])
   @@index([organizationId, eventType, createdAt])
   @@map("automation_events")
 }

@@ -363,8 +363,18 @@ export class AutomationsService {
     eventKey: string,
     payload?: Record<string, unknown>,
   ) {
+    // Scoped by (organizationId, eventType, eventKey) — never just eventKey:
+    // an eventKey is only meant to be unique within its own type, so this
+    // never returns a different event type's row (and its payload) for a
+    // reused key.
     const existing = await this.prisma.automationEvent.findUnique({
-      where: { organizationId_eventKey: { organizationId, eventKey } },
+      where: {
+        organizationId_eventType_eventKey: {
+          organizationId,
+          eventType,
+          eventKey,
+        },
+      },
     });
     if (existing) {
       return existing;
@@ -389,7 +399,13 @@ export class AutomationsService {
         error.code === 'P2002'
       ) {
         const raced = await this.prisma.automationEvent.findUnique({
-          where: { organizationId_eventKey: { organizationId, eventKey } },
+          where: {
+            organizationId_eventType_eventKey: {
+              organizationId,
+              eventType,
+              eventKey,
+            },
+          },
         });
         if (raced) return raced;
       }
@@ -450,19 +466,72 @@ export class AutomationsService {
       throw new AutomationTooManyStepsError(MAX_STEPS_PER_AUTOMATION);
     }
 
+    // A {{event.<key>}} placeholder is resolved HERE, once, against the
+    // triggering event's own already-persisted (redacted) payload — never
+    // deferred to execution time. That is what makes plannedSteps a true
+    // WYSIWYG plan: an approver reading `waiting_approval.plannedSteps` sees
+    // the literal value ("audit-123") that will run, not a template string
+    // ("{{event.auditId}}") that only resolves later. A manual/scheduled run
+    // has no source event, so eventPayload stays null and any such
+    // placeholder resolves to null, same as before.
+    const sourceEvent = opts.sourceEventId
+      ? await this.prisma.automationEvent.findUnique({
+          where: { id: opts.sourceEventId },
+        })
+      : null;
+    const eventPayload =
+      (sourceEvent?.payload as Record<string, unknown> | null) ?? null;
+
     // Freeze the execution plan now, at trigger time: canonical (allowlisted
-    // keys only) action inputs, snapshotted before anything about the
-    // automation can change underneath this run. executeSteps() runs this
-    // snapshot — never the automation's live `steps` — so an edit made while
-    // a run sits at `waiting_approval` can never change what an approver's
-    // click actually executes.
-    const plannedSteps: StoredAutomationStep[] = rawSteps.map((step) => ({
-      actionType: step.actionType,
-      input: this.actionsRegistry.canonicalizeInput(
-        step.actionType,
-        step.input,
-      ),
-    }));
+    // keys only), fully resolved action inputs, snapshotted before anything
+    // about the automation can change underneath this run. executeSteps()
+    // runs this snapshot verbatim — never the automation's live `steps`, and
+    // never re-resolved — so an edit made while a run sits at
+    // `waiting_approval` can never change what an approver's click actually
+    // executes, and the plan an approver reads is exactly the plan that runs.
+    let plannedSteps: StoredAutomationStep[];
+    try {
+      plannedSteps = rawSteps.map((step) => {
+        const canonicalInput = this.actionsRegistry.canonicalizeInput(
+          step.actionType,
+          step.input,
+        );
+        const resolvedInput = resolveStepInput(canonicalInput, eventPayload);
+        return {
+          actionType: step.actionType,
+          // resolveStepInput only ever replaces an existing key's own value
+          // (see automation-templating.ts) so this can't introduce a new
+          // key — re-canonicalizing here is a second, defensive pass, the
+          // same way canonicalizeInput is called twice elsewhere in this
+          // file, and it is what actually surfaces a placeholder that
+          // resolved to null (a missing/absent event field) as a clean,
+          // expected failure rather than a silently wrong stored value.
+          input: this.actionsRegistry.canonicalizeInput(
+            step.actionType,
+            resolvedInput,
+          ),
+        };
+      });
+    } catch (error) {
+      if (
+        error instanceof InvalidOpsActionInputError ||
+        error instanceof UnknownOpsActionError
+      ) {
+        // A {{event.*}} placeholder that resolved to null/absent — e.g. this
+        // automation was triggered manually or by schedule but its steps
+        // expect an event payload that doesn't exist. This is the same
+        // "action's own input validation rejects it as a missing value"
+        // outcome automation-templating.ts already documents, just caught
+        // before a run is ever created rather than mid-execution.
+        return this.persistRun(automation, opts, {
+          status: 'failed',
+          errorMessage: redactSensitive(error.message) as string,
+          startedAt: new Date(),
+          finishedAt: new Date(),
+        });
+      }
+      throw error;
+    }
     const plannedStepsJson = plannedSteps as unknown as Prisma.InputJsonValue;
 
     const context = await this.context.build(automation.organizationId);
@@ -573,23 +642,16 @@ export class AutomationsService {
       );
     }
 
-    // RC-20: a step's input may reference the triggering event's payload
-    // via a literal "{{event.<key>}}" placeholder (see
-    // automation-templating.ts) — fetched once, up front, rather than per
-    // step. A manual/scheduled run has no source event, so eventPayload
-    // stays null and any such placeholder simply resolves to null.
-    const sourceEvent = run.sourceEventId
-      ? await this.prisma.automationEvent.findUnique({
-          where: { id: run.sourceEventId },
-        })
-      : null;
-    const eventPayload =
-      (sourceEvent?.payload as Record<string, unknown> | null) ?? null;
-
+    // Never re-resolve a {{event.<key>}} placeholder here: startRun() already
+    // resolved every step's input against the triggering event's payload
+    // before persisting plannedSteps, precisely so that what an approver
+    // reads on a waiting_approval run IS the value that executes — re-doing
+    // the resolution at this point would defeat that guarantee. This is the
+    // final, already-canonical, already-resolved input, used verbatim.
     let sequence = 0;
     for (const step of steps) {
       sequence += 1;
-      const resolvedInput = resolveStepInput(step.input, eventPayload);
+      const resolvedInput = step.input;
 
       if (!this.actionsRegistry.isAllowed(step.actionType)) {
         await this.prisma.automationStepRun.create({

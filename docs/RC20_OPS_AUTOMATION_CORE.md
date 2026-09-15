@@ -21,6 +21,18 @@ l'exécute encore** — voir « Ce qui n'est pas fait » plus bas.
 > inputs de step / payloads d'événement. Les cinq sont corrigés — voir les
 > sections « Modèle d'idempotence », « Garde-fous » et « Tests »
 > ci-dessous, qui reflètent l'état corrigé.
+>
+> **Round 3 (re-revue Codex).** Deux problèmes bloquants supplémentaires,
+> découverts après le round 2 : (1) `plannedSteps` était figé **avant**
+> résolution des `{{event.<key>}}`, donc un approbateur voyait le
+> placeholder brut plutôt que la valeur réellement exécutée ; (2)
+> `AutomationEvent` était unique sur `(organizationId, eventKey)` seul —
+> réutiliser la même `eventKey` sous un `eventType` différent pouvait
+> renvoyer silencieusement le mauvais événement (et son payload) à une
+> automation qui n'avait rien à voir. Les deux sont corrigés : la résolution
+> des templates se fait maintenant au déclenchement (le plan stocké est déjà
+> la valeur finale), et l'unicité de `AutomationEvent` est désormais scopée
+> par `(organizationId, eventType, eventKey)`.
 
 ## Architecture
 
@@ -106,9 +118,15 @@ Deux niveaux, tous deux imposés par une contrainte unique en base
 (`@@unique`), jamais seulement en mémoire :
 
 1. **Événement** — `AutomationEvent` est unique par
-   `(organizationId, eventKey)`. Émettre le même événement deux fois
-   (même `eventKey`) renvoie la ligne déjà existante ; aucune deuxième
-   ligne n'est créée.
+   `(organizationId, eventType, eventKey)` — scopé par type, pas seulement
+   par clé : une `eventKey` n'est garantie unique qu'au sein de son propre
+   `eventType` (deux types d'événements différents peuvent coïncidentellement
+   utiliser la même chaîne de clé). Réutiliser la même `eventKey` sous un
+   `eventType` différent crée donc une **nouvelle** ligne au lieu de
+   renvoyer par erreur celle d'un autre type avec son payload (bug identifié
+   en re-revue Codex, corrigé). Émettre le même événement deux fois (même
+   `eventType` **et** même `eventKey`) renvoie la ligne déjà existante ;
+   aucune deuxième ligne n'est créée.
 2. **Run** — `AutomationRun` est unique par `(organizationId,
 dedupKey)`. Pour un déclenchement événementiel, `dedupKey =
 automation:<automationId>:event:<eventId>` — scopé par automation, pas
@@ -131,16 +149,31 @@ créée par l'autre requête après une violation de contrainte unique
 ### Snapshot immuable du plan d'exécution
 
 `startRun()` fige, au moment du déclenchement, un `plannedSteps` :
-chaque step avec son `actionType` et son input **canonique** (voir
-« Entrées canoniques allowlistées » ci-dessous), calculé une seule fois et
-stocké sur le run lui-même. `executeSteps()` exécute **toujours**
-`run.plannedSteps` — jamais `automation.steps` — donc éditer une
-automation pendant qu'un de ses runs attend une approbation (`waiting_
-approval`) ne change jamais ce que l'approbateur exécute réellement en
-cliquant « approuver ». C'est la correction du deuxième problème bloquant
-identifié en revue Codex : avant ce correctif, `approveRun()` relisait
-l'automation courante (potentiellement déjà modifiée), rompant le lien
-entre ce qui avait été revu et ce qui s'exécutait.
+chaque step avec son `actionType` et son input **canonique, déjà résolu**
+(voir « Entrées canoniques allowlistées » ci-dessous), calculé une seule
+fois et stocké sur le run lui-même. `executeSteps()` exécute **toujours**
+`run.plannedSteps` tel quel — jamais `automation.steps`, et sans jamais
+re-résoudre quoi que ce soit — donc éditer une automation pendant qu'un de
+ses runs attend une approbation (`waiting_approval`) ne change jamais ce
+que l'approbateur exécute réellement en cliquant « approuver ». C'est la
+correction du deuxième problème bloquant identifié en revue Codex : avant
+ce correctif, `approveRun()` relisait l'automation courante (potentiellement
+déjà modifiée), rompant le lien entre ce qui avait été revu et ce qui
+s'exécutait.
+
+Un point capital, corrigé en re-revue Codex : la résolution d'un
+placeholder `{{event.<key>}}` (voir `automation-templating.ts`) se fait
+**au déclenchement**, contre le payload déjà persisté (et redacted) de
+l'événement — pas à l'exécution. `plannedSteps` contient donc la **valeur
+littérale finale** (`"audit-123"`), jamais le template brut
+(`"{{event.auditId}}"`). Sans ça, un `waiting_approval.plannedSteps`
+affichait le placeholder non résolu : l'approbateur voyait un plan
+« immuable » qui ne révélait pourtant pas la valeur réelle qui allait
+s'exécuter — la structure était figée, mais pas la valeur visible. Si la
+résolution échoue (placeholder sans valeur disponible — typiquement une
+automation déclenchée manuellement alors que ses steps attendent un
+événement), le run passe directement à `failed` avec un message clair,
+sans jamais créer de step ni appeler `executeSteps()`.
 
 ### Transitions approve/reject atomiques
 
@@ -273,6 +306,8 @@ simple entrée de configuration.
 | Une automation est modifiée pendant qu'un run attend une approbation, et l'approbateur exécute sans le savoir des actions différentes de celles revues | `plannedSteps` fige le plan (action + input canonique) au déclenchement ; `executeSteps()` n'exécute jamais que ce snapshot                                                                |
 | Deux requêtes concurrentes (approve+approve, approve+reject) exécutent deux fois les mêmes steps, ou exécutent un run déjà rejeté | Transition `updateMany` conditionnelle (compare-and-swap) — une seule des deux peut jamais matcher la ligne                                                                                |
 | Un champ hors-schéma (secret collé au mauvais endroit) est stocké dans un input de step ou un payload d'événement | `canonicalizeInput()` (steps) et `redactSensitive()` (payload d'événement) avant toute persistance                                                                                         |
+| Un approbateur voit un placeholder `{{event.*}}` non résolu au lieu de la valeur réelle qui va s'exécuter | Résolution au déclenchement (pas à l'exécution) contre le payload déjà persisté de l'événement ; `plannedSteps` stocke la valeur finale, jamais le template                              |
+| Réutiliser la même `eventKey` sous un `eventType` différent déclenche des automations d'un type avec le payload d'un autre type | `AutomationEvent` unique sur `(organizationId, eventType, eventKey)`, pas seulement `eventKey`                                                                                            |
 
 ## Ce qui n'est pas fait dans RC20
 
@@ -346,8 +381,13 @@ chargera.
   approve/reject atomiques (approve+reject concurrents, deux approve
   concurrents — un seul gagne, jamais une double exécution), snapshot de
   plan immuable (edit après déclenchement, l'approbation exécute
-  l'original), boucle interdite, secrets jamais persistés (input de step,
-  payload d'événement), historique append-only (35 tests).
+  l'original), valeur `{{event.*}}` résolue — pas le placeholder brut —
+  visible dans `plannedSteps` avant approbation, échec propre d'un
+  placeholder non résolvable (déclenchement manuel sans événement source),
+  collision `eventKey` entre deux `eventType` différents (chaque type
+  garde son propre événement et son propre payload), boucle interdite,
+  secrets jamais persistés (input de step, payload d'événement),
+  historique append-only (38 tests).
 - `examples/automation-examples.spec.ts` — les 3 exemples restent valides
   contre le moteur réel (7 tests).
 

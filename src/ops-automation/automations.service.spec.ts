@@ -407,26 +407,38 @@ class FakePrisma {
       where,
     }: {
       where: {
-        organizationId_eventKey?: { organizationId: string; eventKey: string };
+        organizationId_eventType_eventKey?: {
+          organizationId: string;
+          eventType: string;
+          eventKey: string;
+        };
         id?: string;
       };
     }) => {
       if (where.id !== undefined) {
         return this.events.get(where.id) ?? null;
       }
-      if (!where.organizationId_eventKey) return null;
-      const { organizationId, eventKey } = where.organizationId_eventKey;
+      if (!where.organizationId_eventType_eventKey) return null;
+      const { organizationId, eventType, eventKey } =
+        where.organizationId_eventType_eventKey;
       return (
         Array.from(this.events.values()).find(
-          (e) => e.organizationId === organizationId && e.eventKey === eventKey,
+          (e) =>
+            e.organizationId === organizationId &&
+            e.eventType === eventType &&
+            e.eventKey === eventKey,
         ) ?? null
       );
     },
     create: ({ data }: { data: Record<string, unknown> }) => {
       const organizationId = data.organizationId as string;
+      const eventType = data.eventType as string;
       const eventKey = data.eventKey as string;
       const clash = Array.from(this.events.values()).find(
-        (e) => e.organizationId === organizationId && e.eventKey === eventKey,
+        (e) =>
+          e.organizationId === organizationId &&
+          e.eventType === eventType &&
+          e.eventKey === eventKey,
       );
       if (clash) {
         throw new Prisma.PrismaClientKnownRequestError(
@@ -1204,6 +1216,134 @@ describe('AutomationsService', () => {
         { auditId: 'audit-real-id' },
       );
       expect(runs[0].steps[0].input).toEqual({ auditId: 'audit-real-id' });
+    });
+
+    it('shows the resolved {{event.<key>}} value — not the raw placeholder — in plannedSteps before approval, and executes exactly that value', async () => {
+      await service.create(
+        orgA,
+        userA,
+        createDto({
+          trigger: { type: 'event', eventType: 'audit.completed' },
+          requiresApproval: true,
+          steps: [
+            {
+              actionType: 'robia.opportunities.regenerate',
+              input: { auditId: '{{event.auditId}}' },
+            },
+          ],
+        }),
+      );
+
+      const { runs } = await service.emitEvent(
+        orgA,
+        'audit.completed',
+        'audit-approval-1',
+        { auditId: 'audit-123' },
+      );
+
+      const run = runs[0];
+      expect(run.status).toBe('waiting_approval');
+      // The plan visible to an approver already holds the real value, not
+      // the template string — this is the whole point of resolving at
+      // trigger time instead of at execution time.
+      const plannedSteps = run.plannedSteps as unknown as Array<{
+        actionType: string;
+        input: Record<string, unknown>;
+      }>;
+      expect(plannedSteps[0].input).toEqual({ auditId: 'audit-123' });
+      expect(actionsRegistry.execute).not.toHaveBeenCalled();
+
+      const approved = await service.approveRun(orgA, 'approver-1', run.id);
+      expect(approved.status).toBe('succeeded');
+      expect(actionsRegistry.execute).toHaveBeenCalledWith(
+        'robia.opportunities.regenerate',
+        orgA,
+        { auditId: 'audit-123' },
+      );
+      expect(approved.steps[0].input).toEqual({ auditId: 'audit-123' });
+    });
+
+    it("fails the run cleanly, without executing any step, when a manual trigger cannot resolve a step's {{event.<key>}} placeholder", async () => {
+      const automation = await service.create(
+        orgA,
+        userA,
+        createDto({
+          steps: [
+            {
+              actionType: 'robia.opportunities.regenerate',
+              input: { auditId: '{{event.auditId}}' },
+            },
+          ],
+        }),
+      );
+
+      // Triggered manually — no source event, so the placeholder has
+      // nothing to resolve against.
+      const run = await service.triggerManual(orgA, userA, automation.id);
+      expect(run.status).toBe('failed');
+      expect(run.errorMessage).toMatch(/auditId/);
+      expect(actionsRegistry.execute).not.toHaveBeenCalled();
+    });
+
+    it('never lets a reused eventKey under a different eventType return the wrong event (and its payload) to a matching automation', async () => {
+      const auditAutomation = await service.create(
+        orgA,
+        userA,
+        createDto({
+          trigger: { type: 'event', eventType: 'audit.completed' },
+          steps: [
+            {
+              actionType: 'robia.opportunities.regenerate',
+              input: { auditId: '{{event.auditId}}' },
+            },
+          ],
+        }),
+      );
+      const integrationAutomation = await service.create(
+        orgA,
+        userA,
+        createDto({
+          trigger: { type: 'event', eventType: 'integration.disconnected' },
+          steps: [
+            {
+              actionType: 'robia.action_items.create_internal_task',
+              input: { title: '{{event.provider}}' },
+            },
+          ],
+        }),
+      );
+
+      const sameKey = 'shared-key-1';
+      const auditEmission = await service.emitEvent(
+        orgA,
+        'audit.completed',
+        sameKey,
+        { auditId: 'audit-real' },
+      );
+      const integrationEmission = await service.emitEvent(
+        orgA,
+        'integration.disconnected',
+        sameKey,
+        { provider: 'google-search-console' },
+      );
+
+      // Two distinct AutomationEvent rows, not one reused across types.
+      expect(auditEmission.event.id).not.toBe(integrationEmission.event.id);
+
+      expect(auditEmission.runs).toHaveLength(1);
+      expect(auditEmission.runs[0].automationId).toBe(auditAutomation.id);
+      expect(auditEmission.runs[0].steps[0].input).toEqual({
+        auditId: 'audit-real',
+      });
+
+      expect(integrationEmission.runs).toHaveLength(1);
+      expect(integrationEmission.runs[0].automationId).toBe(
+        integrationAutomation.id,
+      );
+      // Must carry ITS OWN payload — never the audit event's payload.
+      expect(integrationEmission.runs[0].steps[0].input).toEqual({
+        title: 'google-search-console',
+      });
     });
   });
 
