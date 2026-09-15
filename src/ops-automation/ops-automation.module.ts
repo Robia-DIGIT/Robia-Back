@@ -5,6 +5,7 @@ import { AutomationsController } from './automations.controller';
 import { AutomationsService } from './automations.service';
 import { AutomationContextService } from './automation-context.service';
 import { OpsActionsRegistryService } from './actions/ops-actions-registry.service';
+import { AuditCompletedEventListener } from './audit-completed-event.listener';
 
 @Module({
   imports: [AuditsModule, OpportunitiesModule],
@@ -13,6 +14,7 @@ import { OpsActionsRegistryService } from './actions/ops-actions-registry.servic
     AutomationsService,
     AutomationContextService,
     OpsActionsRegistryService,
+    AuditCompletedEventListener,
   ],
   exports: [AutomationsService, OpsActionsRegistryService],
 })

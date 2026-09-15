@@ -683,6 +683,29 @@ describe('AutomationsService', () => {
         service.approveRun(orgB, 'user-b', run.id),
       ).rejects.toBeInstanceOf(NotFoundException);
     });
+
+    // RC-23: audit.completed is the first real caller of emitEvent() —
+    // proves the pre-existing organizationId scoping actually holds for
+    // this exact event, not just in the abstract.
+    it("never triggers org B's audit.completed automation when org A's audit completes", async () => {
+      await service.create(
+        orgB,
+        userA,
+        createDto({
+          name: "Org B — traiter l'audit terminé",
+          trigger: { type: 'event', eventType: 'audit.completed' },
+        }),
+      );
+
+      const { runs } = await service.emitEvent(
+        orgA,
+        'audit.completed',
+        'audit-org-a-1',
+        { auditId: 'audit-org-a-1', websiteId: 'website-a', globalScore: 42 },
+      );
+
+      expect(runs).toHaveLength(0);
+    });
   });
 
   // ---------------------------------------------------------------------
