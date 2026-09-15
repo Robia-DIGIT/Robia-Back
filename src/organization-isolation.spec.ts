@@ -8,7 +8,7 @@ import { DocumentsService } from './documents/documents.service';
 import { OpportunitiesService } from './opportunities/opportunities.service';
 import { OpportunityGeneratorService } from './opportunities/opportunity-generator/opportunity-generator.service';
 import { N8nWebhookService } from './integrations/n8n-webhook.service';
-import { MetaService } from './integrations/meta.service';
+import { IntelligenceRegistryService } from './intelligence/intelligence-registry.service';
 import { PrismaService } from './prisma/prisma.service';
 import { ValidationLogsService } from './validation-logs/validation-logs.service';
 import { WebsitesService } from './websites/websites.service';
@@ -121,7 +121,7 @@ describe('Organization isolation', () => {
       prisma as unknown as PrismaService,
       {} as unknown as OpportunityGeneratorService,
       {} as unknown as N8nWebhookService,
-      {} as unknown as MetaService,
+      {} as unknown as IntelligenceRegistryService,
     );
 
     await expect(

@@ -6,11 +6,8 @@ import {
 } from './opportunity-generator/opportunity-generator.service';
 import { N8nWebhookService } from '../integrations/n8n-webhook.service';
 import { SiteAuditResult } from '../audits/audit-runner/audit-runner.service';
-import { MetaService } from '../integrations/meta.service';
-import {
-  evaluateMetaFindings,
-  MetaFinding,
-} from '../integrations/meta-insights';
+import { IntelligenceRegistryService } from '../intelligence/intelligence-registry.service';
+import { IntelligenceFinding } from '../intelligence/intelligence.types';
 import { Prisma } from '@prisma/client';
 
 // audit.resultJson is untrusted, raw persisted JSON (see AuditsService) — this
@@ -31,19 +28,30 @@ export class OpportunitiesService {
     private readonly prisma: PrismaService,
     private readonly generator: OpportunityGeneratorService,
     private readonly webhooks: N8nWebhookService,
-    private readonly meta: MetaService,
+    private readonly intelligence: IntelligenceRegistryService,
   ) {}
 
-  // RC-19: source_data shape for a Meta-originated opportunity. Deliberately
+  // RC-21: source_data shape for a provider-originated opportunity (any
+  // IntelligenceProvider — Meta today, others in the future). Deliberately
   // separate from buildSourceData()'s SEO-oriented shape (rule_code/severity/
-  // priority_score/affected_urls) rather than overloading it — Meta findings
-  // have a different evidence model and must always self-identify as
-  // `source: 'meta'` / `scoreInfluence: false` so nothing downstream can
-  // mistake them for score-influencing SEO findings.
-  private buildMetaSourceData(finding: MetaFinding) {
+  // priority_score/affected_urls) rather than overloading it — provider
+  // findings have a different evidence model and must always self-identify
+  // so nothing downstream can mistake them for score-influencing SEO
+  // findings. Writes BOTH `provider` (RC-21's canonical field) and `source`
+  // (RC-19's original Meta field, same value) — existing Meta opportunities
+  // persisted before this refactor only have `source`, and isProviderSourceData()
+  // below reads either, so this is purely additive: no already-persisted row
+  // needs to change shape, and no reader needs a migration.
+  //
+  // `confidence` (Codex review): RC-19's MetaFinding carries 'observed' vs
+  // 'heuristic' and the frontend renders a different label for each — RC-21
+  // must keep persisting it, not just the generic provider fields. Omitted
+  // entirely (never defaulted) for a provider/finding that doesn't set it.
+  private buildProviderSourceData(finding: IntelligenceFinding) {
     return {
-      version: 1,
-      source: finding.source,
+      version: 2,
+      provider: finding.provider,
+      source: finding.provider,
       ruleCode: finding.ruleCode,
       confidence: finding.confidence,
       evidence: finding.evidence,
@@ -52,23 +60,10 @@ export class OpportunitiesService {
     } as unknown as Prisma.InputJsonValue;
   }
 
-  // RC-19: MetaService.getInsightSignals() never throws (mirrors
-  // GoogleSearchConsoleService's RC-13 guarantee) and evaluateMetaFindings()
-  // is a pure, exception-free function — so, like AuditsService's GSC
-  // attachment, this call is intentionally not wrapped in an extra
-  // try/catch here: opportunity generation must never fail because a Meta
-  // side-signal read hiccuped.
-  private async evaluateCurrentMetaFindings(
-    organizationId: string,
-  ): Promise<MetaFinding[]> {
-    const signals = await this.meta.getInsightSignals(organizationId);
-    return evaluateMetaFindings(signals, this.meta.getInsightsThresholds());
-  }
-
-  private buildMetaOpportunityData(
+  private buildProviderOpportunityData(
     organizationId: string,
     auditId: string,
-    finding: MetaFinding,
+    finding: IntelligenceFinding,
   ) {
     return {
       organizationId,
@@ -79,60 +74,88 @@ export class OpportunitiesService {
       impactScore: finding.impactScore,
       effortScore: finding.effortScore,
       confidenceScore: finding.confidenceScore,
-      sourceData: this.buildMetaSourceData(finding),
+      sourceData: this.buildProviderSourceData(finding),
       status: 'open' as const,
     };
   }
 
-  // RC-19: reads sourceData defensively (it is untrusted, persisted JSON —
-  // same caveat as AuditsService.resultJson) to tell a Meta-sourced
+  // RC-21: reads sourceData defensively (it is untrusted, persisted JSON —
+  // same caveat as AuditsService.resultJson) to tell a provider-sourced
   // opportunity apart from an SEO one, without relying on Prisma's Json
-  // path-filtering (unused elsewhere in this codebase).
-  private isMetaSourceData(
-    sourceData: unknown,
-  ): sourceData is { source: 'meta'; ruleCode?: unknown } {
-    return (
-      !!sourceData &&
-      typeof sourceData === 'object' &&
-      (sourceData as { source?: unknown }).source === 'meta'
-    );
+  // path-filtering (unused elsewhere in this codebase). Accepts either the
+  // RC-21 `provider` key or the RC-19 `source` key it replaces, so
+  // opportunities persisted before this refactor are still recognized.
+  private isProviderSourceData(sourceData: unknown): sourceData is {
+    provider?: unknown;
+    source?: unknown;
+    ruleCode?: unknown;
+  } {
+    if (!sourceData || typeof sourceData !== 'object') {
+      return false;
+    }
+    const data = sourceData as { provider?: unknown; source?: unknown };
+    return typeof data.provider === 'string' || typeof data.source === 'string';
   }
 
-  // RC-19: identifies which Meta rules already have an opportunity recorded
-  // for this audit, keyed by ruleCode — the stable identity a Meta finding
-  // carries across re-evaluations (see buildMetaSourceData). Used so a
-  // regeneration call can add newly-missing Meta opportunities without
-  // ever duplicating one that already exists.
-  private async existingMetaRuleCodes(auditId: string): Promise<Set<string>> {
+  private providerRuleKey(data: {
+    provider?: unknown;
+    source?: unknown;
+    ruleCode?: unknown;
+  }): string | null {
+    const provider = data.provider ?? data.source;
+    if (typeof provider !== 'string' || typeof data.ruleCode !== 'string') {
+      return null;
+    }
+    return `${provider}:${data.ruleCode}`;
+  }
+
+  // RC-21: identifies which (provider, ruleCode) pairs already have an
+  // opportunity recorded for this audit — the stable identity a provider
+  // finding carries across re-evaluations (see buildProviderSourceData).
+  // Keying on the pair (not ruleCode alone) means two different providers
+  // can never collide even if they happen to reuse the same rule string.
+  // Used so a regeneration call can add newly-missing provider
+  // opportunities without ever duplicating one that already exists.
+  private async existingProviderRuleKeys(
+    auditId: string,
+  ): Promise<Set<string>> {
     const existing = await this.prisma.opportunity.findMany({
       where: { auditId },
       select: { sourceData: true },
     });
-    const ruleCodes = new Set<string>();
+    const keys = new Set<string>();
     for (const opportunity of existing) {
       const data = opportunity.sourceData;
-      if (this.isMetaSourceData(data) && typeof data.ruleCode === 'string') {
-        ruleCodes.add(data.ruleCode);
+      if (this.isProviderSourceData(data)) {
+        const key = this.providerRuleKey(data);
+        if (key) keys.add(key);
       }
     }
-    return ruleCodes;
+    return keys;
   }
 
-  // RC-19: called on the idempotent "already generated" path — preserves
-  // every existing SEO and Meta opportunity (and anything already linked to
-  // them: actions, documents, validations) untouched, and inserts only the
-  // Meta findings that are not yet represented for this audit. Never
-  // touches the SEO generator or re-runs it.
-  private async syncMissingMetaOpportunities(
+  // RC-21 (generalizes RC-19's syncMissingMetaOpportunities): called on the
+  // idempotent "already generated" path — preserves every existing SEO and
+  // provider opportunity (and anything already linked to them: actions,
+  // documents, validations) untouched, and inserts only the provider
+  // findings not yet represented for this audit. Never touches the SEO
+  // generator or re-runs it. A single provider's collection failing never
+  // aborts this: IntelligenceRegistryService isolates each adapter and
+  // simply omits that provider's findings for this call.
+  private async syncMissingProviderOpportunities(
     organizationId: string,
     auditId: string,
+    auditResult: Record<string, unknown> | null,
   ) {
-    const [existingRuleCodes, findings] = await Promise.all([
-      this.existingMetaRuleCodes(auditId),
-      this.evaluateCurrentMetaFindings(organizationId),
+    const [existingKeys, findings] = await Promise.all([
+      this.existingProviderRuleKeys(auditId),
+      this.intelligence.collectFindings(organizationId, {
+        auditId,
+        auditResult,
+      }),
     ]);
     const missing = findings.filter(
-      (finding) => !existingRuleCodes.has(finding.ruleCode),
+      (finding) => !existingKeys.has(`${finding.provider}:${finding.ruleCode}`),
     );
     if (missing.length === 0) {
       return;
@@ -140,7 +163,11 @@ export class OpportunitiesService {
     await this.prisma.$transaction(
       missing.map((finding) =>
         this.prisma.opportunity.create({
-          data: this.buildMetaOpportunityData(organizationId, auditId, finding),
+          data: this.buildProviderOpportunityData(
+            organizationId,
+            auditId,
+            finding,
+          ),
         }),
       ),
     );
@@ -193,11 +220,16 @@ export class OpportunitiesService {
 
     // La génération SEO est idempotente : les opportunités peuvent déjà
     // avoir des actions, documents et validations liés qu'une régénération
-    // détruirait. RC-19 : les opportunités Meta manquantes sont néanmoins
-    // ajoutées à un audit déjà généré (Meta a pu être connecté après coup) —
-    // jamais de suppression ni de régénération du SEO existant.
+    // détruirait. RC-21 : les opportunités provider manquantes sont
+    // néanmoins ajoutées à un audit déjà généré (un provider a pu être
+    // connecté après coup) — jamais de suppression ni de régénération du
+    // SEO existant.
     if (existingOpportunityCount > 0) {
-      await this.syncMissingMetaOpportunities(organizationId, audit.id);
+      await this.syncMissingProviderOpportunities(
+        organizationId,
+        audit.id,
+        audit.resultJson as Record<string, unknown> | null,
+      );
       return this.findAllForAudit(organizationId, audit.id);
     }
 
@@ -213,10 +245,16 @@ export class OpportunitiesService {
         })
       : await this.generator.generate(auditResult, organization?.city);
 
-    // RC-19: additive only — Meta findings never replace or reorder the SEO
-    // opportunities above; they are read-only, social-presence evidence
-    // (scoreInfluence: false) attached to the same completed audit.
-    const metaFindings = await this.evaluateCurrentMetaFindings(organizationId);
+    // RC-21: additive only — provider findings never replace or reorder the
+    // SEO opportunities above; they are read-only evidence (scoreInfluence:
+    // false for every provider shipped in this RC) attached to the same
+    // completed audit. A single provider failing never aborts this or the
+    // SEO opportunities already computed above — IntelligenceRegistryService
+    // isolates each adapter and simply omits that provider's findings.
+    const providerFindings = await this.intelligence.collectFindings(
+      organizationId,
+      { auditId: audit.id, auditResult },
+    );
 
     const opportunities = await this.prisma.$transaction([
       ...generated.map((opp) =>
@@ -235,9 +273,9 @@ export class OpportunitiesService {
           },
         }),
       ),
-      ...metaFindings.map((finding) =>
+      ...providerFindings.map((finding) =>
         this.prisma.opportunity.create({
-          data: this.buildMetaOpportunityData(
+          data: this.buildProviderOpportunityData(
             organizationId,
             audit.id,
             finding,
@@ -279,7 +317,11 @@ export class OpportunitiesService {
     });
 
     if (existingOpportunityCount > 0) {
-      await this.syncMissingMetaOpportunities(organizationId, audit.id);
+      await this.syncMissingProviderOpportunities(
+        organizationId,
+        audit.id,
+        audit.resultJson as Record<string, unknown> | null,
+      );
       return this.findAllForAudit(organizationId, audit.id);
     }
 
@@ -294,8 +336,14 @@ export class OpportunitiesService {
       country: organization?.country,
     });
 
-    // RC-19: additive only, same as generateFromAudit() above.
-    const metaFindings = await this.evaluateCurrentMetaFindings(organizationId);
+    // RC-21: additive only, same as generateFromAudit() above.
+    const providerFindings = await this.intelligence.collectFindings(
+      organizationId,
+      {
+        auditId: audit.id,
+        auditResult: audit.resultJson as Record<string, unknown> | null,
+      },
+    );
 
     return this.prisma.$transaction([
       ...generated.map((opp) =>
@@ -314,9 +362,9 @@ export class OpportunitiesService {
           },
         }),
       ),
-      ...metaFindings.map((finding) =>
+      ...providerFindings.map((finding) =>
         this.prisma.opportunity.create({
-          data: this.buildMetaOpportunityData(
+          data: this.buildProviderOpportunityData(
             organizationId,
             audit.id,
             finding,
@@ -326,26 +374,26 @@ export class OpportunitiesService {
     ]);
   }
 
-  // RC-19 (Codex review): a plain `take: 5` over SEO + Meta combined let a
-  // full slate of SEO opportunities silently evict every Meta one from the
-  // listing — Meta could be created in the database by
-  // syncMissingMetaOpportunities() yet never appear here, and disappear
-  // again after a reload. The listing must stay source-aware: keep SEO's
-  // own top-5 cap unchanged, and always surface every Meta opportunity for
-  // this audit alongside it (Meta findings are capped at 5 rules total by
-  // evaluateMetaFindings(), so this can never grow unbounded).
+  // RC-19 (Codex review), generalized in RC-21: a plain `take: 5` over
+  // SEO + provider opportunities combined let a full slate of SEO
+  // opportunities silently evict every provider one from the listing — a
+  // provider opportunity could be created in the database by
+  // syncMissingProviderOpportunities() yet never appear here, and
+  // disappear again after a reload. The listing must stay source-aware:
+  // keep SEO's own top-5 cap unchanged, and always surface every provider
+  // opportunity for this audit alongside it.
   async findAllForAudit(organizationId: string, auditId: string) {
     const opportunities = await this.prisma.opportunity.findMany({
       where: { organizationId, auditId },
       orderBy: { impactScore: 'desc' },
     });
     const seoOpportunities = opportunities.filter(
-      (opportunity) => !this.isMetaSourceData(opportunity.sourceData),
+      (opportunity) => !this.isProviderSourceData(opportunity.sourceData),
     );
-    const metaOpportunities = opportunities.filter((opportunity) =>
-      this.isMetaSourceData(opportunity.sourceData),
+    const providerOpportunities = opportunities.filter((opportunity) =>
+      this.isProviderSourceData(opportunity.sourceData),
     );
-    return [...seoOpportunities.slice(0, 5), ...metaOpportunities];
+    return [...seoOpportunities.slice(0, 5), ...providerOpportunities];
   }
 
   async findOne(organizationId: string, opportunityId: string) {
