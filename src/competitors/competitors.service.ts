@@ -66,6 +66,8 @@ export class CompetitorsService {
     }
 
     await this.prisma.competitor.delete({ where: { id: competitor.id } });
+
+    return { deleted: true };
   }
 
   // Reuses AuditRunnerService directly — the same real audit engine and

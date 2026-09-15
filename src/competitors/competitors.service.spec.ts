@@ -147,7 +147,7 @@ describe('CompetitorsService', () => {
 
   describe('remove', () => {
     it('deletes a competitor scoped to the organization', async () => {
-      await service.remove(organizationId, competitorId);
+      const result = await service.remove(organizationId, competitorId);
 
       expect(prisma.competitor.findFirst).toHaveBeenCalledWith({
         where: { id: competitorId, organizationId },
@@ -155,6 +155,7 @@ describe('CompetitorsService', () => {
       expect(prisma.competitor.delete).toHaveBeenCalledWith({
         where: { id: competitorId },
       });
+      expect(result).toEqual({ deleted: true });
     });
 
     it('never deletes a competitor belonging to another organization', async () => {
