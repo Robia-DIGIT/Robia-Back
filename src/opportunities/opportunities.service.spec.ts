@@ -58,6 +58,7 @@ function metaFinding(
     impactScore: 3,
     effortScore: 2,
     confidenceScore: 0.9,
+    confidence: 'observed',
     scoreInfluence: false,
     ...overrides,
   };
@@ -280,6 +281,7 @@ describe('OpportunitiesService', () => {
         provider?: string;
         source?: string;
         ruleCode?: string;
+        confidence?: string;
         evidence?: unknown[];
         recommendation?: string | string[];
         scoreInfluence?: boolean;
@@ -342,6 +344,25 @@ describe('OpportunitiesService', () => {
       expect(
         opportunities.some((opp) => opp.title === generated[0].title),
       ).toBe(true);
+    });
+
+    it("preserves MetaFinding's 'observed' vs 'heuristic' confidence in sourceData, so the frontend never mislabels a threshold-based finding as a directly-observed fact (Codex review)", async () => {
+      mockAudit({ global_score: 62 });
+      intelligence.collectFindings.mockResolvedValue([
+        metaFinding({
+          ruleCode: 'META_LOW_RECENT_ACTIVITY',
+          confidence: 'heuristic',
+        }),
+      ]);
+
+      const opportunities = asTestOpportunities(
+        await service.generateFromAudit(organizationId, auditId),
+      );
+
+      const providerOpportunity = opportunities.find(
+        (opp) => opp.sourceData?.provider === 'meta',
+      );
+      expect(providerOpportunity?.sourceData?.confidence).toBe('heuristic');
     });
 
     it('adds a missing provider opportunity to an audit that already has SEO opportunities, without regenerating or deleting the existing ones (Codex review)', async () => {

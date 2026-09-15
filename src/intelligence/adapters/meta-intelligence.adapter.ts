@@ -83,6 +83,7 @@ export class MetaIntelligenceAdapter implements IntelligenceProviderAdapter {
       impactScore: finding.impactScore,
       effortScore: finding.effortScore,
       confidenceScore: finding.confidenceScore,
+      confidence: finding.confidence,
       scoreInfluence: finding.scoreInfluence,
     };
   }

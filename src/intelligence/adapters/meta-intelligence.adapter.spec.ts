@@ -136,6 +136,7 @@ describe('MetaIntelligenceAdapter', () => {
       expect(findings[0]).toMatchObject({
         provider: 'meta',
         ruleCode: 'META_INSTAGRAM_NOT_LINKED',
+        confidence: 'observed',
         scoreInfluence: false,
       });
       expect(Array.isArray(findings[0].evidence)).toBe(true);

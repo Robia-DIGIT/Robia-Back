@@ -138,11 +138,23 @@ Chaque opportunité provider (`buildProviderSourceData`) persiste au minimum :
   "provider": "meta",
   "source": "meta",
   "ruleCode": "META_INSTAGRAM_NOT_LINKED",
+  "confidence": "observed",
   "evidence": [...],
   "recommendation": "...",
   "scoreInfluence": false
 }
 ```
+
+> **Revue Codex (round 1).** `confidence` (`'observed' | 'heuristic'`,
+> RC-19's `MetaFinding.confidence`, lu par le frontend pour distinguer un
+> constat direct d'un seuil documenté) avait été omis de la première
+> version de `buildProviderSourceData()`. Corrigé : `IntelligenceFinding`
+> gagne un champ `confidence` optionnel (`IntelligenceFindingConfidence`),
+> `MetaIntelligenceAdapter` le mappe depuis `MetaFinding.confidence`, et
+> `buildProviderSourceData()` le persiste — jamais fabriqué pour un
+> provider qui ne le distingue pas. Voir le test « preserves MetaFinding's
+> 'observed' vs 'heuristic' confidence... » dans
+> `opportunities.service.spec.ts`.
 
 ## Preuve que `seo_score_v2` n'a pas changé
 

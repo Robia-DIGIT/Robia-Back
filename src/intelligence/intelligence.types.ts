@@ -64,6 +64,16 @@ export interface IntelligenceSignal<T = unknown> {
  * downstream (priority sorting, the top-5 cap) needs a provider-specific
  * branch.
  */
+/**
+ * `'observed'` — a directly-read fact (a field is null, a list is empty).
+ * `'heuristic'` — a documented threshold, not a business truth (e.g. Meta's
+ * "fewer than N posts in M days" rule). Carried over from RC-19's
+ * `MetaFindingConfidence` — kept generic here so any future provider that
+ * distinguishes fact-from-threshold can reuse it instead of inventing its
+ * own vocabulary.
+ */
+export type IntelligenceFindingConfidence = 'observed' | 'heuristic';
+
 export interface IntelligenceFinding {
   provider: IntelligenceProvider;
   /** Stable across re-evaluations — the identity a re-run's dedup keys on, together with `provider`. */
@@ -76,6 +86,8 @@ export interface IntelligenceFinding {
   impactScore: number;
   effortScore: number;
   confidenceScore: number;
+  /** Optional: only providers that distinguish fact from threshold set this (Meta today) — omitted, never defaulted, for providers that don't. */
+  confidence?: IntelligenceFindingConfidence;
   /** Always `false` for every provider shipped in RC-21 — nothing here feeds `seo_score_v2`. */
   scoreInfluence: boolean;
 }

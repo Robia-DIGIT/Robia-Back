@@ -42,12 +42,18 @@ export class OpportunitiesService {
   // persisted before this refactor only have `source`, and isProviderSourceData()
   // below reads either, so this is purely additive: no already-persisted row
   // needs to change shape, and no reader needs a migration.
+  //
+  // `confidence` (Codex review): RC-19's MetaFinding carries 'observed' vs
+  // 'heuristic' and the frontend renders a different label for each — RC-21
+  // must keep persisting it, not just the generic provider fields. Omitted
+  // entirely (never defaulted) for a provider/finding that doesn't set it.
   private buildProviderSourceData(finding: IntelligenceFinding) {
     return {
       version: 2,
       provider: finding.provider,
       source: finding.provider,
       ruleCode: finding.ruleCode,
+      confidence: finding.confidence,
       evidence: finding.evidence,
       recommendation: finding.recommendation,
       scoreInfluence: finding.scoreInfluence,
