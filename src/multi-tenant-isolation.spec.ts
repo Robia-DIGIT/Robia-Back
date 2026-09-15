@@ -9,8 +9,9 @@ import { DocumentGeneratorService } from './documents/document-generator/documen
 import { DocumentsService } from './documents/documents.service';
 import { GenerateDocumentDto } from './documents/dto/generate-document.dto';
 import { GoogleSearchConsoleService } from './integrations/google-search-console.service';
-import { MetaService } from './integrations/meta.service';
 import { N8nWebhookService } from './integrations/n8n-webhook.service';
+import { IntelligenceRegistryService } from './intelligence/intelligence-registry.service';
+import { IntelligenceController } from './intelligence/intelligence.controller';
 import { LocationPlacesService } from './locations/location-places/location-places.service';
 import { LocationWeatherService } from './locations/location-weather/location-weather.service';
 import { LocationsService } from './locations/locations.service';
@@ -175,12 +176,12 @@ describe('Multi-tenant isolation (RC-16)', () => {
       const prisma = {
         opportunity: { findMany: jest.fn().mockResolvedValue([]) },
       };
-      const meta = { getInsightSignals: jest.fn() };
+      const intelligence = { collectFindings: jest.fn() };
       const service = new OpportunitiesService(
         prisma as unknown as PrismaService,
         {} as unknown as OpportunityGeneratorService,
         {} as unknown as N8nWebhookService,
-        meta as unknown as MetaService,
+        intelligence as unknown as IntelligenceRegistryService,
       );
 
       const result = await service.findAllForAudit(orgA, 'audit-org-b');
@@ -191,7 +192,7 @@ describe('Multi-tenant isolation (RC-16)', () => {
           where: { organizationId: orgA, auditId: 'audit-org-b' },
         }),
       );
-      expect(meta.getInsightSignals).not.toHaveBeenCalled();
+      expect(intelligence.collectFindings).not.toHaveBeenCalled();
     });
 
     it('does not generate opportunities from an audit owned by another organization', async () => {
@@ -200,12 +201,12 @@ describe('Multi-tenant isolation (RC-16)', () => {
         opportunity: { count: jest.fn(), create: jest.fn() },
       };
       const generator = { generate: jest.fn(), generateForSite: jest.fn() };
-      const meta = { getInsightSignals: jest.fn() };
+      const intelligence = { collectFindings: jest.fn() };
       const service = new OpportunitiesService(
         prisma as unknown as PrismaService,
         generator as unknown as OpportunityGeneratorService,
         {} as unknown as N8nWebhookService,
-        meta as unknown as MetaService,
+        intelligence as unknown as IntelligenceRegistryService,
       );
 
       await expect(
@@ -214,7 +215,7 @@ describe('Multi-tenant isolation (RC-16)', () => {
       expect(prisma.opportunity.count).not.toHaveBeenCalled();
       expect(generator.generate).not.toHaveBeenCalled();
       expect(generator.generateForSite).not.toHaveBeenCalled();
-      expect(meta.getInsightSignals).not.toHaveBeenCalled();
+      expect(intelligence.collectFindings).not.toHaveBeenCalled();
     });
 
     it('does not change the status of an opportunity owned by another organization', async () => {
@@ -224,19 +225,19 @@ describe('Multi-tenant isolation (RC-16)', () => {
           update: jest.fn(),
         },
       };
-      const meta = { getInsightSignals: jest.fn() };
+      const intelligence = { collectFindings: jest.fn() };
       const service = new OpportunitiesService(
         prisma as unknown as PrismaService,
         {} as unknown as OpportunityGeneratorService,
         {} as unknown as N8nWebhookService,
-        meta as unknown as MetaService,
+        intelligence as unknown as IntelligenceRegistryService,
       );
 
       await expect(
         service.updateStatus(orgA, 'opportunity-org-b', 'done'),
       ).rejects.toBeInstanceOf(NotFoundException);
       expect(prisma.opportunity.update).not.toHaveBeenCalled();
-      expect(meta.getInsightSignals).not.toHaveBeenCalled();
+      expect(intelligence.collectFindings).not.toHaveBeenCalled();
     });
   });
 
@@ -509,6 +510,33 @@ describe('Multi-tenant isolation (RC-16)', () => {
       ).not.toHaveBeenCalledWith({
         where: { organizationId: orgB },
       });
+    });
+  });
+
+  describe('Intelligence (RC-21)', () => {
+    it('never returns findings for an audit owned by another organization', async () => {
+      const prisma = {
+        audit: { findFirst: jest.fn().mockResolvedValue(null) },
+      };
+      const registry = { getStatus: jest.fn(), collectFindings: jest.fn() };
+      const controller = new IntelligenceController(
+        registry as unknown as IntelligenceRegistryService,
+        prisma as unknown as PrismaService,
+      );
+
+      const req: Parameters<IntelligenceController['getFindings']>[0] = {
+        organizationId: orgA,
+        user: { userId: 'user-a', email: 'a@example.com' },
+      } as unknown as Parameters<IntelligenceController['getFindings']>[0];
+
+      await expect(
+        controller.getFindings(req, 'audit-org-b'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(prisma.audit.findFirst).toHaveBeenCalledWith({
+        where: { id: 'audit-org-b', organizationId: orgA },
+        select: { id: true, resultJson: true },
+      });
+      expect(registry.collectFindings).not.toHaveBeenCalled();
     });
   });
 });
