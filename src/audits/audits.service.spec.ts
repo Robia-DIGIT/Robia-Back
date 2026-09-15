@@ -1,9 +1,11 @@
 import { ConfigService } from '@nestjs/config';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PinoLogger } from 'nestjs-pino';
 import { AuditsService } from './audits.service';
 import { GoogleSearchConsoleService } from '../integrations/google-search-console.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditRunnerService } from './audit-runner/audit-runner.service';
+import { AUDIT_COMPLETED_EVENT } from './audit-completed.event';
 
 describe('AuditsService', () => {
   const organizationId = 'org-1';
@@ -14,6 +16,7 @@ describe('AuditsService', () => {
   let auditRunner: any;
   let googleSearchConsole: { getSearchConsoleSignalsForAudit: jest.Mock };
   let logger: { assign: jest.Mock };
+  let eventEmitter: { emit: jest.Mock };
   let service: AuditsService;
 
   const page = {
@@ -113,10 +116,13 @@ describe('AuditsService', () => {
       },
       audit: {
         create: jest.fn().mockResolvedValue({ id: auditId }),
+        // `globalScore` defaults to null here, matching the real Int?
+        // column: runSite()'s update never sets it, and Prisma returns
+        // null for an untouched nullable column, never undefined.
         update: jest
           .fn()
           .mockImplementation(({ data }) =>
-            Promise.resolve({ id: auditId, ...data }),
+            Promise.resolve({ id: auditId, globalScore: null, ...data }),
           ),
       },
       webPage: {
@@ -133,11 +139,13 @@ describe('AuditsService', () => {
         .mockResolvedValue(searchConsoleSignals),
     };
     logger = { assign: jest.fn() };
+    eventEmitter = { emit: jest.fn() };
     service = new AuditsService(
       prisma,
       auditRunner,
       googleSearchConsole as unknown as GoogleSearchConsoleService,
       logger as unknown as PinoLogger,
+      eventEmitter as unknown as EventEmitter2,
     );
   });
 
@@ -197,6 +205,24 @@ describe('AuditsService', () => {
     expect(logger.assign).toHaveBeenCalledWith({ auditId });
   });
 
+  // RC-23: audit.completed is RC-20's first real business event — wired as
+  // an in-process EventEmitter2 event rather than a direct call into
+  // OpsAutomationModule, to avoid a circular module dependency (see
+  // audit-completed.event.ts). This only asserts AuditsService's own side:
+  // that it emits, with the right payload — AuditCompletedEventListener's
+  // own spec covers turning this into a real AutomationEvent.
+  it('emits audit.completed with organizationId/auditId/websiteId/globalScore once the audit completes', async () => {
+    const result = await service.run(organizationId, websiteId);
+
+    expect(eventEmitter.emit).toHaveBeenCalledWith(AUDIT_COMPLETED_EVENT, {
+      organizationId,
+      auditId,
+      websiteId,
+      globalScore: 62,
+    });
+    expect(result.status).toBe('completed');
+  });
+
   it('marks the audit failed instead of completing with zero accessible pages', async () => {
     auditRunner.runSiteAudit.mockResolvedValue({
       ...siteResult,
@@ -219,6 +245,9 @@ describe('AuditsService', () => {
       },
     });
     expect(result.status).toBe('failed');
+    // A failed audit never emits audit.completed — the event's own name
+    // says what it means.
+    expect(eventEmitter.emit).not.toHaveBeenCalled();
   });
 
   it('completes the audit with an unavailable Search Console signal when its underlying reads fail — not a failed audit', async () => {
@@ -273,11 +302,15 @@ describe('AuditsService', () => {
       runAudit: jest.fn().mockResolvedValue(scoreResult),
     } as unknown as AuditRunnerService;
     const loggerForThisTest = { assign: jest.fn() } as unknown as PinoLogger;
+    const eventEmitterForThisTest = {
+      emit: jest.fn(),
+    } as unknown as EventEmitter2;
     service = new AuditsService(
       auditPrisma,
       auditRunnerForThisTest,
       realGoogleSearchConsole,
       loggerForThisTest,
+      eventEmitterForThisTest,
     );
 
     const result: any = await service.run(organizationId, websiteId);
@@ -291,6 +324,37 @@ describe('AuditsService', () => {
       summary: null,
       lastSyncedAt: null,
       unavailableReason: 'temporarily_unavailable',
+    });
+  });
+
+  // RC-23: runSite() is AuditsService's second completion path — the event
+  // must fire there too, on the same eventKey convention (auditId).
+  describe('runSite', () => {
+    it('emits audit.completed once the multi-page audit completes — globalScore stays null, never fabricated', async () => {
+      const result = await service.runSite(organizationId, websiteId);
+
+      expect(eventEmitter.emit).toHaveBeenCalledWith(AUDIT_COMPLETED_EVENT, {
+        organizationId,
+        auditId,
+        websiteId,
+        globalScore: null,
+      });
+      expect(result.status).toBe('completed');
+    });
+
+    it('never emits audit.completed when the multi-page audit fails', async () => {
+      (
+        auditRunner as { runSiteAudit: jest.Mock }
+      ).runSiteAudit.mockResolvedValue({
+        ...siteResult,
+        pages_analyzed: 0,
+        pages: [],
+      });
+
+      const result = await service.runSite(organizationId, websiteId);
+
+      expect(result.status).toBe('failed');
+      expect(eventEmitter.emit).not.toHaveBeenCalled();
     });
   });
 });

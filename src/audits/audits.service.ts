@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PinoLogger } from 'nestjs-pino';
 import { PrismaService } from '../prisma/prisma.service';
 import {
@@ -7,6 +8,7 @@ import {
 } from './audit-runner/audit-runner.service';
 import { GoogleSearchConsoleService } from '../integrations/google-search-console.service';
 import { Prisma } from '@prisma/client';
+import { AUDIT_COMPLETED_EVENT } from './audit-completed.event';
 
 @Injectable()
 export class AuditsService {
@@ -15,6 +17,7 @@ export class AuditsService {
     private readonly auditRunner: AuditRunnerService,
     private readonly googleSearchConsole: GoogleSearchConsoleService,
     private readonly logger: PinoLogger,
+    private readonly eventEmitter: EventEmitter2,
   ) {}
 
   async run(organizationId: string, websiteId: string, requestId?: string) {
@@ -75,7 +78,7 @@ export class AuditsService {
           organizationId,
         );
 
-      return this.prisma.audit.update({
+      const completedAudit = await this.prisma.audit.update({
         where: { id: audit.id },
         data: {
           status: 'completed',
@@ -90,6 +93,16 @@ export class AuditsService {
           completedAt: new Date(),
         },
       });
+      // RC-23: in-process, fire-and-forget — never awaited, never able to
+      // fail this request. See audit-completed.event.ts for why this is an
+      // event rather than a direct call into OpsAutomationModule.
+      this.eventEmitter.emit(AUDIT_COMPLETED_EVENT, {
+        organizationId,
+        auditId: completedAudit.id,
+        websiteId: website.id,
+        globalScore: completedAudit.globalScore,
+      });
+      return completedAudit;
     } catch (error) {
       return this.prisma.audit.update({
         where: { id: audit.id },
@@ -185,7 +198,7 @@ export class AuditsService {
           organizationId,
         );
 
-      return this.prisma.audit.update({
+      const completedAudit = await this.prisma.audit.update({
         where: { id: audit.id },
         data: {
           status: 'completed',
@@ -196,6 +209,16 @@ export class AuditsService {
           completedAt: new Date(),
         },
       });
+      // RC-23 — see run() above for why this is a fire-and-forget event.
+      // globalScore stays null here: runSite() never computes one, and
+      // this event never fabricates a value the audit itself doesn't have.
+      this.eventEmitter.emit(AUDIT_COMPLETED_EVENT, {
+        organizationId,
+        auditId: completedAudit.id,
+        websiteId: website.id,
+        globalScore: completedAudit.globalScore,
+      });
+      return completedAudit;
     } catch (error) {
       return this.prisma.audit.update({
         where: { id: audit.id },
