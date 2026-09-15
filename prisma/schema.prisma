@@ -28,6 +28,9 @@ model User {
   organizations Organization[]
   validationLogs ValidationLog[]
   passwordResetTokens PasswordResetToken[]
+  createdAutomations      Automation[]
+  triggeredAutomationRuns AutomationRun[] @relation("AutomationRunTriggeredBy")
+  approvedAutomationRuns  AutomationRun[] @relation("AutomationRunApprovedBy")
 
   @@map("users")
 }
@@ -61,10 +64,13 @@ model Organization {
   validationLogs ValidationLog[]
   actionItems    ActionItem[]
   actionExecutionEvents ActionExecutionEvent[]
-  locations Location[] 
+  locations Location[]
   googleSearchConsoleConnection GoogleSearchConsoleConnection?
   metaConnection MetaConnection?
   stripeSubscription StripeSubscription?
+  automations       Automation[]
+  automationRuns    AutomationRun[]
+  automationEvents  AutomationEvent[]
   createdAt DateTime @default(now()) @map("created_at")
 
   @@map("organizations")
@@ -364,4 +370,150 @@ model Location {
   opportunities  Opportunity[]
 
   @@map("locations")
+}
+
+// RC-20 — Ops Automation Core.
+// Architecture: Trigger -> Rule/Condition -> Workflow (steps) -> Approval
+// (optional) -> Execution -> Evidence -> History.
+//
+// `scope` separates today's single case (ORGANIZATION — a PME automating
+// its own ROBIA operations) from ROBIA_INTERNAL (ROBIA staff operating on
+// ROBIA itself) without building the future PARTNER/PROGRAM/COHORT scopes
+// (Orange Digital Center / Orange Formation) yet — see
+// docs/RC20_OPS_AUTOMATION_CORE.md.
+model Automation {
+  id               String   @id @default(cuid())
+  organizationId   String   @map("organization_id")
+  organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  scope            String   @default("ORGANIZATION") // ROBIA_INTERNAL | ORGANIZATION
+  name             String
+  description      String?
+  enabled          Boolean  @default(false)
+  // Structured condition tree (see src/ops-automation/condition-engine.ts).
+  // Deterministic, allowlisted operators only — never a dynamic expression.
+  conditions       Json?
+  // Ordered list of { actionType: string, input?: Json } — actionType must
+  // resolve against the Ops action registry (src/ops-automation/actions);
+  // an unregistered actionType is rejected at creation time, not at run time.
+  steps            Json
+  requiresApproval Boolean  @default(true) @map("requires_approval")
+  createdById      String   @map("created_by_id")
+  createdBy        User     @relation(fields: [createdById], references: [id])
+  lastRunAt        DateTime? @map("last_run_at")
+  nextRunAt        DateTime? @map("next_run_at")
+  // Non-sensitive metadata only (e.g. UI hints) — never tokens/secrets.
+  metadata         Json?
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  trigger AutomationTrigger?
+  runs    AutomationRun[]
+
+  @@index([organizationId])
+  @@map("automations")
+}
+
+model AutomationTrigger {
+  id             String   @id @default(cuid())
+  automationId   String   @unique @map("automation_id")
+  automation     Automation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+  type           String   // manual | scheduled | event
+  cronExpression String?  @map("cron_expression") // for type: scheduled
+  eventType      String?  @map("event_type")      // for type: event, e.g. "audit.completed"
+  config         Json?    // extra, non-sensitive trigger config
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  @@map("automation_triggers")
+}
+
+// One ingested event, deduplicated by (organizationId, eventKey) before it
+// is ever matched against any automation's trigger/conditions — this is
+// RC-20's "système d'événements". RC20 exposes the ingestion/service, but
+// nothing in this PR calls it from AuditsService/MetaService/etc.: existing
+// modules are not modified to emit these events yet.
+model AutomationEvent {
+  id             String   @id @default(cuid())
+  organizationId String   @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  eventType      String   @map("event_type")
+  eventKey       String   @map("event_key")
+  payload        Json?
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  runs AutomationRun[]
+
+  // Scoped by eventType, not just eventKey: an eventKey is only guaranteed
+  // unique within its own event type (e.g. an audit id and an unrelated
+  // integration id could coincidentally collide as strings). Without this,
+  // reusing the same eventKey for a different eventType would silently
+  // return the wrong row — the wrong payload — to whatever automations
+  // match the new type (see AutomationsService.getOrCreateEvent()).
+  @@unique([organizationId, eventType, eventKey])
+  @@index([organizationId, eventType, createdAt])
+  @@map("automation_events")
+}
+
+model AutomationRun {
+  id               String   @id @default(cuid())
+  organizationId   String   @map("organization_id")
+  organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  automationId     String   @map("automation_id")
+  automation       Automation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+  status           String   @default("queued") // queued | running | waiting_approval | succeeded | failed | cancelled | skipped
+  triggerType      String   @map("trigger_type") // manual | scheduled | event
+  sourceEventId    String?  @map("source_event_id")
+  sourceEvent      AutomationEvent? @relation(fields: [sourceEventId], references: [id])
+  // Idempotency key for this run, e.g. `${automationId}:manual:${ts}` or
+  // `${automationId}:event:${eventKey}` — a duplicate never creates a
+  // second row (see AutomationsService.startRun()).
+  dedupKey         String   @map("dedup_key")
+  triggeredById    String?  @map("triggered_by_id")
+  triggeredBy      User?    @relation("AutomationRunTriggeredBy", fields: [triggeredById], references: [id])
+  requiresApproval Boolean  @default(false) @map("requires_approval")
+  approvalStatus   String?  @map("approval_status") // pending | approved | rejected
+  approvedById     String?  @map("approved_by_id")
+  approvedBy       User?    @relation("AutomationRunApprovedBy", fields: [approvedById], references: [id])
+  approvalReason   String?  @map("approval_reason")
+  approvedAt       DateTime? @map("approved_at")
+  startedAt        DateTime? @map("started_at")
+  finishedAt       DateTime? @map("finished_at")
+  // Always passed through redactSensitive() before being written — never a
+  // raw error object that could carry a token/secret.
+  errorMessage     String?  @map("error_message")
+  // Sanitized snapshot of the condition-evaluation context at trigger time.
+  context          Json?
+  // Immutable snapshot of the automation's steps (canonical/allowlisted
+  // input only) taken at trigger time. executeSteps() runs this, never the
+  // automation's current (possibly since-edited) `steps` — otherwise an
+  // approver could unknowingly execute different actions than the ones
+  // that were actually reviewed before approval.
+  plannedSteps     Json?    @map("planned_steps")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  steps AutomationStepRun[]
+
+  @@unique([organizationId, dedupKey])
+  @@index([organizationId, automationId, createdAt])
+  @@map("automation_runs")
+}
+
+model AutomationStepRun {
+  id         String   @id @default(cuid())
+  runId      String   @map("run_id")
+  run        AutomationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  sequence   Int
+  actionType String   @map("action_type")
+  input      Json?
+  status     String   @default("queued") // queued | running | succeeded | failed | skipped | cancelled
+  // Action-produced evidence (redacted before persisting).
+  evidence   Json?
+  // Cleaned/redacted error text — never a raw stack trace or exception object.
+  error      String?
+  startedAt  DateTime? @map("started_at")
+  finishedAt DateTime? @map("finished_at")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@unique([runId, sequence])
+  @@map("automation_step_runs")
 }
