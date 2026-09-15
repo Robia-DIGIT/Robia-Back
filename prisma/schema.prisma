@@ -71,6 +71,7 @@ model Organization {
   automations       Automation[]
   automationRuns    AutomationRun[]
   automationEvents  AutomationEvent[]
+  competitors       Competitor[]
   createdAt DateTime @default(now()) @map("created_at")
 
   @@map("organizations")
@@ -164,9 +165,10 @@ model Website {
 
   audits Audit[]
   pages WebPage[]
+  competitors Competitor[]
 
   @@unique([organizationId, url])
-  @@map("websites")  
+  @@map("websites")
 }
 
 model WebPage {
@@ -240,6 +242,33 @@ model Audit {
   completedAt    DateTime? @map("completed_at")
 
   @@map("audits")
+}
+
+// A competitor is an external URL an organization wants to benchmark
+// against its own site. Deliberately NOT an Audit/Website row: running a
+// competitor audit must never emit RC-23's audit.completed event (that
+// event means the organization's own site finished auditing), never create
+// Opportunities (those are for the org's own site), and never touch
+// WebPage (that table is FK'd to the org's own crawled site). It reuses
+// AuditRunnerService directly for real, unfabricated scores.
+model Competitor {
+  id             String    @id @default(cuid())
+  organizationId String    @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  websiteId      String    @map("website_id")
+  website        Website   @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  url            String
+  name           String?
+  status         String    @default("pending") // pending | running | completed | failed
+  globalScore    Int?      @map("global_score")
+  resultJson     Json?     @map("result_json")
+  errorMessage   String?   @map("error_message")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  completedAt    DateTime? @map("completed_at")
+
+  @@unique([websiteId, url])
+  @@index([organizationId])
+  @@map("competitors")
 }
 
 model Opportunity {
