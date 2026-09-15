@@ -1,3 +1,5 @@
+from unittest import result
+
 from app.agents.ingestion import scrape_website, crawl_website, aggregate_site
 from app.agents.analysis import compute_audit_result, _analyze_ai_readiness
 from app.agents.prioritization import generate_opportunities, generate_site_opportunities
@@ -132,16 +134,21 @@ def run_site_audit(url: str, max_pages: int = 20, max_depth: int = 2, city: str 
     }
     psi_result = fetch_pagespeed_insights(result["base_url"])
     result["pagespeed_insights"] = psi_result
+
+    # Conversion sécurisée avec contournement de l'analyse statique Pylance
+    if psi_result:
+        if hasattr(psi_result, "model_dump"):
+            psi_dict = psi_result.model_dump()  # type: ignore[attr-defined]
+        elif hasattr(psi_result, "dict"):
+            psi_dict = psi_result.dict()       # type: ignore[attr-defined]
+        else:
+            psi_dict = vars(psi_result)
+    else:
+        psi_dict = None
+
     result["detailed_findings"] = evaluate_site_audit(
-        result, city, country, psi_result=psi_result
+        result, city, country, psi_result=psi_dict
     )
-    # Additive only (RC-12): exposed alongside the legacy score, does not
-    # replace resultJson.global_score / Audit.globalScore. Closed product
-    # decision (Romeo/Landry): no historical recompute — existing audits
-    # keep their legacy score exactly as stored; new audits get both
-    # legacy and v2, additively, until a final display-migration decision
-    # is made separately.
-    result["seo_score_v2"] = compute_seo_score_v2(result["detailed_findings"])
     return result
 
 def run_social_post_generation(
