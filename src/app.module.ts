@@ -24,6 +24,7 @@ import { ProspectsModule } from './prospects/prospects.module';
 import { BillingModule } from './billing/billing.module';
 import { OpsAutomationModule } from './ops-automation/ops-automation.module';
 import { IntelligenceModule } from './intelligence/intelligence.module';
+import { CompetitorsModule } from './competitors/competitors.module';
 
 @Module({
   imports: [
@@ -55,6 +56,7 @@ import { IntelligenceModule } from './intelligence/intelligence.module';
     BillingModule,
     OpsAutomationModule,
     IntelligenceModule,
+    CompetitorsModule,
   ],
   controllers: [AppController],
   providers: [
