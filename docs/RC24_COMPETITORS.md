@@ -75,11 +75,16 @@ npx tsc --noEmit -p tsconfig.json    → aucune nouvelle erreur (1 erreur
                                         pré-existante et sans rapport dans
                                         n8n-webhook.service.spec.ts, comme
                                         documenté en RC23)
-npx eslint src/competitors           → 0 nouvelle erreur en dehors du motif
-                                        `any` déjà accepté dans tous les
-                                        `*.service.spec.ts` du projet
-                                        (17 erreurs, identique au
-                                        baseline d'audits.service.spec.ts)
+node scripts/check-eslint-baseline.mjs
+  eslint-report.json 74 23           → ESLint debt: 74 errors, 23 warnings
+                                        (baseline: 74/23) — la CI compare un
+                                        TOTAL sur tout le repo, pas fichier
+                                        par fichier ; competitors.service.spec.ts
+                                        type ses mocks Prisma explicitement
+                                        (jest.Mock<...> au lieu de `any`,
+                                        même motif que
+                                        opportunities.service.spec.ts) pour
+                                        n'ajouter aucune dette
 npm run build                        → prisma generate + nest build : succès
 ```
 

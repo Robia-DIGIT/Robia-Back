@@ -2,13 +2,32 @@ import { ConflictException, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { CompetitorsService } from './competitors.service';
 import { AuditRunnerService } from '../audits/audit-runner/audit-runner.service';
+import { PrismaService } from '../prisma/prisma.service';
+
+interface PrismaMock {
+  website: { findFirst: jest.Mock };
+  organization: { findUnique: jest.Mock };
+  competitor: {
+    create: jest.Mock<
+      Promise<Record<string, unknown>>,
+      [{ data: Record<string, unknown> }]
+    >;
+    findFirst: jest.Mock;
+    findMany: jest.Mock;
+    update: jest.Mock<
+      Promise<Record<string, unknown>>,
+      [{ where: { id: string }; data: Record<string, unknown> }]
+    >;
+    delete: jest.Mock;
+  };
+}
 
 describe('CompetitorsService', () => {
   const organizationId = 'org-1';
   const websiteId = 'website-1';
   const competitorId = 'competitor-1';
 
-  let prisma: any;
+  let prisma: PrismaMock;
   let auditRunner: { runSiteAudit: jest.Mock; runAudit: jest.Mock };
   let service: CompetitorsService;
 
@@ -54,7 +73,10 @@ describe('CompetitorsService', () => {
       },
       competitor: {
         create: jest
-          .fn()
+          .fn<
+            Promise<Record<string, unknown>>,
+            [{ data: Record<string, unknown> }]
+          >()
           .mockImplementation(({ data }) =>
             Promise.resolve({ id: competitorId, ...data }),
           ),
@@ -66,7 +88,10 @@ describe('CompetitorsService', () => {
         }),
         findMany: jest.fn().mockResolvedValue([]),
         update: jest
-          .fn()
+          .fn<
+            Promise<Record<string, unknown>>,
+            [{ where: { id: string }; data: Record<string, unknown> }]
+          >()
           .mockImplementation(({ data }) =>
             Promise.resolve({ id: competitorId, ...data }),
           ),
@@ -78,7 +103,7 @@ describe('CompetitorsService', () => {
       runAudit: jest.fn().mockResolvedValue(auditResult),
     };
     service = new CompetitorsService(
-      prisma,
+      prisma as unknown as PrismaService,
       auditRunner as unknown as AuditRunnerService,
     );
   });
@@ -182,12 +207,12 @@ describe('CompetitorsService', () => {
           websiteUrl: 'https://concurrent.example.com',
         }),
       );
-      expect(prisma.competitor.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: { id: competitorId },
-          data: expect.objectContaining({ status: 'running' }),
-        }),
-      );
+      expect(prisma.competitor.update).toHaveBeenCalledWith({
+        where: { id: competitorId },
+        data: expect.objectContaining({
+          status: 'running',
+        }) as Record<string, unknown>,
+      });
       expect(result.status).toBe('completed');
       expect(result.globalScore).toBe(71);
       expect(result.resultJson).toEqual(
