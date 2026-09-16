@@ -20,4 +20,12 @@ export class AutomationTriggerDto {
   @IsOptional()
   @IsString()
   eventType?: string;
+
+  // IANA zone the cronExpression is evaluated in (e.g. "Europe/Paris").
+  // Only meaningful for type === 'scheduled'; validated at the service
+  // level. Defaults to "UTC" when omitted — never inferred from anything
+  // else (see AutomationsService.validateTrigger()).
+  @IsOptional()
+  @IsString()
+  timezone?: string;
 }

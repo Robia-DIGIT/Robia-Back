@@ -430,6 +430,17 @@ model Automation {
   createdBy        User     @relation(fields: [createdById], references: [id])
   lastRunAt        DateTime? @map("last_run_at")
   nextRunAt        DateTime? @map("next_run_at")
+  // RC-25 review fix: a lease on the in-flight scheduled claim for
+  // `nextRunAt`. Null when no claim is in flight. Set the instant a
+  // dispatcher instance claims this automation's due occurrence; cleared
+  // only once that occurrence's run has been durably created (or the
+  // automation turned out to be no longer eligible) — never at claim
+  // time. `nextRunAt` itself is NOT advanced until that same moment, so a
+  // crash between claim and run creation leaves nextRunAt unchanged: the
+  // occurrence is never lost, only delayed until the lease goes stale
+  // (see AutomationSchedulerService.SCHEDULED_CLAIM_LEASE_MS) and another
+  // instance reclaims it with the exact same scheduledFor/dedupKey.
+  scheduledClaimedAt DateTime? @map("scheduled_claimed_at")
   // Non-sensitive metadata only (e.g. UI hints) — never tokens/secrets.
   metadata         Json?
   createdAt        DateTime @default(now()) @map("created_at")
@@ -439,6 +450,9 @@ model Automation {
   runs    AutomationRun[]
 
   @@index([organizationId])
+  // RC-25: serves AutomationSchedulerService's periodic due-set scan
+  // (WHERE enabled = true AND next_run_at <= now).
+  @@index([enabled, nextRunAt])
   @@map("automations")
 }
 
@@ -448,6 +462,12 @@ model AutomationTrigger {
   automation     Automation @relation(fields: [automationId], references: [id], onDelete: Cascade)
   type           String   // manual | scheduled | event
   cronExpression String?  @map("cron_expression") // for type: scheduled
+  // IANA zone (e.g. "Indian/Antananarivo", "Europe/Paris", "UTC") the
+  // cronExpression is evaluated in — never inferred from the org's
+  // city/country. Defaults to UTC for pre-RC25 rows. See RC25's
+  // cron-schedule.ts for the strict validation (Intl-based, not left to
+  // cron-parser's own unclear error on an invalid zone).
+  timezone       String   @default("UTC") @map("timezone")
   eventType      String?  @map("event_type")      // for type: event, e.g. "audit.completed"
   config         Json?    // extra, non-sensitive trigger config
   createdAt      DateTime @default(now()) @map("created_at")

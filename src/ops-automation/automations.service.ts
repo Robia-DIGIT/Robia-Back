@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import {
   ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
@@ -35,6 +36,11 @@ import {
   MAX_TRIGGER_DEPTH,
 } from './automation.constants';
 import {
+  InvalidCronExpressionError,
+  InvalidTimezoneError,
+  computeNextOccurrence,
+} from './cron-schedule';
+import {
   AutomationRunWithSteps,
   AutomationWithTrigger,
   StoredAutomationStep,
@@ -53,6 +59,8 @@ interface StartRunOptions {
 
 @Injectable()
 export class AutomationsService {
+  private readonly logger = new Logger(AutomationsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly context: AutomationContextService,
@@ -72,12 +80,22 @@ export class AutomationsService {
     this.validateSteps(dto.steps);
     this.validateConditions(dto.conditions);
 
+    const enabled = dto.enabled ?? false;
+    const timezone = dto.trigger.timezone ?? 'UTC';
+    const nextRunAt = this.resolveNextRunAt({
+      enabled,
+      triggerType: dto.trigger.type,
+      cronExpression: dto.trigger.cronExpression ?? null,
+      timezone,
+    });
+
     return this.prisma.automation.create({
       data: {
         organizationId,
         name: dto.name,
         description: dto.description ?? null,
-        enabled: dto.enabled ?? false,
+        enabled,
+        nextRunAt,
         conditions: (dto.conditions ??
           Prisma.JsonNull) as Prisma.InputJsonValue,
         steps: dto.steps as unknown as Prisma.InputJsonValue,
@@ -88,6 +106,7 @@ export class AutomationsService {
             type: dto.trigger.type,
             cronExpression: dto.trigger.cronExpression ?? null,
             eventType: dto.trigger.eventType ?? null,
+            timezone,
           },
         },
       },
@@ -118,7 +137,7 @@ export class AutomationsService {
   }
 
   async update(organizationId: string, id: string, dto: UpdateAutomationDto) {
-    await this.findOne(organizationId, id);
+    const existing = await this.findOne(organizationId, id);
 
     if (dto.trigger) {
       this.validateTrigger(dto.trigger);
@@ -129,6 +148,23 @@ export class AutomationsService {
     if (dto.conditions !== undefined) {
       this.validateConditions(dto.conditions);
     }
+
+    // nextRunAt is always recomputed from the *effective* post-update state
+    // (whatever isn't in this dto falls back to what's already stored),
+    // never just when a specific field is detected as "the cron one" —
+    // one code path, so it can't miss a case (enabled flipped, trigger
+    // type changed away from scheduled, cron/timezone edited, ...) the way
+    // a per-field conditional easily could.
+    const effectiveEnabled = dto.enabled ?? existing.enabled;
+    const effectiveTimezone =
+      dto.trigger?.timezone ?? existing.trigger?.timezone ?? 'UTC';
+    const nextRunAt = this.resolveNextRunAt({
+      enabled: effectiveEnabled,
+      triggerType: dto.trigger?.type ?? existing.trigger?.type ?? 'manual',
+      cronExpression:
+        dto.trigger?.cronExpression ?? existing.trigger?.cronExpression ?? null,
+      timezone: effectiveTimezone,
+    });
 
     return this.prisma.automation.update({
       where: { id },
@@ -141,6 +177,17 @@ export class AutomationsService {
         ...(dto.requiresApproval !== undefined
           ? { requiresApproval: dto.requiresApproval }
           : {}),
+        nextRunAt,
+        // RC-25 review fix: nextRunAt is always rewritten above (recomputed
+        // from the effective post-update state), so any scheduler claim
+        // that was in flight for the *previous* nextRunAt value is
+        // necessarily stale the instant this commits — release it
+        // immediately rather than waiting for the lease to time out. This
+        // is what lets AutomationSchedulerService's own re-fetch
+        // (fresh.nextRunAt === scheduledFor check) catch a disable/
+        // re-enable or cron/timezone edit that lands between its claim and
+        // that re-fetch: the claim it thinks it still holds is gone.
+        scheduledClaimedAt: null,
         ...(dto.conditions !== undefined
           ? {
               conditions: (dto.conditions ??
@@ -158,11 +205,13 @@ export class AutomationsService {
                     type: dto.trigger.type,
                     cronExpression: dto.trigger.cronExpression ?? null,
                     eventType: dto.trigger.eventType ?? null,
+                    timezone: effectiveTimezone,
                   },
                   update: {
                     type: dto.trigger.type,
                     cronExpression: dto.trigger.cronExpression ?? null,
                     eventType: dto.trigger.eventType ?? null,
+                    timezone: effectiveTimezone,
                   },
                 },
               },
@@ -174,10 +223,20 @@ export class AutomationsService {
   }
 
   async setEnabled(organizationId: string, id: string, enabled: boolean) {
-    await this.findOne(organizationId, id);
+    const existing = await this.findOne(organizationId, id);
+    const nextRunAt = this.resolveNextRunAt({
+      enabled,
+      triggerType: existing.trigger?.type ?? 'manual',
+      cronExpression: existing.trigger?.cronExpression ?? null,
+      timezone: existing.trigger?.timezone ?? 'UTC',
+    });
     return this.prisma.automation.update({
       where: { id },
-      data: { enabled },
+      // RC-25 review fix: same reasoning as update() — nextRunAt is always
+      // rewritten here (disabling clears it, re-enabling recomputes it), so
+      // any in-flight scheduler claim for the previous value is stale the
+      // instant this commits.
+      data: { enabled, nextRunAt, scheduledClaimedAt: null },
       include: { trigger: true },
     });
   }
@@ -198,6 +257,27 @@ export class AutomationsService {
       // deduplicated against a previous one (unlike an emitted event).
       dedupKey: `manual:${randomUUID()}`,
       triggeredById: userId,
+    });
+  }
+
+  // Dedicated entry point for AutomationSchedulerService — deliberately not
+  // just startRun() made public. The caller must already hold this
+  // automation (having won the atomic nextRunAt claim for `scheduledFor`
+  // — see AutomationSchedulerService.runDueAutomations()); this method
+  // itself does no claiming, no re-fetch, and no org-scope check, only the
+  // run-creation half of the contract. `scheduledFor` — the occurrence
+  // that was actually due, never the newly-computed next one — is what
+  // makes the dedupKey deterministic per occurrence, so two callers
+  // racing for the *same* occurrence (if the claim step were ever bypassed)
+  // still collapse to exactly one run via the existing
+  // (organizationId, dedupKey) unique constraint (see persistRun()).
+  async triggerScheduled(
+    automation: AutomationWithTrigger,
+    scheduledFor: Date,
+  ): Promise<AutomationRunWithSteps> {
+    return this.startRun(automation, {
+      triggerType: 'scheduled',
+      dedupKey: `automation:${automation.id}:scheduled:${scheduledFor.toISOString()}`,
     });
   }
 
@@ -738,15 +818,122 @@ export class AutomationsService {
   // ---------------------------------------------------------------------
 
   private validateTrigger(trigger: AutomationTriggerDto) {
-    if (trigger.type === 'scheduled' && !trigger.cronExpression) {
-      throw new AutomationValidationError(
-        'A scheduled trigger requires a cronExpression.',
-      );
+    if (trigger.type === 'scheduled') {
+      if (!trigger.cronExpression) {
+        throw new AutomationValidationError(
+          'A scheduled trigger requires a cronExpression.',
+        );
+      }
+      // RC-25 review fix: reject incoherent combinations explicitly —
+      // eventType only ever means something for an `event` trigger.
+      // Silently accepting (and persisting) a stray eventType here would
+      // let bad data through that later code has to defensively tolerate.
+      if (trigger.eventType) {
+        throw new AutomationValidationError(
+          'A scheduled trigger cannot have an eventType.',
+        );
+      }
+      // Validates both the cron expression and the timezone by actually
+      // computing an occurrence with them — the same function used later
+      // to compute the real nextRunAt, so "this trigger validated" and
+      // "this trigger's nextRunAt can be computed" can never disagree.
+      try {
+        computeNextOccurrence(
+          trigger.cronExpression,
+          trigger.timezone ?? 'UTC',
+          new Date(),
+        );
+      } catch (error) {
+        if (
+          error instanceof InvalidCronExpressionError ||
+          error instanceof InvalidTimezoneError
+        ) {
+          throw new AutomationValidationError(error.message);
+        }
+        throw error;
+      }
+    } else if (trigger.type === 'event') {
+      if (!trigger.eventType) {
+        throw new AutomationValidationError(
+          'An event trigger requires an eventType.',
+        );
+      }
+      if (trigger.cronExpression) {
+        throw new AutomationValidationError(
+          'An event trigger cannot have a cronExpression.',
+        );
+      }
+      if (trigger.timezone) {
+        throw new AutomationValidationError(
+          'An event trigger cannot have a timezone.',
+        );
+      }
+    } else if (trigger.type === 'manual') {
+      if (trigger.cronExpression) {
+        throw new AutomationValidationError(
+          'A manual trigger cannot have a cronExpression.',
+        );
+      }
+      if (trigger.timezone) {
+        throw new AutomationValidationError(
+          'A manual trigger cannot have a timezone.',
+        );
+      }
+      if (trigger.eventType) {
+        throw new AutomationValidationError(
+          'A manual trigger cannot have an eventType.',
+        );
+      }
     }
-    if (trigger.type === 'event' && !trigger.eventType) {
-      throw new AutomationValidationError(
-        'An event trigger requires an eventType.',
+  }
+
+  // The single place that decides what Automation.nextRunAt should be,
+  // given the trigger/enabled state that will be persisted. Returns null
+  // for every case that must never carry a scheduled nextRunAt: disabled,
+  // manual, or event-triggered (see RC25 doc's "nextRunAt semantics").
+  //
+  // Assumes cronExpression/timezone already passed validateTrigger when
+  // they were *written* — but this method also runs on every update/
+  // setEnabled call that doesn't touch the trigger at all, using
+  // `existing.trigger` data that could, in principle, predate this
+  // validation (or a future bug). It must therefore never throw: a
+  // computation failure here degrades to "can't schedule yet" (null) with
+  // a logged warning, never a 500 on an unrelated field change (e.g.
+  // renaming the automation).
+  private resolveNextRunAt(params: {
+    enabled: boolean;
+    triggerType: string;
+    cronExpression: string | null;
+    timezone: string;
+  }): Date | null {
+    if (
+      !params.enabled ||
+      params.triggerType !== 'scheduled' ||
+      !params.cronExpression
+    ) {
+      return null;
+    }
+    try {
+      return computeNextOccurrence(
+        params.cronExpression,
+        params.timezone,
+        new Date(),
       );
+    } catch (error) {
+      // RC-25 review fix: same redaction discipline as
+      // AutomationSchedulerService's own error logs — never interpolate a
+      // cron expression, timezone, or error message straight into a log
+      // line without passing it through redactSensitive first.
+      this.logger.warn(
+        `Impossible de calculer nextRunAt (cron="${
+          redactSensitive(params.cronExpression) as string
+        }", timezone="${redactSensitive(params.timezone) as string}") : ${
+          redactSensitive(
+            error instanceof Error ? error.message : 'erreur inconnue',
+          ) as string
+        }`,
+      );
+      return null;
     }
   }
 
