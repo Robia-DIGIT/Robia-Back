@@ -189,6 +189,7 @@ describe('Multi-tenant isolation (RC-16)', () => {
         {} as unknown as OpportunityGeneratorService,
         {} as unknown as N8nWebhookService,
         intelligence as unknown as IntelligenceRegistryService,
+        {} as unknown as ConfigService,
       );
 
       const result = await service.findAllForAudit(orgA, 'audit-org-b');
@@ -214,6 +215,7 @@ describe('Multi-tenant isolation (RC-16)', () => {
         generator as unknown as OpportunityGeneratorService,
         {} as unknown as N8nWebhookService,
         intelligence as unknown as IntelligenceRegistryService,
+        {} as unknown as ConfigService,
       );
 
       await expect(
@@ -238,6 +240,7 @@ describe('Multi-tenant isolation (RC-16)', () => {
         {} as unknown as OpportunityGeneratorService,
         {} as unknown as N8nWebhookService,
         intelligence as unknown as IntelligenceRegistryService,
+        {} as unknown as ConfigService,
       );
 
       await expect(

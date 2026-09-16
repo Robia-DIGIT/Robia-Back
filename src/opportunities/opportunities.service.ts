@@ -1,4 +1,6 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { auditCompletedEmailProvider } from '../notifications/notification-policy';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   GeneratedOpportunity,
@@ -29,6 +31,7 @@ export class OpportunitiesService {
     private readonly generator: OpportunityGeneratorService,
     private readonly webhooks: N8nWebhookService,
     private readonly intelligence: IntelligenceRegistryService,
+    private readonly config: ConfigService,
   ) {}
 
   // RC-21: source_data shape for a provider-originated opportunity (any
@@ -284,19 +287,23 @@ export class OpportunitiesService {
       ),
     ]);
 
-    const scoreCandidate = audit.globalScore ?? auditResult?.global_score;
-    const score = Number(scoreCandidate);
-    void this.webhooks
-      .notifyAuditCompleted({
-        auditId: audit.id,
-        email: audit.organization.owner.email,
-        userName: audit.organization.owner.name,
-        websiteUrl: audit.website.url,
-        score: Number.isFinite(score) ? score : null,
-        opportunities: opportunities.map((opportunity) => opportunity.title),
-        completedAt: audit.completedAt ?? new Date(),
-      })
-      .catch(() => undefined);
+    // Audit routing is independent of the generic notification dispatcher.
+    // Keep n8n until an explicitly coordinated migration is ready.
+    if (auditCompletedEmailProvider(this.config) === 'n8n') {
+      const scoreCandidate = audit.globalScore ?? auditResult?.global_score;
+      const score = Number(scoreCandidate);
+      void this.webhooks
+        .notifyAuditCompleted({
+          auditId: audit.id,
+          email: audit.organization.owner.email,
+          userName: audit.organization.owner.name,
+          websiteUrl: audit.website.url,
+          score: Number.isFinite(score) ? score : null,
+          opportunities: opportunities.map((opportunity) => opportunity.title),
+          completedAt: audit.completedAt ?? new Date(),
+        })
+        .catch(() => undefined);
+    }
 
     return opportunities;
   }

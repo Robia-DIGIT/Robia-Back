@@ -70,6 +70,42 @@ export const EXAMPLE_AUTOMATIONS: CreateAutomationDto[] = [
       },
     ],
   },
+  {
+    // RC-26: must stay enabled: false until the SMTP channel has been
+    // configured (NOTIFICATIONS_ENABLED + SMTP_*) and manually validated —
+    // see docs/RC26_NOTIFICATION_DELIVERY.md's activation procedure. Never
+    // flipped to true anywhere in this codebase.
+    //
+    // Audit email migration is deferred; n8n remains the default provider.
+    name: "Notifier par email la fin d'un audit",
+    description:
+      "Quand un audit se termine, envoie un email au créateur de l'automatisation (template allowlisté audit_completed, données relues depuis l'audit) — nécessite un canal SMTP configuré et validé avant activation ; réservé à une future migration explicite via AUDIT_COMPLETED_EMAIL_PROVIDER=notifications.",
+    enabled: false,
+    requiresApproval: false,
+    trigger: {
+      type: 'event',
+      eventType: 'audit.completed',
+    },
+    conditions: {
+      field: 'audit.status',
+      operator: 'eq',
+      value: 'completed',
+    },
+    steps: [
+      {
+        actionType: 'robia.notification.send_email',
+        input: {
+          templateKey: 'audit_completed',
+          // Real audit.completed event fields only (see
+          // audit-completed.event.ts) — websiteUrl/scoreLine are resolved
+          // server-side from the Audit record itself, org-scoped, never
+          // from this step's own (static) input. See
+          // NotificationsService.resolveTemplateData().
+          auditId: '{{event.auditId}}',
+        },
+      },
+    ],
+  },
 ];
 
 export async function seedExampleAutomations(

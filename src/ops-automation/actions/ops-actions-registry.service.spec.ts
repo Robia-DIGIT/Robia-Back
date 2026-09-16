@@ -1,6 +1,7 @@
 import { PrismaService } from '../../prisma/prisma.service';
 import { AuditsService } from '../../audits/audits.service';
 import { OpportunitiesService } from '../../opportunities/opportunities.service';
+import { NotificationsService } from '../../notifications/notifications.service';
 import {
   InvalidOpsActionInputError,
   OpsActionsRegistryService,
@@ -19,12 +20,21 @@ interface MockAudits {
 interface MockOpportunities {
   generateFromAudit: jest.Mock;
 }
+interface MockNotifications {
+  createEmailDelivery: jest.Mock;
+}
 
 describe('OpsActionsRegistryService', () => {
   const organizationId = 'org-1';
+  const executionContext = {
+    automationId: 'automation-1',
+    runId: 'run-1',
+    stepRunId: 'step-run-1',
+  };
   let prisma: MockPrisma;
   let audits: MockAudits;
   let opportunities: MockOpportunities;
+  let notifications: MockNotifications;
   let registry: OpsActionsRegistryService;
 
   beforeEach(() => {
@@ -54,20 +64,33 @@ describe('OpsActionsRegistryService', () => {
         .fn()
         .mockResolvedValue([{ id: 'opp-1' }, { id: 'opp-2' }]),
     };
+    notifications = {
+      createEmailDelivery: jest.fn().mockResolvedValue({
+        delivery: {
+          id: 'delivery-1',
+          channel: 'email',
+          templateKey: 'audit_completed',
+          status: 'pending',
+        },
+        recipientEmail: 'jane@example.com',
+      }),
+    };
     registry = new OpsActionsRegistryService(
       prisma as unknown as PrismaService,
       audits as unknown as AuditsService,
       opportunities as unknown as OpportunitiesService,
+      notifications as unknown as NotificationsService,
     );
   });
 
   describe('allowlist', () => {
-    it('lists exactly the 4 safe, internal ROBIA actions', () => {
+    it('lists exactly the 5 safe, internal ROBIA actions', () => {
       const types = registry.listAllowedActions().map((a) => a.type);
       expect(types.sort()).toEqual(
         [
           'robia.action_items.create_internal_task',
           'robia.audit.run_diagnostic',
+          'robia.notification.send_email',
           'robia.opportunities.regenerate',
           'robia.report.prepare_organization_summary',
         ].sort(),
@@ -203,6 +226,142 @@ describe('OpsActionsRegistryService', () => {
     });
   });
 
+  describe('robia.notification.send_email', () => {
+    it('returns explicit routing evidence when n8n owns the audit email', async () => {
+      notifications.createEmailDelivery.mockResolvedValue({
+        delivery: null,
+        recipientEmail: '',
+        reason: 'handled_by_n8n',
+      });
+      const evidence = await registry.execute(
+        'robia.notification.send_email',
+        organizationId,
+        { templateKey: 'audit_completed' },
+        { automationId: 'auto-1', runId: 'run-1', stepRunId: 'step-1' },
+      );
+      expect(evidence).toEqual({
+        channel: 'email',
+        templateKey: 'audit_completed',
+        status: 'skipped',
+        reason: 'handled_by_n8n',
+      });
+    });
+    it('drops an arbitrary caller-supplied recipient field — canonicalizeInput only ever keeps templateKey/templateData', () => {
+      const canonical = registry.canonicalizeInput(
+        'robia.notification.send_email',
+        {
+          templateKey: 'audit_completed',
+          templateData: { websiteUrl: 'https://example.com', globalScore: 82 },
+          to: 'attacker@evil.example',
+          recipientEmail: 'attacker@evil.example',
+          replyTo: 'attacker@evil.example',
+        },
+      );
+      expect(canonical).toEqual({
+        templateKey: 'audit_completed',
+        templateData: { websiteUrl: 'https://example.com', globalScore: 82 },
+      });
+      expect(JSON.stringify(canonical)).not.toContain('evil.example');
+    });
+
+    it('delegates to NotificationsService.createEmailDelivery with the trusted execution context, never a caller-supplied recipient', async () => {
+      const evidence = await registry.execute(
+        'robia.notification.send_email',
+        organizationId,
+        {
+          templateKey: 'audit_completed',
+          templateData: { websiteUrl: 'https://example.com', globalScore: 82 },
+        },
+        executionContext,
+      );
+      expect(notifications.createEmailDelivery).toHaveBeenCalledWith({
+        organizationId,
+        automationId: executionContext.automationId,
+        automationRunId: executionContext.runId,
+        automationStepRunId: executionContext.stepRunId,
+        templateKey: 'audit_completed',
+        templateData: { websiteUrl: 'https://example.com', globalScore: 82 },
+      });
+      expect(evidence).toEqual({
+        deliveryId: 'delivery-1',
+        channel: 'email',
+        templateKey: 'audit_completed',
+        status: 'pending',
+        recipientMasked: 'j***@example.com',
+      });
+    });
+
+    it('never returns the full recipient address in its evidence', async () => {
+      const evidence = await registry.execute(
+        'robia.notification.send_email',
+        organizationId,
+        { templateKey: 'audit_completed', templateData: {} },
+        executionContext,
+      );
+      expect(JSON.stringify(evidence)).not.toContain('jane@example.com');
+    });
+
+    it('rejects a missing templateKey input', async () => {
+      await expect(
+        registry.execute(
+          'robia.notification.send_email',
+          organizationId,
+          { templateData: {} },
+          executionContext,
+        ),
+      ).rejects.toBeInstanceOf(InvalidOpsActionInputError);
+      expect(notifications.createEmailDelivery).not.toHaveBeenCalled();
+    });
+
+    it('defaults templateData to {} when absent', async () => {
+      await registry.execute(
+        'robia.notification.send_email',
+        organizationId,
+        { templateKey: 'audit_completed' },
+        executionContext,
+      );
+      expect(notifications.createEmailDelivery).toHaveBeenCalledWith(
+        expect.objectContaining({ templateData: {} }),
+      );
+    });
+
+    it('throws when invoked without an execution context', async () => {
+      await expect(
+        registry.execute('robia.notification.send_email', organizationId, {
+          templateKey: 'audit_completed',
+        }),
+      ).rejects.toBeInstanceOf(InvalidOpsActionInputError);
+      expect(notifications.createEmailDelivery).not.toHaveBeenCalled();
+    });
+
+    // RC-26 review fix: auditId (optionalInputSchema) forwarded through to
+    // NotificationsService, which is what resolves audit_completed's real
+    // data — see notifications.service.ts's resolveTemplateData().
+    it('forwards auditId through to createEmailDelivery when present', async () => {
+      await registry.execute(
+        'robia.notification.send_email',
+        organizationId,
+        { templateKey: 'audit_completed', auditId: 'audit-42' },
+        executionContext,
+      );
+      expect(notifications.createEmailDelivery).toHaveBeenCalledWith(
+        expect.objectContaining({ auditId: 'audit-42' }),
+      );
+    });
+
+    it('omits auditId when absent, never defaulting it to an empty string', async () => {
+      await registry.execute(
+        'robia.notification.send_email',
+        organizationId,
+        { templateKey: 'automation_failed', templateData: {} },
+        executionContext,
+      );
+      expect(notifications.createEmailDelivery).toHaveBeenCalledWith(
+        expect.objectContaining({ auditId: undefined }),
+      );
+    });
+  });
+
   describe('canonicalizeInput', () => {
     it('strips any key not declared by the action, keeping only its own allowlisted fields', () => {
       const canonical = registry.canonicalizeInput(
@@ -232,6 +391,62 @@ describe('OpsActionsRegistryService', () => {
       expect(() =>
         registry.canonicalizeInput('shell.exec', { cmd: 'rm -rf /' }),
       ).toThrow(UnknownOpsActionError);
+    });
+
+    it('keeps a declared object field (objectInputFields), stripping keys not part of it', () => {
+      const canonical = registry.canonicalizeInput(
+        'robia.notification.send_email',
+        {
+          templateKey: 'audit_completed',
+          templateData: { websiteUrl: 'https://example.com' },
+          extraneous: 'dropped',
+        },
+      );
+      expect(canonical).toEqual({
+        templateKey: 'audit_completed',
+        templateData: { websiteUrl: 'https://example.com' },
+      });
+    });
+
+    it('defaults a declared object field to {} when absent', () => {
+      const canonical = registry.canonicalizeInput(
+        'robia.notification.send_email',
+        { templateKey: 'audit_completed' },
+      );
+      expect(canonical).toEqual({
+        templateKey: 'audit_completed',
+        templateData: {},
+      });
+    });
+
+    // RC-26 review fix: optionalInputSchema (auditId).
+    it('keeps a declared optional field (optionalInputSchema) when present', () => {
+      const canonical = registry.canonicalizeInput(
+        'robia.notification.send_email',
+        { templateKey: 'audit_completed', auditId: 'audit-42' },
+      );
+      expect(canonical).toEqual({
+        templateKey: 'audit_completed',
+        templateData: {},
+        auditId: 'audit-42',
+      });
+    });
+
+    it('never requires a declared optional field to be present', () => {
+      const canonical = registry.canonicalizeInput(
+        'robia.notification.send_email',
+        { templateKey: 'automation_failed' },
+      );
+      expect(canonical).not.toHaveProperty('auditId');
+    });
+
+    it('rejects a declared object field that is an array', () => {
+      expect(() =>
+        registry.canonicalizeInput('robia.notification.send_email', {
+          templateKey: 'audit_completed',
+          templateData: ['not', 'an', 'object'],
+        }),
+      ).toThrow(InvalidOpsActionInputError);
     });
 
     it('never lets a templated placeholder value be rejected as invalid — it is still just a non-empty string', () => {

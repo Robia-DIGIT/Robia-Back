@@ -31,6 +31,11 @@ model User {
   createdAutomations      Automation[]
   triggeredAutomationRuns AutomationRun[] @relation("AutomationRunTriggeredBy")
   approvedAutomationRuns  AutomationRun[] @relation("AutomationRunApprovedBy")
+  // RC-26: a user is only ever the *recipient* of a notification when
+  // resolved server-side from Automation.createdById — never from a
+  // caller-supplied address (see OpsActionsRegistryService's
+  // robia.notification.send_email).
+  notificationDeliveries  NotificationDelivery[]
 
   @@map("users")
 }
@@ -72,6 +77,7 @@ model Organization {
   automationRuns    AutomationRun[]
   automationEvents  AutomationEvent[]
   competitors       Competitor[]
+  notificationDeliveries NotificationDelivery[]
   createdAt DateTime @default(now()) @map("created_at")
 
   @@map("organizations")
@@ -541,6 +547,7 @@ model AutomationRun {
   createdAt        DateTime @default(now()) @map("created_at")
 
   steps AutomationStepRun[]
+  notificationDeliveries NotificationDelivery[]
 
   @@unique([organizationId, dedupKey])
   @@index([organizationId, automationId, createdAt])
@@ -563,6 +570,71 @@ model AutomationStepRun {
   finishedAt DateTime? @map("finished_at")
   createdAt  DateTime @default(now()) @map("created_at")
 
+  notificationDeliveries NotificationDelivery[]
+
   @@unique([runId, sequence])
   @@map("automation_step_runs")
+}
+
+// RC-26 — Notification Delivery Foundation. A durable, retryable record of
+// one attempt to deliver one notification (today: email only) to one user.
+// Created exclusively by OpsActionsRegistryService's
+// robia.notification.send_email action — never directly by a controller,
+// and never with a caller-supplied recipient address (see that action's own
+// doc comment). NotificationDispatcherService (this module) is the only
+// thing that ever attempts the actual send, on its own schedule; creating a
+// row here never sends anything by itself.
+model NotificationDelivery {
+  id             String   @id @default(cuid())
+  organizationId String   @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  // Resolved server-side only, from Automation.createdById — see the
+  // action's own validation. Never a caller-supplied address.
+  recipientUserId String  @map("recipient_user_id")
+  recipient      User     @relation(fields: [recipientUserId], references: [id])
+  channel        String   @default("email")
+  // Must be one of NOTIFICATION_TEMPLATES' own keys (see
+  // notification-templates.ts) — enforced at creation time, not just at
+  // send time.
+  templateKey    String   @map("template_key")
+  // Already validated against the template's own declared variables
+  // (unknown keys rejected, values size-bounded, header-injection
+  // characters rejected) before this row is ever created — see
+  // notification-templates.ts's renderTemplate(). Never sensitive: this is
+  // what a template placeholder resolves to, not a secret.
+  templateData   Json     @map("template_data")
+  // pending -> processing -> sent
+  //                        -> retry_scheduled -> processing -> ...
+  //                        -> dead_letter
+  status         String   @default("pending")
+  // Unique per organization — a repeat call for the same automation run +
+  // step (see NotificationsService.createEmailDelivery()) always returns
+  // the same row instead of creating a second delivery.
+  idempotencyKey String   @map("idempotency_key")
+  attemptCount   Int      @default(0) @map("attempt_count")
+  nextAttemptAt  DateTime @default(now()) @map("next_attempt_at")
+  // Lease on the in-flight claim — see NotificationDispatcherService, the
+  // same two-phase claim-with-lease pattern as RC-25's
+  // AutomationSchedulerService (Automation.scheduledClaimedAt). Null when
+  // no claim is in flight.
+  claimedAt      DateTime? @map("claimed_at")
+  providerMessageId String? @map("provider_message_id")
+  // Always passed through redactSensitive() before being written — never a
+  // raw error object, SMTP response body, or anything that could carry a
+  // credential.
+  lastError      String?  @map("last_error")
+  sentAt         DateTime? @map("sent_at")
+  automationRunId String? @map("automation_run_id")
+  automationRun  AutomationRun? @relation(fields: [automationRunId], references: [id], onDelete: SetNull)
+  automationStepRunId String? @map("automation_step_run_id")
+  automationStepRun AutomationStepRun? @relation(fields: [automationStepRunId], references: [id], onDelete: SetNull)
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  @@unique([organizationId, idempotencyKey])
+  // Serves NotificationDispatcherService's periodic claim scan.
+  @@index([status, nextAttemptAt])
+  // Serves GET /ops/notifications (list, most recent first).
+  @@index([organizationId, createdAt])
+  @@map("notification_deliveries")
 }
