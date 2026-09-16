@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 import { ConfigModule } from '@nestjs/config';
 import { EventEmitterModule } from '@nestjs/event-emitter';
+import { ScheduleModule } from '@nestjs/schedule';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { LoggerModule } from 'nestjs-pino';
 import { buildPinoHttpOptions } from './common/logging/logger.config';
@@ -36,6 +37,9 @@ import { CompetitorsModule } from './competitors/competitors.module';
     // mechanism future modules — Meta, candidatures, opportunities — reuse
     // to reach OpsAutomationModule without a direct/circular dependency.
     EventEmitterModule.forRoot(),
+    // RC-25: powers AutomationSchedulerService's single periodic tick —
+    // registered once, globally, the same way EventEmitterModule is above.
+    ScheduleModule.forRoot(),
     ThrottlerModule.forRoot({
       throttlers: [{ ttl: 60_000, limit: 100 }],
     }),
