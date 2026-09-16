@@ -95,6 +95,7 @@ class FakeDispatcherPrisma {
     }: {
       where: {
         id: string;
+        attemptCount?: { lt?: number; gte?: number };
         claimedAt?: Date | null;
         AND?: [
           {
@@ -112,6 +113,16 @@ class FakeDispatcherPrisma {
     }): { count: number } => {
       const record = this.records.get(where.id);
       if (!record) return { count: 0 };
+      if (
+        where.attemptCount?.lt !== undefined &&
+        record.attemptCount >= where.attemptCount.lt
+      )
+        return { count: 0 };
+      if (
+        where.attemptCount?.gte !== undefined &&
+        record.attemptCount < where.attemptCount.gte
+      )
+        return { count: 0 };
 
       if (where.claimedAt !== undefined) {
         const matches =
@@ -220,6 +231,40 @@ describe('NotificationDispatcherService', () => {
   }
 
   const now = new Date('2026-09-21T06:05:00.000Z');
+
+  it.each(['processing', 'pending', 'retry_scheduled'])(
+    'never sends an exhausted %s delivery, even on repeated ticks',
+    async (status) => {
+      const { dispatcher, prisma } = buildDispatcher([
+        delivery({
+          status,
+          attemptCount: 5,
+          claimedAt: new Date(now.getTime() - 6 * 60_000),
+        }),
+      ]);
+      await dispatcher.runDueDeliveries(now);
+      await dispatcher.runDueDeliveries(new Date(now.getTime() + 10 * 60_000));
+      expect(sendEmail).not.toHaveBeenCalled();
+      expect(prisma.get('delivery-1')).toMatchObject({
+        status: 'dead_letter',
+        attemptCount: 5,
+        claimedAt: null,
+      });
+    },
+  );
+
+  it('does not terminalize the fifth attempt while its lease is still live', async () => {
+    const { dispatcher, prisma } = buildDispatcher([
+      delivery({ status: 'processing', attemptCount: 5, claimedAt: now }),
+    ]);
+    await dispatcher.runDueDeliveries(now);
+    expect(sendEmail).not.toHaveBeenCalled();
+    expect(prisma.get('delivery-1')).toMatchObject({
+      status: 'processing',
+      attemptCount: 5,
+      claimedAt: now,
+    });
+  });
 
   it('never touches the network when NOTIFICATIONS_ENABLED is off', async () => {
     ensureReady.mockImplementation(() => {
@@ -448,13 +493,14 @@ describe('NotificationDispatcherService', () => {
     expect(prisma.get('delivery-1')?.status).toBe('processing');
   });
 
-  it('sends a dead-lettered delivery again once it has been manually reset to pending', async () => {
+  it('allows manual retry with one remaining attempt, without resetting the counter', async () => {
     const { dispatcher, prisma } = buildDispatcher([
-      delivery({ status: 'pending', claimedAt: null, attemptCount: 5 }),
+      delivery({ status: 'pending', claimedAt: null, attemptCount: 4 }),
     ]);
     await dispatcher.runDueDeliveries(now);
     expect(sendEmail).toHaveBeenCalledTimes(1);
     expect(prisma.get('delivery-1')?.status).toBe('sent');
+    expect(prisma.get('delivery-1')?.attemptCount).toBe(5);
   });
 
   it('processes multiple due deliveries independently in the same tick', async () => {

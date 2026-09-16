@@ -373,7 +373,7 @@ export class OpsActionsRegistryService {
             'robia.notification.send_email requires automation execution context.',
           );
         }
-        const { delivery, recipientEmail } =
+        const { delivery, recipientEmail, reason } =
           await this.notifications.createEmailDelivery({
             organizationId,
             automationId: context.automationId,
@@ -383,6 +383,9 @@ export class OpsActionsRegistryService {
             templateData,
             auditId,
           });
+        if (!delivery) {
+          return { channel: 'email', templateKey, status: 'skipped', reason };
+        }
         return {
           deliveryId: delivery.id,
           channel: delivery.channel,

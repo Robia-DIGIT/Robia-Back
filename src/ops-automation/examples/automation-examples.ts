@@ -76,16 +76,10 @@ export const EXAMPLE_AUTOMATIONS: CreateAutomationDto[] = [
     // see docs/RC26_NOTIFICATION_DELIVERY.md's activation procedure. Never
     // flipped to true anywhere in this codebase.
     //
-    // Single owner of the "audit terminé" email: while NOTIFICATIONS_ENABLED
-    // is "true", OpportunitiesService.generateFromAudit() (the existing
-    // "Régénérer les opportunités" example below, or a direct call) no
-    // longer fires the n8n audit-completed webhook — this automation, once
-    // also enabled, is what takes over that responsibility. See
-    // docs/RC26_NOTIFICATION_DELIVERY.md's "Bascule email audit — un seul
-    // responsable".
+    // Audit email migration is deferred; n8n remains the default provider.
     name: "Notifier par email la fin d'un audit",
     description:
-      "Quand un audit se termine, envoie un email au créateur de l'automatisation (template allowlisté audit_completed, données relues depuis l'audit) — nécessite un canal SMTP configuré et validé avant activation ; désactive automatiquement le webhook n8n équivalent une fois NOTIFICATIONS_ENABLED=true.",
+      "Quand un audit se termine, envoie un email au créateur de l'automatisation (template allowlisté audit_completed, données relues depuis l'audit) — nécessite un canal SMTP configuré et validé avant activation ; réservé à une future migration explicite via AUDIT_COMPLETED_EMAIL_PROVIDER=notifications.",
     enabled: false,
     requiresApproval: false,
     trigger: {

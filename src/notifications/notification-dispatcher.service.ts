@@ -5,6 +5,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { redactSensitive } from '../common/logging/redact';
 import { maskEmail } from './mask-email';
 import { renderNotificationTemplate } from './notification-templates';
+import { MAX_NOTIFICATION_ATTEMPTS } from './notification-policy';
 import {
   IncompleteSmtpConfigurationError,
   NOTIFICATION_TRANSPORT,
@@ -31,7 +32,7 @@ const CLAIM_LEASE_MS = 5 * 60 * 1000;
 // kept in this array for documentation/symmetry with the spec and as the
 // value to use first if MAX_ATTEMPTS is ever raised — it is not reachable
 // under the current cap.
-const MAX_ATTEMPTS = 5;
+const MAX_ATTEMPTS = MAX_NOTIFICATION_ATTEMPTS;
 const RETRY_BACKOFF_MS = [
   60_000, // 1 min
   5 * 60_000, // 5 min
@@ -153,6 +154,20 @@ export class NotificationDispatcherService {
     now: Date,
     staleThreshold: Date,
   ): Promise<void> {
+    // Terminalize exhausted, due deliveries without claiming or sending again.
+    // Re-check both budget and lease atomically; never interrupt a live fifth send.
+    await this.prisma.notificationDelivery.updateMany({
+      where: {
+        id: delivery.id,
+        ...this.dueSetWhere(now, staleThreshold),
+        attemptCount: { gte: MAX_ATTEMPTS },
+      },
+      data: {
+        status: 'dead_letter',
+        claimedAt: null,
+        lastError: 'Notification attempt limit reached.',
+      },
+    });
     // Phase 1 — claim. attemptCount is incremented atomically right here,
     // not at finalize time (RC-26 review fix): this is what makes it count
     // every real pickup — including one interrupted by a crash before any
@@ -160,7 +175,11 @@ export class NotificationDispatcherService {
     // and leaving a delivery that succeeded on its very first try showing
     // attemptCount: 0.
     const claim = await this.prisma.notificationDelivery.updateMany({
-      where: { id: delivery.id, ...this.dueSetWhere(now, staleThreshold) },
+      where: {
+        id: delivery.id,
+        ...this.dueSetWhere(now, staleThreshold),
+        attemptCount: { lt: MAX_ATTEMPTS },
+      },
       data: {
         status: 'processing',
         claimedAt: now,

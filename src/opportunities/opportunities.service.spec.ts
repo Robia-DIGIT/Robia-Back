@@ -6,12 +6,7 @@ import { N8nWebhookService } from '../integrations/n8n-webhook.service';
 import { IntelligenceRegistryService } from '../intelligence/intelligence-registry.service';
 import { IntelligenceFinding } from '../intelligence/intelligence.types';
 
-// RC-26 review fix: NOTIFICATIONS_ENABLED is the single switch that
-// decides whether generateFromAudit() still fires the n8n audit-completed
-// webhook, or defers to RC-26's own SMTP-based channel instead — see
-// opportunities.service.ts's own comment at the call site. Defaults to
-// "not configured" (same as a real ConfigService with no env var set),
-// which resolves to the "false" fallback exactly like production.
+// Default routing preserves n8n independently of dispatcher activation.
 function fakeConfig(values: Record<string, string> = {}): ConfigService {
   return {
     get: (name: string, fallback?: string) => values[name] ?? fallback,
@@ -203,38 +198,49 @@ describe('OpportunitiesService', () => {
     });
   });
 
-  // RC-26 review fix: single owner of the "audit terminé" email — once
-  // NOTIFICATIONS_ENABLED=true, this n8n webhook must stop firing so it can
-  // never double-send alongside RC-26's own SMTP-based channel.
-  it('never sends the n8n audit-completed webhook once NOTIFICATIONS_ENABLED=true (RC-26 channel owns it)', async () => {
-    service = new OpportunitiesService(
-      prisma as unknown as PrismaService,
-      generator as unknown as OpportunityGeneratorService,
-      webhooks as unknown as N8nWebhookService,
-      intelligence as unknown as IntelligenceRegistryService,
-      fakeConfig({ NOTIFICATIONS_ENABLED: 'true' }),
-    );
-    prisma.audit.findFirst.mockResolvedValue({
-      id: auditId,
-      globalScore: 62,
-      completedAt: new Date('2026-09-04T21:00:00Z'),
-      website: { url: 'https://robiacopilot.site/' },
-      organization: {
-        owner: { name: 'Landry', email: 'landry@example.com' },
-      },
-      resultJson: {
-        global_score: 62,
-        site_audit: {
-          pages_analyzed: 2,
-          pages: [{ url: 'https://robiacopilot.site/' }],
+  it.each([
+    ['false', 'n8n', true],
+    ['true', 'n8n', true],
+    ['true', 'notifications', false],
+    ['true', undefined, true],
+    ['true', 'invalid', true],
+  ])(
+    'routes audit email with dispatcher=%s, provider=%s (no email automation required)',
+    async (enabled, provider, sendsN8n) => {
+      service = new OpportunitiesService(
+        prisma as unknown as PrismaService,
+        generator as unknown as OpportunityGeneratorService,
+        webhooks as unknown as N8nWebhookService,
+        intelligence as unknown as IntelligenceRegistryService,
+        fakeConfig({
+          NOTIFICATIONS_ENABLED: enabled,
+          ...(provider ? { AUDIT_COMPLETED_EMAIL_PROVIDER: provider } : {}),
+        }),
+      );
+      prisma.audit.findFirst.mockResolvedValue({
+        id: auditId,
+        globalScore: 62,
+        completedAt: new Date('2026-09-04T21:00:00Z'),
+        website: { url: 'https://robiacopilot.site/' },
+        organization: {
+          owner: { name: 'Landry', email: 'landry@example.com' },
         },
-      },
-    });
+        resultJson: {
+          global_score: 62,
+          site_audit: {
+            pages_analyzed: 2,
+            pages: [{ url: 'https://robiacopilot.site/' }],
+          },
+        },
+      });
 
-    await service.generateFromAudit(organizationId, auditId);
+      await service.generateFromAudit(organizationId, auditId);
 
-    expect(webhooks.notifyAuditCompleted).not.toHaveBeenCalled();
-  });
+      expect(webhooks.notifyAuditCompleted).toHaveBeenCalledTimes(
+        sendsN8n ? 1 : 0,
+      );
+    },
+  );
 
   it('keeps the legacy single-page generator for existing audits', async () => {
     const legacyResult = {

@@ -4,6 +4,11 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { Prisma, NotificationDelivery } from '@prisma/client';
+import { ConfigService } from '@nestjs/config';
+import {
+  auditCompletedEmailProvider,
+  MAX_NOTIFICATION_ATTEMPTS,
+} from './notification-policy';
 import { PrismaService } from '../prisma/prisma.service';
 import { renderNotificationTemplate } from './notification-templates';
 
@@ -45,8 +50,9 @@ export interface CreateEmailDeliveryParams {
 }
 
 export interface CreateEmailDeliveryResult {
-  delivery: NotificationDelivery;
+  delivery: NotificationDelivery | null;
   recipientEmail: string;
+  reason?: 'handled_by_n8n';
 }
 
 // A delivery can be manually retried from exactly this status — the only
@@ -56,7 +62,10 @@ const RETRYABLE_STATUSES = ['dead_letter'];
 
 @Injectable()
 export class NotificationsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly config: ConfigService,
+  ) {}
 
   // Called exclusively by OpsActionsRegistryService's
   // robia.notification.send_email action, from inside an automation run's
@@ -68,6 +77,12 @@ export class NotificationsService {
   async createEmailDelivery(
     params: CreateEmailDeliveryParams,
   ): Promise<CreateEmailDeliveryResult> {
+    if (
+      params.templateKey === 'audit_completed' &&
+      auditCompletedEmailProvider(this.config) === 'n8n'
+    ) {
+      return { delivery: null, recipientEmail: '', reason: 'handled_by_n8n' };
+    }
     // RC-26 review fix: the real audit.completed event (see
     // audit-completed.event.ts) only ever carries auditId/websiteId/
     // globalScore — never a websiteUrl string — so audit_completed's
@@ -229,6 +244,12 @@ export class NotificationsService {
     // exist or belongs to a different organization — never itself the
     // source of truth for the state transition below.
     const existing = await this.findOne(organizationId, id);
+    // Manual retry uses only the remaining lifetime budget; no hidden reset.
+    if (existing.attemptCount >= MAX_NOTIFICATION_ATTEMPTS) {
+      throw new NotificationRetryNotAllowedError(
+        'Notification attempt limit reached.',
+      );
+    }
     if (!RETRYABLE_STATUSES.includes(existing.status)) {
       throw new NotificationRetryNotAllowedError(
         `Only a delivery in one of [${RETRYABLE_STATUSES.join(', ')}] can be manually retried (current status: "${existing.status}").`,
@@ -236,7 +257,12 @@ export class NotificationsService {
     }
 
     const result = await this.prisma.notificationDelivery.updateMany({
-      where: { id, organizationId, status: { in: RETRYABLE_STATUSES } },
+      where: {
+        id,
+        organizationId,
+        status: { in: RETRYABLE_STATUSES },
+        attemptCount: { lt: MAX_NOTIFICATION_ATTEMPTS },
+      },
       data: {
         status: 'pending',
         nextAttemptAt: new Date(),

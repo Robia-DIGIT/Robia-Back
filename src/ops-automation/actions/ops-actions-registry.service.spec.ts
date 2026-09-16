@@ -227,6 +227,25 @@ describe('OpsActionsRegistryService', () => {
   });
 
   describe('robia.notification.send_email', () => {
+    it('returns explicit routing evidence when n8n owns the audit email', async () => {
+      notifications.createEmailDelivery.mockResolvedValue({
+        delivery: null,
+        recipientEmail: '',
+        reason: 'handled_by_n8n',
+      });
+      const evidence = await registry.execute(
+        'robia.notification.send_email',
+        organizationId,
+        { templateKey: 'audit_completed' },
+        { automationId: 'auto-1', runId: 'run-1', stepRunId: 'step-1' },
+      );
+      expect(evidence).toEqual({
+        channel: 'email',
+        templateKey: 'audit_completed',
+        status: 'skipped',
+        reason: 'handled_by_n8n',
+      });
+    });
     it('drops an arbitrary caller-supplied recipient field — canonicalizeInput only ever keeps templateKey/templateData', () => {
       const canonical = registry.canonicalizeInput(
         'robia.notification.send_email',

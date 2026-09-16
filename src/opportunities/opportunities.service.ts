@@ -1,5 +1,6 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { auditCompletedEmailProvider } from '../notifications/notification-policy';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   GeneratedOpportunity,
@@ -286,18 +287,9 @@ export class OpportunitiesService {
       ),
     ]);
 
-    // RC-26 review fix — single owner of the "audit terminé" email: this
-    // n8n webhook and RC-26's own SMTP-based notification (the "Notifier
-    // par email la fin d'un audit" example automation, src/ops-automation/
-    // examples/automation-examples.ts) both listen to the same
-    // audit.completed occurrence. NOTIFICATIONS_ENABLED is the single
-    // switch that decides which one owns it: while it is not exactly
-    // "true" (the default everywhere until an operator deliberately
-    // activates RC-26's channel), nothing here changes and n8n keeps
-    // sending exactly as it always has. Once flipped, this call is skipped
-    // — the new channel takes over, and the two can never both fire for
-    // the same audit. See docs/RC26_NOTIFICATION_DELIVERY.md.
-    if (this.config.get<string>('NOTIFICATIONS_ENABLED', 'false') !== 'true') {
+    // Audit routing is independent of the generic notification dispatcher.
+    // Keep n8n until an explicitly coordinated migration is ready.
+    if (auditCompletedEmailProvider(this.config) === 'n8n') {
       const scoreCandidate = audit.globalScore ?? auditResult?.global_score;
       const score = Number(scoreCandidate);
       void this.webhooks

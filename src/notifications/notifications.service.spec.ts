@@ -1,3 +1,4 @@
+import { ConfigService } from '@nestjs/config';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import {
@@ -146,14 +147,21 @@ class FakePrisma {
       where,
       data,
     }: {
-      where: { id: string; organizationId: string; status: { in: string[] } };
+      where: {
+        id: string;
+        organizationId: string;
+        status: { in: string[] };
+        attemptCount?: { lt: number };
+      };
       data: Record<string, unknown>;
     }) => {
       const record = this.deliveries.get(where.id);
       if (
         !record ||
         record.organizationId !== where.organizationId ||
-        !where.status.in.includes(record.status as string)
+        !where.status.in.includes(record.status as string) ||
+        (where.attemptCount !== undefined &&
+          Number(record.attemptCount) >= where.attemptCount.lt)
       ) {
         return { count: 0 };
       }
@@ -197,10 +205,57 @@ describe('NotificationsService', () => {
 
   beforeEach(() => {
     prisma = new FakePrisma();
-    service = new NotificationsService(prisma as unknown as PrismaService);
+    service = new NotificationsService(
+      prisma as unknown as PrismaService,
+      new ConfigService({ AUDIT_COMPLETED_EMAIL_PROVIDER: 'notifications' }),
+    );
   });
 
   describe('createEmailDelivery', () => {
+    it.each(['false', 'true'])(
+      'skips SMTP audit delivery in n8n mode with dispatcher=%s',
+      async (enabled) => {
+        service = new NotificationsService(
+          prisma as unknown as PrismaService,
+          new ConfigService({
+            NOTIFICATIONS_ENABLED: enabled,
+            AUDIT_COMPLETED_EMAIL_PROVIDER: 'n8n',
+          }),
+        );
+        const result = await service.createEmailDelivery({
+          organizationId: 'org-1',
+          automationId: 'automation-1',
+          automationRunId: 'run-1',
+          automationStepRunId: 'step-1',
+          templateKey: 'audit_completed',
+        });
+        expect(result).toMatchObject({
+          delivery: null,
+          reason: 'handled_by_n8n',
+        });
+        expect(prisma.deliveries.size).toBe(0);
+      },
+    );
+
+    it('allows weekly notifications while audit routing remains n8n', async () => {
+      seedAutomation(prisma);
+      service = new NotificationsService(
+        prisma as unknown as PrismaService,
+        new ConfigService({
+          NOTIFICATIONS_ENABLED: 'true',
+          AUDIT_COMPLETED_EMAIL_PROVIDER: 'n8n',
+        }),
+      );
+      const result = await service.createEmailDelivery({
+        organizationId: 'org-1',
+        automationId: 'automation-1',
+        automationRunId: 'run-1',
+        automationStepRunId: 'step-1',
+        templateKey: 'weekly_opportunities_summary',
+        templateData: { organizationName: 'ROBIA', openOpportunityCount: 3 },
+      });
+      expect(result.delivery).toMatchObject({ status: 'pending' });
+    });
     it('creates a pending delivery addressed to Automation.createdBy, never a caller-supplied recipient', async () => {
       seedAutomation(prisma);
       const { delivery, recipientEmail } = await service.createEmailDelivery({
@@ -293,7 +348,7 @@ describe('NotificationsService', () => {
       };
       const first = await service.createEmailDelivery(params);
       const second = await service.createEmailDelivery(params);
-      expect(second.delivery.id).toBe(first.delivery.id);
+      expect(second.delivery!.id).toBe(first.delivery!.id);
       expect(prisma.deliveries.size).toBe(1);
     });
   });
@@ -326,7 +381,7 @@ describe('NotificationsService', () => {
         },
       });
 
-      expect(delivery.templateData).toEqual({
+      expect(delivery!.templateData).toEqual({
         websiteUrl: 'https://robiacopilot.site',
         scoreLine: '91/100',
       });
@@ -345,7 +400,7 @@ describe('NotificationsService', () => {
         auditId: 'audit-1',
       });
 
-      expect(delivery.templateData).toMatchObject({
+      expect(delivery!.templateData).toMatchObject({
         scoreLine: 'non disponible',
       });
     });
@@ -410,13 +465,38 @@ describe('NotificationsService', () => {
         },
       });
 
-      await expect(service.findOne('org-other', delivery.id)).rejects.toThrow();
+      await expect(
+        service.findOne('org-other', delivery!.id),
+      ).rejects.toThrow();
       const list = await service.findAllForOrganization('org-other');
       expect(list).toHaveLength(0);
     });
   });
 
   describe('retry', () => {
+    it('rejects manual retry after all five attempts, preserving history', async () => {
+      seedAutomation(prisma);
+      const result = await service.createEmailDelivery({
+        organizationId: 'org-1',
+        automationId: 'automation-1',
+        automationRunId: 'run-1',
+        automationStepRunId: 'step-1',
+        templateKey: 'weekly_opportunities_summary',
+        templateData: { organizationName: 'ROBIA', openOpportunityCount: 3 },
+      });
+      const id = result.delivery!.id;
+      Object.assign(prisma.deliveries.get(id)!, {
+        status: 'dead_letter',
+        attemptCount: 5,
+      });
+      await expect(service.retry('org-1', id)).rejects.toBeInstanceOf(
+        NotificationRetryNotAllowedError,
+      );
+      expect(prisma.deliveries.get(id)).toMatchObject({
+        status: 'dead_letter',
+        attemptCount: 5,
+      });
+    });
     it('puts a dead_letter delivery back to pending, preserving its idempotencyKey, without creating a new row', async () => {
       seedAutomation(prisma);
       const { delivery } = await service.createEmailDelivery({
@@ -430,12 +510,12 @@ describe('NotificationsService', () => {
           errorMessage: 'Timeout',
         },
       });
-      prisma.deliveries.get(delivery.id)!.status = 'dead_letter';
+      prisma.deliveries.get(delivery!.id)!.status = 'dead_letter';
 
-      const retried = await service.retry('org-1', delivery.id);
+      const retried = await service.retry('org-1', delivery!.id);
       expect(retried.status).toBe('pending');
       expect(retried.claimedAt).toBeNull();
-      expect(retried.idempotencyKey).toBe(delivery.idempotencyKey);
+      expect(retried.idempotencyKey).toBe(delivery!.idempotencyKey);
       expect(prisma.deliveries.size).toBe(1);
     });
 
@@ -452,7 +532,7 @@ describe('NotificationsService', () => {
           errorMessage: 'Timeout',
         },
       });
-      await expect(service.retry('org-1', delivery.id)).rejects.toBeInstanceOf(
+      await expect(service.retry('org-1', delivery!.id)).rejects.toBeInstanceOf(
         NotificationRetryNotAllowedError,
       );
     });
@@ -470,9 +550,9 @@ describe('NotificationsService', () => {
           errorMessage: 'Timeout',
         },
       });
-      prisma.deliveries.get(delivery.id)!.status = 'dead_letter';
+      prisma.deliveries.get(delivery!.id)!.status = 'dead_letter';
 
-      await expect(service.retry('org-other', delivery.id)).rejects.toThrow();
+      await expect(service.retry('org-other', delivery!.id)).rejects.toThrow();
     });
 
     // RC-26 review fix: retry() must use a single atomic conditional
@@ -493,7 +573,7 @@ describe('NotificationsService', () => {
           errorMessage: 'Timeout',
         },
       });
-      prisma.deliveries.get(delivery.id)!.status = 'dead_letter';
+      prisma.deliveries.get(delivery!.id)!.status = 'dead_letter';
 
       // Simulate a dispatcher worker reclaiming the delivery (status ->
       // processing, a fresh claimedAt) in the gap between retry()'s own
@@ -507,18 +587,18 @@ describe('NotificationsService', () => {
         findFirstCalls += 1;
         const result = originalFindFirst(args);
         if (findFirstCalls === 1) {
-          const record = prisma.deliveries.get(delivery.id)!;
+          const record = prisma.deliveries.get(delivery!.id)!;
           record.status = 'processing';
           record.claimedAt = new Date('2026-09-21T06:05:00.000Z');
         }
         return result;
       };
 
-      await expect(service.retry('org-1', delivery.id)).rejects.toBeInstanceOf(
+      await expect(service.retry('org-1', delivery!.id)).rejects.toBeInstanceOf(
         NotificationRetryNotAllowedError,
       );
       // The worker's claim must survive untouched.
-      const stored = prisma.deliveries.get(delivery.id)!;
+      const stored = prisma.deliveries.get(delivery!.id)!;
       expect(stored.status).toBe('processing');
       expect(stored.claimedAt).toEqual(new Date('2026-09-21T06:05:00.000Z'));
     });
