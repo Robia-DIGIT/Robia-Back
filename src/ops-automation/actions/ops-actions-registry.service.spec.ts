@@ -314,6 +314,33 @@ describe('OpsActionsRegistryService', () => {
       ).rejects.toBeInstanceOf(InvalidOpsActionInputError);
       expect(notifications.createEmailDelivery).not.toHaveBeenCalled();
     });
+
+    // RC-26 review fix: auditId (optionalInputSchema) forwarded through to
+    // NotificationsService, which is what resolves audit_completed's real
+    // data — see notifications.service.ts's resolveTemplateData().
+    it('forwards auditId through to createEmailDelivery when present', async () => {
+      await registry.execute(
+        'robia.notification.send_email',
+        organizationId,
+        { templateKey: 'audit_completed', auditId: 'audit-42' },
+        executionContext,
+      );
+      expect(notifications.createEmailDelivery).toHaveBeenCalledWith(
+        expect.objectContaining({ auditId: 'audit-42' }),
+      );
+    });
+
+    it('omits auditId when absent, never defaulting it to an empty string', async () => {
+      await registry.execute(
+        'robia.notification.send_email',
+        organizationId,
+        { templateKey: 'automation_failed', templateData: {} },
+        executionContext,
+      );
+      expect(notifications.createEmailDelivery).toHaveBeenCalledWith(
+        expect.objectContaining({ auditId: undefined }),
+      );
+    });
   });
 
   describe('canonicalizeInput', () => {
@@ -371,6 +398,27 @@ describe('OpsActionsRegistryService', () => {
         templateKey: 'audit_completed',
         templateData: {},
       });
+    });
+
+    // RC-26 review fix: optionalInputSchema (auditId).
+    it('keeps a declared optional field (optionalInputSchema) when present', () => {
+      const canonical = registry.canonicalizeInput(
+        'robia.notification.send_email',
+        { templateKey: 'audit_completed', auditId: 'audit-42' },
+      );
+      expect(canonical).toEqual({
+        templateKey: 'audit_completed',
+        templateData: {},
+        auditId: 'audit-42',
+      });
+    });
+
+    it('never requires a declared optional field to be present', () => {
+      const canonical = registry.canonicalizeInput(
+        'robia.notification.send_email',
+        { templateKey: 'automation_failed' },
+      );
+      expect(canonical).not.toHaveProperty('auditId');
     });
 
     it('rejects a declared object field that is an array', () => {

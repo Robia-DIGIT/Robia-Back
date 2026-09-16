@@ -30,18 +30,32 @@ describe('notification-templates', () => {
     it('renders subject and text from valid variables', () => {
       const rendered = renderNotificationTemplate('audit_completed', {
         websiteUrl: 'https://example.com',
-        globalScore: 82,
+        scoreLine: '82/100',
       });
       expect(rendered.subject).toBe('Audit terminé pour https://example.com');
       expect(rendered.text).toContain('https://example.com');
       expect(rendered.text).toContain('82/100');
     });
 
+    // RC-26 review fix: an absent score is handled explicitly upstream
+    // (NotificationsService.resolveAuditCompletedData()) by passing a
+    // pre-formatted "non disponible" string rather than leaving the
+    // template to render "null/100" or similar.
+    it('renders a pre-formatted "no score" line without needing template-level special-casing', () => {
+      const rendered = renderNotificationTemplate('audit_completed', {
+        websiteUrl: 'https://example.com',
+        scoreLine: 'non disponible',
+      });
+      expect(rendered.text).toContain('Score global : non disponible.');
+      expect(rendered.text).not.toContain('null');
+      expect(rendered.text).not.toContain('undefined');
+    });
+
     it('rejects an unknown variable', () => {
       expect(() =>
         renderNotificationTemplate('audit_completed', {
           websiteUrl: 'https://example.com',
-          globalScore: 82,
+          scoreLine: '82/100',
           unexpected: 'value',
         }),
       ).toThrow(InvalidNotificationTemplateDataError);
@@ -62,7 +76,7 @@ describe('notification-templates', () => {
       expect(() =>
         renderNotificationTemplate('audit_completed', [
           'websiteUrl',
-          'globalScore',
+          'scoreLine',
         ]),
       ).toThrow(InvalidNotificationTemplateDataError);
       expect(() => renderNotificationTemplate('audit_completed', null)).toThrow(
@@ -74,7 +88,7 @@ describe('notification-templates', () => {
       expect(() =>
         renderNotificationTemplate('audit_completed', {
           websiteUrl: 'https://example.com/'.padEnd(300, 'a'),
-          globalScore: 82,
+          scoreLine: '82/100',
         }),
       ).toThrow(InvalidNotificationTemplateDataError);
     });
@@ -83,7 +97,7 @@ describe('notification-templates', () => {
       expect(() =>
         renderNotificationTemplate('audit_completed', {
           websiteUrl: 'https://example.com\r\nBcc: attacker@evil.example',
-          globalScore: 82,
+          scoreLine: '82/100',
         }),
       ).toThrow(InvalidNotificationTemplateDataError);
     });
@@ -92,7 +106,7 @@ describe('notification-templates', () => {
       expect(() =>
         renderNotificationTemplate('audit_completed', {
           websiteUrl: '',
-          globalScore: 82,
+          scoreLine: '82/100',
         }),
       ).toThrow(InvalidNotificationTemplateDataError);
     });

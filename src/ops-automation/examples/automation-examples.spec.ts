@@ -71,21 +71,24 @@ describe('RC-20 demonstration automations', () => {
     expect(resolved).toEqual({ auditId: 'audit-42' });
   });
 
-  it("resolves the notify-by-email example's nested templateData from a real event payload", () => {
+  // RC-26 review fix: the real audit.completed event only ever carries
+  // auditId/websiteId/globalScore (see audit-completed.event.ts) — never a
+  // websiteUrl — so this example passes auditId through and lets
+  // NotificationsService resolve websiteUrl/scoreLine from the real Audit
+  // record itself, org-scoped.
+  it("resolves the notify-by-email example's auditId from a real event payload", () => {
     const notifyByEmail = EXAMPLE_AUTOMATIONS.find(
       (a) => a.name === "Notifier par email la fin d'un audit",
     )!;
     const [step] = notifyByEmail.steps;
     const resolved = resolveStepInput(step.input, {
-      websiteUrl: 'https://example.com',
+      auditId: 'audit-42',
+      websiteId: 'website-1',
       globalScore: 91,
     });
     expect(resolved).toEqual({
       templateKey: 'audit_completed',
-      templateData: {
-        websiteUrl: 'https://example.com',
-        globalScore: 91,
-      },
+      auditId: 'audit-42',
     });
   });
 });

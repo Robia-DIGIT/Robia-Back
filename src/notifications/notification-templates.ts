@@ -44,13 +44,20 @@ const NOTIFICATION_TEMPLATES: Record<
   NotificationTemplateKey,
   NotificationTemplateDescriptor
 > = {
+  // RC-26 review fix: `scoreLine` (not a raw `globalScore` number) is
+  // deliberately a fully pre-formatted string — "82/100" or "non
+  // disponible" — computed by NotificationsService.createEmailDelivery()
+  // from the real Audit record (see its own resolveAuditCompletedData()).
+  // An absent score (Audit.globalScore === null, e.g. an audit path that
+  // never computes one) is handled explicitly there, not here: the
+  // template itself never has to special-case "no score" formatting.
   audit_completed: {
-    variables: ['websiteUrl', 'globalScore'],
+    variables: ['websiteUrl', 'scoreLine'],
     subject: (data) => `Audit terminé pour ${data.websiteUrl}`,
     text: (data) =>
       [
         `L'audit de ${data.websiteUrl} est terminé.`,
-        `Score global : ${data.globalScore}/100.`,
+        `Score global : ${data.scoreLine}.`,
         '',
         'Ceci est une notification automatique ROBIA.',
       ].join('\n'),

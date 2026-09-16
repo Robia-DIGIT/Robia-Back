@@ -21,12 +21,17 @@ interface NodemailerSendError {
   message?: string;
 }
 
+// RC-26 review fix: reuses the exact same SMTP_* variables as
+// PasswordResetMailService (src/auth/password-reset-mail.service.ts) rather
+// than introducing a near-duplicate set (the first draft of this file added
+// SMTP_USER/SMTP_FROM_EMAIL/SMTP_FROM_NAME alongside the pre-existing
+// SMTP_USERNAME/SMTP_FROM — two names for the same credential is exactly
+// the kind of config drift that causes a production outage). One SMTP
+// account, one set of variable names, consulted by both mail paths.
 const REQUIRED_SMTP_VARS = [
   'SMTP_HOST',
-  'SMTP_PORT',
-  'SMTP_USER',
+  'SMTP_USERNAME',
   'SMTP_PASSWORD',
-  'SMTP_FROM_EMAIL',
 ] as const;
 
 // Deliberately simple — this only needs to catch a structurally malformed
@@ -68,12 +73,13 @@ export class SmtpNotificationTransport implements NotificationTransport {
     this.ensureReady();
 
     const host = this.config.get<string>('SMTP_HOST')!.trim();
-    const port = Number(this.config.get<string>('SMTP_PORT'));
+    const port = Number(this.config.get<string>('SMTP_PORT', '465'));
     const secure = this.config.get<string>('SMTP_SECURE', 'true') === 'true';
-    const user = this.config.get<string>('SMTP_USER')!.trim();
+    const username = this.config.get<string>('SMTP_USERNAME')!.trim();
     const password = this.config.get<string>('SMTP_PASSWORD')!.trim();
-    const fromEmail = this.config.get<string>('SMTP_FROM_EMAIL')!.trim();
-    const fromName = this.config.get<string>('SMTP_FROM_NAME', 'ROBIA Copilot');
+    // Same fallback as PasswordResetMailService: SMTP_FROM defaults to the
+    // authenticating account itself when not set separately.
+    const from = this.config.get<string>('SMTP_FROM', username);
 
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       throw new IncompleteSmtpConfigurationError(['SMTP_PORT']);
@@ -93,7 +99,7 @@ export class SmtpNotificationTransport implements NotificationTransport {
       host,
       port,
       secure,
-      auth: { user, pass: password },
+      auth: { user: username, pass: password },
       connectionTimeout: 10_000,
       greetingTimeout: 10_000,
       socketTimeout: 15_000,
@@ -101,7 +107,7 @@ export class SmtpNotificationTransport implements NotificationTransport {
 
     try {
       const info = await transporter.sendMail({
-        from: `${fromName} <${fromEmail}>`,
+        from: `ROBIA Copilot <${from}>`,
         to: params.to,
         subject: params.subject,
         text: params.text,

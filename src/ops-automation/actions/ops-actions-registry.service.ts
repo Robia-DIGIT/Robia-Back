@@ -53,6 +53,10 @@ interface OpsActionDescriptor {
   // `token`/`apiKey`, or any other extraneous field — is never persisted or
   // executed: see canonicalizeInput().
   inputSchema: string[];
+  // Like inputSchema, but each field is only validated (as a non-empty
+  // string) *if present* — never required. E.g. send_email's `auditId`,
+  // which only some templates need.
+  optionalInputSchema?: string[];
   // Additional keys that, when declared, must each be a plain JSON object
   // (defaulting to `{}` when absent) rather than a string — e.g.
   // send_email's `templateData`. Declared separately from inputSchema
@@ -127,6 +131,12 @@ export class OpsActionsRegistryService {
     const canonical: OpsActionInput = {};
     for (const field of action.inputSchema) {
       canonical[field] = (input as OpsActionInput)[field];
+    }
+    for (const field of action.optionalInputSchema ?? []) {
+      const value = input?.[field];
+      if (value !== undefined && value !== null) {
+        canonical[field] = this.requireStringInput(input, field);
+      }
     }
     for (const field of action.objectInputFields ?? []) {
       canonical[field] = this.canonicalizeObjectInput(input, field);
@@ -341,10 +351,20 @@ export class OpsActionsRegistryService {
       description:
         "Crée une notification email (en attente d'envoi) à partir d'un template allowlisté, adressée exclusivement au créateur de l'automatisation.",
       inputSchema: ['templateKey'],
+      // `auditId` — required only by the `audit_completed` template (see
+      // NotificationsService.resolveTemplateData()), which resolves its
+      // own data (website URL, formatted score) from the real Audit
+      // record rather than trusting templateData for those fields — the
+      // real audit.completed event never carries a websiteUrl anyway (see
+      // audit-completed.event.ts). Every other template ignores this
+      // field.
+      optionalInputSchema: ['auditId'],
       objectInputFields: ['templateData'],
       execute: async (organizationId, input, context) => {
         const templateKey = this.requireStringInput(input, 'templateKey');
         const templateData = (input as OpsActionInput)?.templateData ?? {};
+        const auditId = (input as OpsActionInput)?.auditId as
+          string | undefined;
         if (!context) {
           // Can only happen if this action is ever invoked outside
           // executeSteps() (it never is in this codebase) — fails loudly
@@ -361,6 +381,7 @@ export class OpsActionsRegistryService {
             automationStepRunId: context.stepRunId,
             templateKey,
             templateData,
+            auditId,
           });
         return {
           deliveryId: delivery.id,

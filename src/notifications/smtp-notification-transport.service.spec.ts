@@ -30,10 +30,9 @@ const ENABLED_COMPLETE_CONFIG = {
   SMTP_HOST: 'smtp.example.com',
   SMTP_PORT: '587',
   SMTP_SECURE: 'false',
-  SMTP_USER: 'no-reply@example.com',
+  SMTP_USERNAME: 'no-reply@example.com',
   SMTP_PASSWORD: 'super-secret-password',
-  SMTP_FROM_EMAIL: 'no-reply@example.com',
-  SMTP_FROM_NAME: 'ROBIA Copilot',
+  SMTP_FROM: 'no-reply@example.com',
 };
 
 describe('SmtpNotificationTransport', () => {
@@ -69,7 +68,7 @@ describe('SmtpNotificationTransport', () => {
         throw new Error('expected ensureReady to throw');
       } catch (error) {
         expect(error).toBeInstanceOf(IncompleteSmtpConfigurationError);
-        expect((error as Error).message).toContain('SMTP_USER');
+        expect((error as Error).message).toContain('SMTP_USERNAME');
         expect((error as Error).message).toContain('SMTP_PASSWORD');
         expect((error as Error).message).not.toContain('super-secret');
       }
@@ -80,6 +79,22 @@ describe('SmtpNotificationTransport', () => {
         fakeConfig(ENABLED_COMPLETE_CONFIG),
       );
       expect(() => transport.ensureReady()).not.toThrow();
+    });
+
+    // RC-26 review fix: the first draft duplicated SMTP config under new
+    // names (SMTP_USER/SMTP_FROM_EMAIL/SMTP_FROM_NAME) instead of reusing
+    // PasswordResetMailService's SMTP_USERNAME/SMTP_FROM — asserting the
+    // exact set of variable names read is what pins this down.
+    it('reads exactly the same SMTP_* variable names as PasswordResetMailService, never a duplicate set', () => {
+      const config = fakeConfig(ENABLED_COMPLETE_CONFIG);
+      const getSpy = jest.spyOn(config, 'get');
+      const transport = new SmtpNotificationTransport(config);
+
+      transport.ensureReady();
+
+      expect(getSpy).not.toHaveBeenCalledWith('SMTP_USER');
+      expect(getSpy).not.toHaveBeenCalledWith('SMTP_FROM_EMAIL');
+      expect(getSpy).not.toHaveBeenCalledWith('SMTP_FROM_NAME');
     });
   });
 

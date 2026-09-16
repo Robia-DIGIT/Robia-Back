@@ -106,7 +106,9 @@ class FakeDispatcherPrisma {
           { OR: ClaimedAtClause[] },
         ];
       };
-      data: Partial<FakeDeliveryRecord>;
+      data: Omit<Partial<FakeDeliveryRecord>, 'attemptCount'> & {
+        attemptCount?: number | { increment: number };
+      };
     }): { count: number } => {
       const record = this.records.get(where.id);
       if (!record) return { count: 0 };
@@ -138,7 +140,17 @@ class FakeDispatcherPrisma {
         if (!statusOk || !leaseOk) return { count: 0 };
       }
 
-      Object.assign(record, data);
+      // Mirrors Prisma's atomic { increment: n } update operator — the
+      // dispatcher uses it to bump attemptCount as part of the claim
+      // itself (see RC-26 review fix comment in
+      // notification-dispatcher.service.ts).
+      const { attemptCount, ...rest } = data;
+      if (typeof attemptCount === 'object' && attemptCount !== null) {
+        record.attemptCount += attemptCount.increment;
+      } else if (typeof attemptCount === 'number') {
+        record.attemptCount = attemptCount;
+      }
+      Object.assign(record, rest);
       return { count: 1 };
     },
     findUnique: ({
@@ -172,7 +184,7 @@ function delivery(
     recipientUserId: 'user-1',
     channel: 'email',
     templateKey: 'audit_completed',
-    templateData: { websiteUrl: 'https://example.com', globalScore: 80 },
+    templateData: { websiteUrl: 'https://example.com', scoreLine: '80/100' },
     status: 'pending',
     idempotencyKey: 'automation-step:step-1',
     attemptCount: 0,
@@ -249,6 +261,36 @@ describe('NotificationDispatcherService', () => {
     expect(stored.providerMessageId).toBe('msg-1');
     expect(stored.sentAt).toEqual(now);
     expect(stored.claimedAt).toBeNull();
+    // RC-26 review fix: a first-try success must still count as one
+    // attempt, never attemptCount: 0.
+    expect(stored.attemptCount).toBe(1);
+  });
+
+  it('counts a crash-interrupted attempt (claimed but never finalized) even though no outcome was ever recorded', async () => {
+    const { dispatcher, prisma } = buildDispatcher([delivery()]);
+    // Simulate a crash: the claim (with its attemptCount increment)
+    // commits, but the send itself never resolves in time — nothing
+    // downstream (finalize) runs before we inspect the state.
+    let resolveSend!: (value: { providerMessageId: string }) => void;
+    sendEmail.mockImplementation(
+      () =>
+        new Promise<{ providerMessageId: string }>((resolve) => {
+          resolveSend = resolve;
+        }),
+    );
+
+    const runPromise = dispatcher.runDueDeliveries(now);
+    // Flush the microtasks for the claim + re-fetch + recipient lookup,
+    // without waiting for sendEmail() itself to settle.
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(prisma.get('delivery-1')?.attemptCount).toBe(1);
+    expect(prisma.get('delivery-1')?.status).toBe('processing');
+
+    // Let the in-flight call actually finish so the test doesn't leave a
+    // hanging promise behind.
+    resolveSend({ providerMessageId: 'msg-late' });
+    await runPromise;
   });
 
   it('never sends a delivery that is not yet due', async () => {
@@ -301,7 +343,10 @@ describe('NotificationDispatcherService', () => {
     const final = prisma.get('delivery-1')!;
     expect(final.status).toBe('sent');
     expect(final.providerMessageId).toBe('msg-retry-1');
-    expect(final.attemptCount).toBe(1);
+    // RC-26 review fix: attemptCount counts every real pickup, success
+    // included — 1 from the first (failed) attempt, 1 from the second
+    // (successful) one.
+    expect(final.attemptCount).toBe(2);
   });
 
   it('sends a delivery straight to dead_letter on a permanent failure', async () => {
@@ -369,10 +414,15 @@ describe('NotificationDispatcherService', () => {
 
   it('reclaims a delivery whose lease has gone stale after a crash mid-send, using an unchanged idempotencyKey', async () => {
     // Simulates a claim that never resolved (process crash between claim
-    // and send): status is 'processing', but the lease is old.
+    // and send): status is 'processing', the lease is old, and
+    // attemptCount already reflects that first (crashed) claim.
     const staleClaim = new Date(now.getTime() - 6 * 60 * 1000); // 6 min ago
     const { dispatcher, prisma } = buildDispatcher([
-      delivery({ status: 'processing', claimedAt: staleClaim }),
+      delivery({
+        status: 'processing',
+        claimedAt: staleClaim,
+        attemptCount: 1,
+      }),
     ]);
 
     await dispatcher.runDueDeliveries(now);
@@ -381,6 +431,9 @@ describe('NotificationDispatcherService', () => {
     const stored = prisma.get('delivery-1')!;
     expect(stored.status).toBe('sent');
     expect(stored.idempotencyKey).toBe('automation-step:step-1');
+    // RC-26 review fix: the reclaim's own successful attempt is counted on
+    // top of the crashed one.
+    expect(stored.attemptCount).toBe(2);
   });
 
   it('does not reclaim a delivery whose lease is still fresh', async () => {

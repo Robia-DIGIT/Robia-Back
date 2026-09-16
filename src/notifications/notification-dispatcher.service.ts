@@ -153,10 +153,19 @@ export class NotificationDispatcherService {
     now: Date,
     staleThreshold: Date,
   ): Promise<void> {
-    // Phase 1 — claim.
+    // Phase 1 — claim. attemptCount is incremented atomically right here,
+    // not at finalize time (RC-26 review fix): this is what makes it count
+    // every real pickup — including one interrupted by a crash before any
+    // finalize ever runs — rather than only counting definitive failures
+    // and leaving a delivery that succeeded on its very first try showing
+    // attemptCount: 0.
     const claim = await this.prisma.notificationDelivery.updateMany({
       where: { id: delivery.id, ...this.dueSetWhere(now, staleThreshold) },
-      data: { status: 'processing', claimedAt: now },
+      data: {
+        status: 'processing',
+        claimedAt: now,
+        attemptCount: { increment: 1 },
+      },
     });
     if (claim.count === 0) {
       return;
@@ -234,6 +243,9 @@ export class NotificationDispatcherService {
     }
   }
 
+  // `delivery.attemptCount` here is always already the post-claim,
+  // post-increment value (see processDueDelivery()'s Phase 1) — never
+  // incremented again at finalize time.
   private async markDeadLetter(
     delivery: NotificationDelivery,
     now: Date,
@@ -243,7 +255,6 @@ export class NotificationDispatcherService {
       where: { id: delivery.id, claimedAt: now },
       data: {
         status: 'dead_letter',
-        attemptCount: delivery.attemptCount + 1,
         claimedAt: null,
         lastError: redactSensitive(message) as string,
       },
@@ -255,14 +266,13 @@ export class NotificationDispatcherService {
     now: Date,
     message: string,
   ): Promise<void> {
-    const attemptCount = delivery.attemptCount + 1;
+    const attemptCount = delivery.attemptCount;
     const cleanedMessage = redactSensitive(message) as string;
     if (attemptCount < MAX_ATTEMPTS) {
       await this.prisma.notificationDelivery.updateMany({
         where: { id: delivery.id, claimedAt: now },
         data: {
           status: 'retry_scheduled',
-          attemptCount,
           claimedAt: null,
           nextAttemptAt: new Date(
             now.getTime() + RETRY_BACKOFF_MS[attemptCount - 1],
@@ -275,7 +285,6 @@ export class NotificationDispatcherService {
         where: { id: delivery.id, claimedAt: now },
         data: {
           status: 'dead_letter',
-          attemptCount,
           claimedAt: null,
           lastError: cleanedMessage,
         },
