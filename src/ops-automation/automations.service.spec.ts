@@ -765,6 +765,40 @@ describe('AutomationsService', () => {
       expect(updated.nextRunAt).not.toEqual(automation.nextRunAt);
     });
 
+    // RC-25 second review fix: update() always rewrites nextRunAt from the
+    // effective post-update state, so any scheduler claim in flight for the
+    // *previous* nextRunAt is necessarily stale the instant this commits —
+    // AutomationSchedulerService's own re-fetch relies on this being
+    // cleared here, not left for the claim's lease to expire.
+    it('clears an in-flight scheduler claim (scheduledClaimedAt) whenever update() rewrites nextRunAt', async () => {
+      const automation = await service.create(orgA, userA, scheduledDto());
+      const record = prisma.automations.get(automation.id)!;
+      record.scheduledClaimedAt = new Date('2026-09-21T06:05:00.000Z');
+
+      const updated = await service.update(orgA, automation.id, {
+        trigger: {
+          type: 'scheduled',
+          cronExpression: '0 10 * * 2',
+          timezone: 'Indian/Antananarivo',
+        },
+      });
+
+      expect(updated.scheduledClaimedAt).toBeNull();
+    });
+
+    it('clears an in-flight scheduler claim (scheduledClaimedAt) whenever setEnabled() rewrites nextRunAt', async () => {
+      const automation = await service.create(orgA, userA, scheduledDto());
+      const record = prisma.automations.get(automation.id)!;
+      record.scheduledClaimedAt = new Date('2026-09-21T06:05:00.000Z');
+
+      const disabled = await service.setEnabled(orgA, automation.id, false);
+      expect(disabled.scheduledClaimedAt).toBeNull();
+
+      record.scheduledClaimedAt = new Date('2026-09-21T06:06:00.000Z');
+      const reenabled = await service.setEnabled(orgA, automation.id, true);
+      expect(reenabled.scheduledClaimedAt).toBeNull();
+    });
+
     it('clears nextRunAt when the trigger type changes away from scheduled', async () => {
       const automation = await service.create(orgA, userA, scheduledDto());
       expect(automation.nextRunAt).not.toBeNull();

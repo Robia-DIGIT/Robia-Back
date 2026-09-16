@@ -510,6 +510,100 @@ describe('AutomationSchedulerService', () => {
     expect(stored?.nextRunAt).toEqual(scheduledFor);
   });
 
+  // RC-25 second review fix (Bloquant): checking enabled/type/cron alone on
+  // the re-fetch is not enough — a disable-then-re-enable that lands
+  // between the claim and the re-fetch leaves `enabled: true` (and a valid
+  // trigger), but AutomationsService.setEnabled() will have rewritten
+  // nextRunAt to a *new* occurrence and cleared scheduledClaimedAt. Without
+  // also re-checking nextRunAt/scheduledClaimedAt, the scheduler would
+  // execute the automation against the stale, already-superseded
+  // occurrence it originally claimed.
+  it('never executes the originally-claimed occurrence after a disable-then-re-enable lands between the claim and the re-fetch', async () => {
+    const now = new Date('2026-09-21T06:05:00.000Z');
+    const scheduledFor = new Date('2026-09-21T06:00:00.000Z');
+    const newOccurrence = new Date('2026-09-28T06:00:00.000Z');
+    const { scheduler, prisma } = buildScheduler([
+      automation({ nextRunAt: scheduledFor }),
+    ]);
+    const originalUpdateMany = prisma.automation.updateMany;
+    prisma.automation.updateMany = (
+      args: Parameters<typeof originalUpdateMany>[0],
+    ) => {
+      const result = originalUpdateMany(args);
+      const isClaimCall =
+        result.count === 1 &&
+        'scheduledClaimedAt' in args.data &&
+        args.data.scheduledClaimedAt instanceof Date &&
+        !('nextRunAt' in args.data);
+      if (isClaimCall) {
+        // Simulates AutomationsService.setEnabled(false) immediately
+        // followed by setEnabled(true) landing between this claim
+        // committing and the scheduler's own re-fetch: enabled stays
+        // true, but nextRunAt is rewritten to a new occurrence and the
+        // claim is cleared (see setEnabled()'s RC-25 review fix).
+        const record = prisma.get(args.where.id);
+        if (record) {
+          record.nextRunAt = newOccurrence;
+          record.scheduledClaimedAt = null;
+        }
+      }
+      return result;
+    };
+
+    await scheduler.runDueAutomations(now);
+
+    expect(triggerScheduled).not.toHaveBeenCalled();
+    const stored = prisma.get('automation-1');
+    // The new occurrence set by the simulated re-enable is left exactly as
+    // is — the scheduler must not touch it, only abort.
+    expect(stored?.nextRunAt).toEqual(newOccurrence);
+    expect(stored?.scheduledClaimedAt).toBeNull();
+  });
+
+  // RC-25 second review fix (Bloquant): same race, triggered by a
+  // cron/timezone edit instead of a disable/re-enable — AutomationsService
+  // .update() also rewrites nextRunAt and clears scheduledClaimedAt.
+  it('never executes the originally-claimed occurrence after a cron/timezone edit lands between the claim and the re-fetch', async () => {
+    const now = new Date('2026-09-21T06:05:00.000Z');
+    const scheduledFor = new Date('2026-09-21T06:00:00.000Z');
+    const newOccurrence = new Date('2026-09-21T18:00:00.000Z');
+    const { scheduler, prisma } = buildScheduler([
+      automation({ nextRunAt: scheduledFor }),
+    ]);
+    const originalUpdateMany = prisma.automation.updateMany;
+    prisma.automation.updateMany = (
+      args: Parameters<typeof originalUpdateMany>[0],
+    ) => {
+      const result = originalUpdateMany(args);
+      const isClaimCall =
+        result.count === 1 &&
+        'scheduledClaimedAt' in args.data &&
+        args.data.scheduledClaimedAt instanceof Date &&
+        !('nextRunAt' in args.data);
+      if (isClaimCall) {
+        // Simulates AutomationsService.update() editing the cron
+        // expression landing between this claim committing and the
+        // scheduler's own re-fetch: the trigger is still valid and
+        // scheduled, but nextRunAt now reflects the new cron and the
+        // claim was cleared.
+        const record = prisma.get(args.where.id);
+        if (record) {
+          if (record.trigger) record.trigger.cronExpression = '0 18 * * 1';
+          record.nextRunAt = newOccurrence;
+          record.scheduledClaimedAt = null;
+        }
+      }
+      return result;
+    };
+
+    await scheduler.runDueAutomations(now);
+
+    expect(triggerScheduled).not.toHaveBeenCalled();
+    const stored = prisma.get('automation-1');
+    expect(stored?.nextRunAt).toEqual(newOccurrence);
+    expect(stored?.scheduledClaimedAt).toBeNull();
+  });
+
   // RC-25 review fix (Important #3): a pre-RC25 automation that was already
   // enabled+scheduled has nextRunAt=null (nothing ever computed it), and a
   // `nextRunAt <= now` filter never matches NULL — it must be reconciled.

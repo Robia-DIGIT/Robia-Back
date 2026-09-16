@@ -149,10 +149,23 @@ export class AutomationSchedulerService {
     }
 
     // Phase 2 — re-fetch fresh state now that the lease is held: the
-    // automation could have been disabled, deleted, or had its trigger
-    // changed in the instant between the claim above and this read.
-    // triggerScheduled() must only ever run against current state, never
-    // the (possibly stale) snapshot from the outer findMany().
+    // automation could have been disabled, deleted, had its trigger
+    // changed, or had its schedule replaced (disable+re-enable,
+    // cron/timezone edit) in the instant between the claim above and this
+    // read. triggerScheduled() must only ever run against current state,
+    // never the (possibly stale) snapshot from the outer findMany() — and
+    // crucially, only ever against the exact occurrence this call actually
+    // claimed, never a newer one that happens to share the row.
+    //
+    // Checking `enabled`/`trigger.type`/`cronExpression` alone is not
+    // enough: a disable-then-re-enable (or a cron/timezone edit) between
+    // the claim and this read leaves `enabled: true` and a valid trigger,
+    // but AutomationsService.update()/setEnabled() will have rewritten
+    // `nextRunAt` to a *different* occurrence and cleared
+    // `scheduledClaimedAt` (see their RC-25 review fix comments) — so both
+    // are re-checked here too. Any mismatch means the claim this call
+    // thinks it holds is no longer the one on the row, so it must not
+    // execute anything.
     const fresh = await this.prisma.automation.findFirst({
       where: { id: automation.id },
       include: { trigger: true },
@@ -162,11 +175,17 @@ export class AutomationSchedulerService {
       !fresh.enabled ||
       !fresh.trigger ||
       fresh.trigger.type !== 'scheduled' ||
-      !fresh.trigger.cronExpression
+      !fresh.trigger.cronExpression ||
+      fresh.nextRunAt === null ||
+      fresh.nextRunAt.getTime() !== scheduledFor.getTime() ||
+      fresh.scheduledClaimedAt === null ||
+      fresh.scheduledClaimedAt.getTime() !== now.getTime()
     ) {
-      // No longer eligible: release the lease without touching nextRunAt.
-      // Safe to key only on scheduledClaimedAt === now — nothing else can
-      // hold or reclaim the lease while it is this fresh.
+      // No longer eligible, or the claim was invalidated out from under
+      // this call: release the lease without touching nextRunAt. Safe to
+      // key only on scheduledClaimedAt === now — this no-ops if the claim
+      // was already cleared (by an update()/setEnabled() call, or by
+      // another instance), and never touches a claim held by anyone else.
       await this.prisma.automation.updateMany({
         where: { id: automation.id, scheduledClaimedAt: now },
         data: { scheduledClaimedAt: null },
@@ -174,24 +193,37 @@ export class AutomationSchedulerService {
       return;
     }
 
-    // Phase 3 — execute via RC-20's engine, unchanged. If this throws (the
-    // run genuinely could not be created — see class doc), nextRunAt is
-    // deliberately left untouched below: the occurrence is retried once the
-    // lease goes stale, never advanced past without a durably created run.
+    // Phase 3 — execute via RC-20's engine, unchanged. Past this point, the
+    // claim held by this call is the linearization point: no other call —
+    // this instance's or another's — can also reach here for the same
+    // occurrence, since Phase 1/Phase 2 above have already excluded every
+    // other path to it. If this throws (the run genuinely could not be
+    // created — see class doc), nextRunAt is deliberately left untouched
+    // below: the occurrence is retried once the lease goes stale, never
+    // advanced past without a durably created run.
     await this.automations.triggerScheduled(fresh, scheduledFor);
 
     // Phase 4 — only reached once triggerScheduled() has resolved, i.e. the
     // run has been durably created. Anchored at `now` (this tick's instant),
     // never incremented from `scheduledFor`: however overdue this occurrence
     // was, the next value jumps straight to the next future occurrence
-    // instead of replaying a backlog.
+    // instead of replaying a backlog. `scheduledClaimedAt: now` is included
+    // in the WHERE (not just `nextRunAt`) so a worker that was delayed long
+    // enough for its lease to go stale — and whose claim was since reclaimed
+    // by another instance — can never release or overwrite that other
+    // instance's claim here, even in the rare case nextRunAt happens to
+    // still read back the same value.
     const following = computeNextOccurrence(
       fresh.trigger.cronExpression,
       fresh.trigger.timezone,
       now,
     );
     await this.prisma.automation.updateMany({
-      where: { id: automation.id, nextRunAt: scheduledFor },
+      where: {
+        id: automation.id,
+        nextRunAt: scheduledFor,
+        scheduledClaimedAt: now,
+      },
       data: { nextRunAt: following, scheduledClaimedAt: null },
     });
   }

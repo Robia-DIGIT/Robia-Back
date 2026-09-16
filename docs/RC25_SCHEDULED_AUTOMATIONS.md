@@ -92,13 +92,60 @@ de cron manquée n'a pas de source de rejeu.
 La Phase 1 exige `enabled = true` dans son `WHERE` — pas seulement dans le
 `SELECT` du due-set — donc un disable qui arrive entre ce `SELECT` et la
 réclamation fait simplement échouer le `WHERE` (`count = 0`), sans exécution.
+
 La Phase 2 (relecture fraîche juste après avoir gagné le bail) ferme la
-fenêtre plus étroite encore : un disable/changement de trigger qui arrive
-entre la réclamation et cette relecture fait annuler l'exécution et libérer
-le bail, sans jamais avancer `nextRunAt`. Une automation désactivée/modifiée
-avant la création du run n'est donc **jamais** exécutée — pas même une seule
-fois de trop, contrainte explicitement requise en vue d'une future action
-externe (ex. un envoi d'email en RC27).
+fenêtre plus étroite encore — mais vérifier seulement `enabled` / le type de
+trigger / la présence du cron n'y suffit pas : un enchaînement
+désactivation-puis-réactivation, ou une édition du cron/fuseau, qui arrive
+entre la réclamation et cette relecture laisse `enabled = true` et un
+trigger valide, alors même que `AutomationsService.update()` /
+`setEnabled()` ont, entre-temps, réécrit `nextRunAt` vers une **nouvelle**
+échéance et effacé `scheduledClaimedAt` (voir plus bas). Sans re-vérifier
+ces deux champs, le scheduler exécuterait l'automation contre l'échéance
+périmée qu'il a réclamée à l'origine plutôt que celle réellement due
+aujourd'hui. La Phase 2 exige donc en plus, après la relecture :
+
+- `fresh.nextRunAt` égal exactement à `scheduledFor` (l'échéance réclamée) ;
+- `fresh.scheduledClaimedAt` égal exactement au timestamp posé par cette
+  réclamation (`now`, la valeur passée à la Phase 1).
+
+Toute divergence sur l'un ou l'autre signifie que le bail que cet appel
+croit détenir n'est plus celui présent sur la ligne : il annule l'exécution
+et libère (silencieusement, sans effet si déjà nul) le bail, sans jamais
+avancer `nextRunAt`.
+
+`AutomationsService.update()` et `.setEnabled()` participent activement à
+cette fermeture : chaque appel qui réécrit `nextRunAt` (systématique, voir
+« Calcul de `nextRunAt` » plus bas) efface aussi
+inconditionnellement `scheduledClaimedAt` — tout bail en cours pour
+l'**ancienne** valeur de `nextRunAt` est nécessairement périmé dès que ce
+`UPDATE` commite, qu'il ait ou non déjà été réclamé par le scheduler.
+
+Une automation désactivée/modifiée avant la création du run n'est donc
+**jamais** exécutée — pas même une seule fois de trop, contrainte
+explicitement requise en vue d'une future action externe (ex. un envoi
+d'email en RC27).
+
+**Point de linéarisation** : la Phase 3 (l'appel à `triggerScheduled()`) est
+le point de linéarisation de toute cette séquence. Une fois la Phase 2
+passée avec succès (bail + `nextRunAt` confirmés cohérents), cet appel est
+garanti être le seul, pour cette occurrence précise, à jamais atteindre la
+Phase 3 — aucun autre appel, sur cette instance ou une autre, ne peut déjà
+s'y trouver ou s'y trouver plus tard pour la même occurrence : la Phase 1 en
+a exclu tout concurrent au moment de la réclamation, et la Phase 2 vient de
+reconfirmer qu'aucune modification n'a entre-temps rendu ce bail caduc.
+Passé ce point, l'occurrence est considérée comme **prise en charge** :
+c'est la garantie sur laquelle repose l'absence de double exécution, la
+contrainte d'unicité `(organizationId, dedupKey)` sur `AutomationRun`
+n'intervenant qu'en défense supplémentaire (voir « Garantie de
+concurrence »).
+
+Enfin, la Phase 4 (avance de `nextRunAt`) inclut elle aussi
+`scheduledClaimedAt: now` dans son `WHERE` — pas seulement `nextRunAt` — pour
+qu'un worker resté bloqué au-delà de la durée du bail, et dont la
+réclamation a depuis été reprise par une autre instance, ne puisse ni
+libérer ni écraser le bail que cette autre instance détient désormais, même
+dans le cas rare où `nextRunAt` se retrouverait relu à l'identique.
 
 ## Réconciliation des automations pré-RC25 (RC-25 review fix)
 
@@ -223,9 +270,12 @@ déjà figées — aucune étape ne s'exécute avant approbation manuelle.
   cron+tz et rejette les combinaisons de champs incohérentes par type de
   trigger ; `create()`/`update()`/`setEnabled()` recalculent `nextRunAt` via
   `resolveNextRunAt()` (jamais d'exception propagée, dégrade en `null` avec
-  un warning loggé) ; nouvelle méthode publique `triggerScheduled()`.
+  un warning loggé, entièrement redacté) ; `update()`/`setEnabled()` effacent
+  aussi `scheduledClaimedAt` à chaque réécriture de `nextRunAt` ; nouvelle
+  méthode publique `triggerScheduled()`.
 - `src/ops-automation/automations.service.spec.ts` — tests `nextRunAt` +
-  `triggerScheduled` + validation des combinaisons de champs.
+  `triggerScheduled` + validation des combinaisons de champs + effacement de
+  `scheduledClaimedAt` par `update()`/`setEnabled()`.
 - `src/ops-automation/ops-automation.module.ts` — enregistre
   `AutomationSchedulerService`.
 - `src/app.module.ts` — `ScheduleModule.forRoot()`.
@@ -256,7 +306,7 @@ hardening séparée (même schéma que RC23/RC24).
 ## Tests exécutés
 
 ```
-npx jest --silent                    → 55 suites, 368 tests, tous passants
+npx jest --silent                    → 55 suites, 372 tests, tous passants
 npx tsc --noEmit -p tsconfig.json    → aucune nouvelle erreur (1 erreur
                                         pré-existante et sans rapport,
                                         documentée depuis RC23)

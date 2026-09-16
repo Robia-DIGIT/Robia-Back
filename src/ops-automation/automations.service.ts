@@ -178,6 +178,16 @@ export class AutomationsService {
           ? { requiresApproval: dto.requiresApproval }
           : {}),
         nextRunAt,
+        // RC-25 review fix: nextRunAt is always rewritten above (recomputed
+        // from the effective post-update state), so any scheduler claim
+        // that was in flight for the *previous* nextRunAt value is
+        // necessarily stale the instant this commits — release it
+        // immediately rather than waiting for the lease to time out. This
+        // is what lets AutomationSchedulerService's own re-fetch
+        // (fresh.nextRunAt === scheduledFor check) catch a disable/
+        // re-enable or cron/timezone edit that lands between its claim and
+        // that re-fetch: the claim it thinks it still holds is gone.
+        scheduledClaimedAt: null,
         ...(dto.conditions !== undefined
           ? {
               conditions: (dto.conditions ??
@@ -222,7 +232,11 @@ export class AutomationsService {
     });
     return this.prisma.automation.update({
       where: { id },
-      data: { enabled, nextRunAt },
+      // RC-25 review fix: same reasoning as update() — nextRunAt is always
+      // rewritten here (disabling clears it, re-enabling recomputes it), so
+      // any in-flight scheduler claim for the previous value is stale the
+      // instant this commits.
+      data: { enabled, nextRunAt, scheduledClaimedAt: null },
       include: { trigger: true },
     });
   }
@@ -906,9 +920,17 @@ export class AutomationsService {
         new Date(),
       );
     } catch (error) {
+      // RC-25 review fix: same redaction discipline as
+      // AutomationSchedulerService's own error logs — never interpolate a
+      // cron expression, timezone, or error message straight into a log
+      // line without passing it through redactSensitive first.
       this.logger.warn(
-        `Impossible de calculer nextRunAt (cron="${params.cronExpression}", timezone="${params.timezone}") : ${
-          error instanceof Error ? error.message : 'erreur inconnue'
+        `Impossible de calculer nextRunAt (cron="${
+          redactSensitive(params.cronExpression) as string
+        }", timezone="${redactSensitive(params.timezone) as string}") : ${
+          redactSensitive(
+            error instanceof Error ? error.message : 'erreur inconnue',
+          ) as string
         }`,
       );
       return null;
