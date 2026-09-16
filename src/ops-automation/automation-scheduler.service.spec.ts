@@ -17,18 +17,37 @@ interface FakeAutomationRecord {
   enabled: boolean;
   nextRunAt: Date | null;
   lastRunAt: Date | null;
+  scheduledClaimedAt: Date | null;
   trigger: FakeTriggerRecord | null;
 }
 
-// Purpose-built, scoped to exactly the two Prisma calls
-// AutomationSchedulerService makes: automation.findMany() (the due-set
-// read) and automation.updateMany() (the atomic claim). It mirrors the
-// same synchronous find-then-mutate shape as automation(Run).updateMany in
-// automations.service.spec.ts's own FakePrisma — no `await` inside the
-// critical section — which is what makes a real concurrency test possible:
-// two "concurrent" callers racing via Promise.all can never both see a
-// matching row AND both win, the same way a real Postgres UPDATE...WHERE
-// serializes two concurrent statements against the same row.
+type ClaimedAtClause =
+  { scheduledClaimedAt: null } | { scheduledClaimedAt: { lt: Date } };
+
+function matchesClaimedAtClause(
+  record: FakeAutomationRecord,
+  clause: ClaimedAtClause,
+): boolean {
+  if (clause.scheduledClaimedAt === null) {
+    return record.scheduledClaimedAt === null;
+  }
+  return (
+    record.scheduledClaimedAt !== null &&
+    record.scheduledClaimedAt.getTime() < clause.scheduledClaimedAt.lt.getTime()
+  );
+}
+
+// Purpose-built, scoped to exactly the three Prisma calls
+// AutomationSchedulerService makes: automation.findMany() (the due-set and
+// reconciliation reads), automation.findFirst() (the post-claim re-fetch),
+// and automation.updateMany() (the atomic claim/release/advance). It
+// mirrors the same synchronous find-then-mutate shape as
+// automation(Run).updateMany in automations.service.spec.ts's own
+// FakePrisma — no `await` inside the critical section — which is what
+// makes a real concurrency test possible: two "concurrent" callers racing
+// via Promise.all can never both see a matching row AND both win, the same
+// way a real Postgres UPDATE...WHERE serializes two concurrent statements
+// against the same row.
 class FakeSchedulerPrisma {
   private records: Map<string, FakeAutomationRecord>;
 
@@ -46,20 +65,40 @@ class FakeSchedulerPrisma {
     }: {
       where: {
         enabled?: boolean;
-        nextRunAt?: { lte: Date };
+        nextRunAt?: { lte: Date } | null;
         trigger?: { type: string };
+        OR?: ClaimedAtClause[];
       };
     }): AutomationWithTrigger[] => {
       return Array.from(this.records.values())
-        .filter(
-          (r) =>
-            (where.enabled === undefined || r.enabled === where.enabled) &&
-            (where.nextRunAt?.lte === undefined ||
-              (r.nextRunAt !== null &&
-                r.nextRunAt.getTime() <= where.nextRunAt.lte.getTime())) &&
-            (where.trigger?.type === undefined ||
-              r.trigger?.type === where.trigger.type),
-        )
+        .filter((r) => {
+          if (where.enabled !== undefined && r.enabled !== where.enabled) {
+            return false;
+          }
+          if (where.nextRunAt !== undefined) {
+            if (where.nextRunAt === null) {
+              if (r.nextRunAt !== null) return false;
+            } else if (
+              r.nextRunAt === null ||
+              r.nextRunAt.getTime() > where.nextRunAt.lte.getTime()
+            ) {
+              return false;
+            }
+          }
+          if (
+            where.trigger?.type !== undefined &&
+            r.trigger?.type !== where.trigger.type
+          ) {
+            return false;
+          }
+          if (
+            where.OR !== undefined &&
+            !where.OR.some((clause) => matchesClaimedAtClause(r, clause))
+          ) {
+            return false;
+          }
+          return true;
+        })
         .map(
           (r) =>
             ({
@@ -68,21 +107,62 @@ class FakeSchedulerPrisma {
             }) as unknown as AutomationWithTrigger,
         );
     },
+    findFirst: ({
+      where,
+    }: {
+      where: { id: string };
+    }): AutomationWithTrigger | null => {
+      const record = this.records.get(where.id);
+      if (!record) return null;
+      return {
+        ...record,
+        trigger: record.trigger ? { ...record.trigger } : null,
+      } as unknown as AutomationWithTrigger;
+    },
     updateMany: ({
       where,
       data,
     }: {
-      where: { id: string; nextRunAt: Date | null };
-      data: { nextRunAt: Date; lastRunAt: Date };
+      where: {
+        id: string;
+        nextRunAt?: Date | null;
+        enabled?: boolean;
+        scheduledClaimedAt?: Date | null;
+        OR?: ClaimedAtClause[];
+      };
+      data: Partial<
+        Pick<
+          FakeAutomationRecord,
+          'nextRunAt' | 'lastRunAt' | 'scheduledClaimedAt'
+        >
+      >;
     }): { count: number } => {
       const record = this.records.get(where.id);
-      const matches =
-        !!record &&
-        (record.nextRunAt === null
-          ? where.nextRunAt === null
-          : where.nextRunAt !== null &&
-            record.nextRunAt.getTime() === where.nextRunAt.getTime());
-      if (!matches) {
+      if (!record) return { count: 0 };
+      if (where.nextRunAt !== undefined) {
+        const matches =
+          where.nextRunAt === null
+            ? record.nextRunAt === null
+            : record.nextRunAt !== null &&
+              record.nextRunAt.getTime() === where.nextRunAt.getTime();
+        if (!matches) return { count: 0 };
+      }
+      if (where.enabled !== undefined && record.enabled !== where.enabled) {
+        return { count: 0 };
+      }
+      if (where.scheduledClaimedAt !== undefined) {
+        const matches =
+          where.scheduledClaimedAt === null
+            ? record.scheduledClaimedAt === null
+            : record.scheduledClaimedAt !== null &&
+              record.scheduledClaimedAt.getTime() ===
+                where.scheduledClaimedAt.getTime();
+        if (!matches) return { count: 0 };
+      }
+      if (
+        where.OR !== undefined &&
+        !where.OR.some((clause) => matchesClaimedAtClause(record, clause))
+      ) {
         return { count: 0 };
       }
       Object.assign(record, data);
@@ -100,6 +180,7 @@ function automation(
     enabled: true,
     nextRunAt: null,
     lastRunAt: null,
+    scheduledClaimedAt: null,
     trigger: {
       type: 'scheduled',
       cronExpression: '0 9 * * 1',
@@ -324,5 +405,160 @@ describe('AutomationSchedulerService', () => {
       }),
       scheduledFor,
     );
+  });
+
+  // RC-25 review fix (Bloquant #1): a process crash — or any failure that
+  // prevents the run from being durably created — between claiming an
+  // occurrence and creating its run must never lose that occurrence.
+  it('crash-then-recovery: a claimed occurrence whose run creation fails is retried by another instance once the lease goes stale, using the same scheduledFor', async () => {
+    const scheduledFor = new Date('2026-09-21T06:00:00.000Z');
+    const tick1 = new Date('2026-09-21T06:05:00.000Z');
+    const prisma = new FakeSchedulerPrisma([
+      automation({ nextRunAt: scheduledFor }),
+    ]);
+
+    // Tick 1, instance A: claims the occurrence, but the run is never
+    // durably created (simulating a crash between the claim and run
+    // creation) — modeled as a rejected triggerScheduled().
+    triggerScheduled.mockRejectedValueOnce(new Error('simulated crash'));
+    const instanceA = new AutomationSchedulerService(
+      prisma as unknown as PrismaService,
+      { triggerScheduled } as unknown as AutomationsService,
+    );
+    await instanceA.runDueAutomations(tick1);
+
+    expect(triggerScheduled).toHaveBeenCalledTimes(1);
+    const afterCrash = prisma.get('automation-1');
+    // nextRunAt was never advanced past the lost occurrence: it is still
+    // exactly the scheduledFor that was claimed, so nothing about the
+    // occurrence itself was lost, only delayed.
+    expect(afterCrash?.nextRunAt).toEqual(scheduledFor);
+    expect(afterCrash?.scheduledClaimedAt).toEqual(tick1);
+
+    // Tick 2, before the lease has gone stale, instance B (e.g. a
+    // dispatcher pod that took over after the crashed one restarted): must
+    // NOT reclaim yet — the lease is still fresh.
+    const tooSoon = new Date(tick1.getTime() + 60_000);
+    const instanceB = new AutomationSchedulerService(
+      prisma as unknown as PrismaService,
+      { triggerScheduled } as unknown as AutomationsService,
+    );
+    await instanceB.runDueAutomations(tooSoon);
+    expect(triggerScheduled).toHaveBeenCalledTimes(1);
+
+    // Tick 3, once the lease has gone stale: instance B reclaims the exact
+    // same scheduledFor and this time succeeds.
+    triggerScheduled.mockResolvedValueOnce({ id: 'run-recovered' });
+    const tick2 = new Date(tick1.getTime() + 5 * 60 * 1000 + 1_000);
+    await instanceB.runDueAutomations(tick2);
+
+    expect(triggerScheduled).toHaveBeenCalledTimes(2);
+    expect(triggerScheduled).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ id: 'automation-1' }),
+      scheduledFor,
+    );
+    expect(triggerScheduled).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ id: 'automation-1' }),
+      scheduledFor,
+    );
+    const recovered = prisma.get('automation-1');
+    expect(recovered?.scheduledClaimedAt).toBeNull();
+    expect(recovered?.nextRunAt).toEqual(
+      computeNextOccurrence('0 9 * * 1', 'Indian/Antananarivo', tick2),
+    );
+    expect(recovered!.nextRunAt!.getTime()).toBeGreaterThan(tick2.getTime());
+  });
+
+  // RC-25 review fix (Bloquant #2): an automation disabled/modified in the
+  // gap between the claim succeeding and the scheduler re-fetching fresh
+  // state must never be executed — "one extra run" is not acceptable for a
+  // future external action (e.g. an email step).
+  it('never executes an automation disabled between the claim and the re-fetch', async () => {
+    const now = new Date('2026-09-21T06:05:00.000Z');
+    const scheduledFor = new Date('2026-09-21T06:00:00.000Z');
+    const { scheduler, prisma } = buildScheduler([
+      automation({ nextRunAt: scheduledFor }),
+    ]);
+    const originalUpdateMany = prisma.automation.updateMany;
+    prisma.automation.updateMany = (
+      args: Parameters<typeof originalUpdateMany>[0],
+    ) => {
+      const result = originalUpdateMany(args);
+      const isClaimCall =
+        result.count === 1 &&
+        'scheduledClaimedAt' in args.data &&
+        args.data.scheduledClaimedAt instanceof Date &&
+        !('nextRunAt' in args.data);
+      if (isClaimCall) {
+        // Simulates a disable landing in the DB in the instant between this
+        // claim committing and the scheduler's own re-fetch.
+        const record = prisma.get(args.where.id);
+        if (record) record.enabled = false;
+      }
+      return result;
+    };
+
+    await scheduler.runDueAutomations(now);
+
+    expect(triggerScheduled).not.toHaveBeenCalled();
+    const stored = prisma.get('automation-1');
+    // Lease released, nextRunAt untouched — never silently advanced past an
+    // occurrence that was never actually executed.
+    expect(stored?.scheduledClaimedAt).toBeNull();
+    expect(stored?.nextRunAt).toEqual(scheduledFor);
+  });
+
+  // RC-25 review fix (Important #3): a pre-RC25 automation that was already
+  // enabled+scheduled has nextRunAt=null (nothing ever computed it), and a
+  // `nextRunAt <= now` filter never matches NULL — it must be reconciled.
+  it('initializes nextRunAt for a pre-existing scheduled automation stuck at null (reconciliation)', async () => {
+    const now = new Date('2026-09-21T06:05:00.000Z');
+    const { scheduler, prisma } = buildScheduler([
+      automation({ nextRunAt: null }),
+    ]);
+
+    await scheduler.runDueAutomations(now);
+
+    const stored = prisma.get('automation-1');
+    expect(stored?.nextRunAt).toEqual(
+      computeNextOccurrence('0 9 * * 1', 'Indian/Antananarivo', now),
+    );
+    expect(stored!.nextRunAt!.getTime()).toBeGreaterThan(now.getTime());
+    // Just initialized on this same tick, not due yet — no run.
+    expect(triggerScheduled).not.toHaveBeenCalled();
+  });
+
+  it('reconciliation never touches manual or event automations', async () => {
+    const now = new Date('2026-09-21T06:05:00.000Z');
+    const { scheduler, prisma } = buildScheduler([
+      automation({
+        id: 'manual-1',
+        nextRunAt: null,
+        trigger: {
+          type: 'manual',
+          cronExpression: null,
+          eventType: null,
+          timezone: 'UTC',
+        },
+      }),
+      automation({
+        id: 'event-1',
+        nextRunAt: null,
+        trigger: {
+          type: 'event',
+          cronExpression: null,
+          eventType: 'audit.completed',
+          timezone: 'UTC',
+        },
+      }),
+    ]);
+
+    await scheduler.runDueAutomations(now);
+
+    expect(prisma.get('manual-1')?.nextRunAt).toBeNull();
+    expect(prisma.get('event-1')?.nextRunAt).toBeNull();
+    expect(triggerScheduled).not.toHaveBeenCalled();
   });
 });

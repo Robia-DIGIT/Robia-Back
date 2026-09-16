@@ -19,17 +19,39 @@ Ces champs étaient stockés mais rien ne les lisait avant RC25.
 AutomationSchedulerService
   @Cron(EVERY_MINUTE) handleTick()
     → runDueAutomations(now)
+        → reconcileMissingNextRunAt(now)     // voir "Réconciliation" plus bas
         → SELECT automations WHERE enabled=true
                                  AND trigger.type='scheduled'
                                  AND nextRunAt <= now
+                                 AND (scheduledClaimedAt IS NULL
+                                      OR scheduledClaimedAt < now - LEASE_MS)
         → pour chaque automation due :
-            following = computeNextOccurrence(cron, timezone, now)
+            // Phase 1 — réclamation (lease), pas d'avance de nextRunAt ici
             claim = UPDATE automations
-                    SET nextRunAt = following, lastRunAt = now
-                    WHERE id = automation.id AND nextRunAt = <valeur observée>
-            si claim.count === 0 : une autre instance a gagné → skip
-            sinon : AutomationsService.triggerScheduled(automation, scheduledFor)
-                      → startRun() (RC-20, inchangé) avec triggerType='scheduled'
+                    SET scheduled_claimed_at = now
+                    WHERE id = ? AND next_run_at = <valeur observée>
+                          AND enabled = true
+                          AND (scheduled_claimed_at IS NULL
+                               OR scheduled_claimed_at < now - LEASE_MS)
+            si claim.count === 0 : perdu la course, ou plus éligible → skip
+
+            // Phase 2 — relecture fraîche, ferme la fenêtre de course avec
+            // un disable/modify survenu entre la réclamation et ici
+            fresh = SELECT automation WHERE id = ? (avec trigger)
+            si fresh n'est plus enabled/scheduled : libère le lease, skip
+                                                     (nextRunAt intact)
+
+            // Phase 3 — exécution via le moteur RC-20, inchangé
+            AutomationsService.triggerScheduled(fresh, scheduledFor)
+                      → startRun() avec triggerType='scheduled'
+            // si cet appel lève (run jamais créé durablement), la Phase 4
+            // n'est JAMAIS atteinte : nextRunAt reste intact, à réessayer
+
+            // Phase 4 — seulement après un triggerScheduled() réussi
+            following = computeNextOccurrence(cron, timezone, now)
+            UPDATE automations
+            SET next_run_at = following, scheduled_claimed_at = NULL
+            WHERE id = ? AND next_run_at = <valeur réclamée>
 ```
 
 ## Décision architecturale : un seul dispatcher, pas un job par automation
@@ -40,17 +62,66 @@ enregistrement/désenregistrement dynamique via `SchedulerRegistry` — plus
 fragile qu'un scan périodique unique. `@nestjs/schedule` n'est donc utilisé
 que pour **un seul** `@Cron(CronExpression.EVERY_MINUTE)` statique.
 
+## Réclamation en deux phases avec bail (RC-25 review fix)
+
+La conception initiale réclamait l'occurrence et avançait `nextRunAt` dans le
+même `UPDATE` — un plantage entre ce `UPDATE` et l'appel effectif à
+`triggerScheduled()` perdait l'occurrence définitivement, sans aucune trace
+permettant de la rejouer. Contrairement aux triggers `event` de RC-20 (où un
+événement perdu peut en principe être ré-émis par sa source), une occurrence
+de cron manquée n'a pas de source de rejeu.
+
+`Automation.scheduledClaimedAt` (`DateTime?`, nullable, additif) est un
+**bail** sur la réclamation en cours :
+
+- Posé (`= now`) uniquement à la Phase 1 — jamais en même temps que l'avance
+  de `nextRunAt`.
+- Libéré (`= null`) uniquement une fois le run **durablement créé** (Phase 4)
+  ou quand la relecture fraîche (Phase 2) montre que l'automation n'est plus
+  éligible.
+- Si le processus plante n'importe où entre la Phase 1 et la Phase 4 (y
+  compris pendant `triggerScheduled()` s'il ne parvient jamais à créer le
+  run), le bail reste posé mais `nextRunAt` n'a jamais bougé : l'occurrence
+  n'est ni perdue ni rejouée en rafale, seulement retardée jusqu'à ce que le
+  bail devienne périmé (`SCHEDULED_CLAIM_LEASE_MS`, 5 minutes) et qu'une
+  autre instance (ou la même, après redémarrage) la réclame de nouveau avec
+  exactement le même `scheduledFor` / `dedupKey`.
+
+## Fermeture de la course avec un disable/modify (RC-25 review fix)
+
+La Phase 1 exige `enabled = true` dans son `WHERE` — pas seulement dans le
+`SELECT` du due-set — donc un disable qui arrive entre ce `SELECT` et la
+réclamation fait simplement échouer le `WHERE` (`count = 0`), sans exécution.
+La Phase 2 (relecture fraîche juste après avoir gagné le bail) ferme la
+fenêtre plus étroite encore : un disable/changement de trigger qui arrive
+entre la réclamation et cette relecture fait annuler l'exécution et libérer
+le bail, sans jamais avancer `nextRunAt`. Une automation désactivée/modifiée
+avant la création du run n'est donc **jamais** exécutée — pas même une seule
+fois de trop, contrainte explicitement requise en vue d'une future action
+externe (ex. un envoi d'email en RC27).
+
+## Réconciliation des automations pré-RC25 (RC-25 review fix)
+
+Une automation déjà `enabled=true` + `trigger.type='scheduled'` avant que
+RC25 ne soit déployé a `nextRunAt = null` (rien ne le calculait avant). Un
+filtre `nextRunAt <= now` ne matche jamais `NULL` : sans intervention, une
+telle automation ne serait jamais prise en compte. `reconcileMissingNextRunAt()`
+tourne au début de chaque tick, cherche exactement ce sous-ensemble (jamais
+les triggers `manual`/`event`), et initialise `nextRunAt` via un
+`UPDATE ... WHERE next_run_at IS NULL` — concurrency-safe par construction :
+si deux instances le font en même temps, une seule gagne.
+
 ## Garantie de concurrence
 
 **Deux couches indépendantes**, aucune ne remplace l'autre :
 
-1. **Réclamation atomique** (la couche qui compte réellement) : un seul
-   `UPDATE automations SET next_run_at = ... WHERE id = ? AND next_run_at = ?`
-   — comparaison-et-échange (compare-and-swap) classique. Exactement le même
-   schéma déjà utilisé et testé dans `AutomationsService.approveRun()` /
-   `rejectRun()` de RC20. Postgres sérialise deux `UPDATE` concurrents sur la
-   même ligne : le perdant relit une valeur déjà modifiée par le gagnant, son
-   `WHERE` ne matche plus, `count = 0`.
+1. **Réclamation atomique par bail** (la couche qui compte réellement) : le
+   `UPDATE ... WHERE` de la Phase 1 ci-dessus — comparaison-et-échange
+   (compare-and-swap) classique. Le même schéma déjà utilisé et testé dans
+   `AutomationsService.approveRun()` / `rejectRun()` de RC20. Postgres
+   sérialise deux `UPDATE` concurrents sur la même ligne : le perdant relit
+   une valeur déjà modifiée par le gagnant, son `WHERE` ne matche plus,
+   `count = 0`.
 2. **Contrainte d'unicité `(organizationId, dedupKey)`** sur `AutomationRun`
    (déjà existante, déjà race-safe dans `persistRun()` — testée pour le
    trigger `event`) comme défense supplémentaire, au cas où la réclamation
@@ -68,6 +139,23 @@ jamais caché dans le JSON `config`). Validation stricte via
 `cron-parser` (dont l'erreur native sur un fuseau invalide est un message
 interne peu clair). Jamais déduit de la ville/pays de l'organisation.
 
+## Contrat cron : 5 champs uniquement (RC-25 review fix)
+
+`computeNextOccurrence()` rejette explicitement (`assertFiveFieldCronExpression()`,
+avant même que `cron-parser` ne voie la chaîne) toute expression qui n'a pas
+exactement 5 champs espacés (minute heure jour-du-mois mois jour-de-semaine).
+`cron-parser` accepte par ailleurs un 6ᵉ champ (secondes) et les raccourcis
+`@daily`/`@weekly`/etc., mais le dispatcher ne tique qu'une fois par minute
+(`EVERY_MINUTE`) : une expression à la seconde près donnerait l'illusion
+d'une fréquence qu'elle n'aura jamais réellement. Le rejet porte un message
+explicite plutôt que de laisser `cron-parser` échouer silencieusement ou de
+façon peu claire. `validateTrigger()` rejette en plus toute combinaison de
+champs incohérente avec le type de trigger (`eventType` sur un trigger
+`scheduled`, `cronExpression`/`timezone` sur un trigger `event` ou `manual`)
+— une donnée legacy/invalide de ce genre ne peut donc jamais survivre à un
+changement de type de trigger vers `scheduled` et déclencher une 500 plus
+tard.
+
 ## Politique de rattrapage après interruption
 
 `nextRunAt` est un scalaire unique par automation, pas une file d'occurrences
@@ -77,13 +165,10 @@ quel que soit le nombre d'occurrences manquées pendant un arrêt du service,
 il y a exactement **une** réclamation, **un** run, puis la prochaine valeur
 saute directement à la prochaine occurrence future — jamais de rafale.
 
-**Limite connue et acceptée** : si le processus plante entre la réclamation
-réussie (nextRunAt déjà avancé) et l'appel effectif à `triggerScheduled()`,
-cette occurrence précise est perdue (elle ne sera pas rejouée au tick
-suivant, puisque `nextRunAt` a déjà été avancé). C'est la même classe de
-risque que RC20 accepte déjà entre `persistRun()` et `executeSteps()` pour
-les triggers manuel/événementiel — non aggravée par RC25, documentée ici
-plutôt que traitée par une garantie transactionnelle nouvelle.
+**Résolu (RC-25 review fix)** : avec la réclamation en deux phases décrite
+plus haut, `nextRunAt` n'est plus avancé au moment de la réclamation mais
+seulement après création durable du run — un plantage entre les deux ne
+perd donc plus l'occurrence, voir « Réclamation en deux phases avec bail ».
 
 ## Calcul de `nextRunAt`
 
@@ -108,28 +193,39 @@ déjà figées — aucune étape ne s'exécute avant approbation manuelle.
   comme sûr avec plusieurs instances (voir tests), pas seulement documenté
   comme tel.
 - Une automation dont `enabled`/`trigger` change *entre* le `findMany()` du
-  tick et sa réclamation individuelle peut, dans de rares cas, déclencher un
-  run de plus que prévu (borné à un seul run superflu, jamais une rafale) —
-  la même classe de décalage lecture-puis-action que le reste du moteur RC20
-  accepte déjà (ex. `emitEvent()`).
+  tick et la réclamation (Phase 1) fait simplement échouer cette
+  réclamation ; entre la réclamation et la relecture fraîche (Phase 2), la
+  relecture elle-même annule l'exécution — dans les deux cas, zéro run de
+  trop, voir « Fermeture de la course avec un disable/modify ».
 - Pas de retry automatique des étapes en échec (RC27).
+- Pas d'intégration Postgres réelle dans la suite de tests (aucune base
+  vivante dans cet environnement) : la preuve de la sémantique CAS/bail
+  repose sur `FakeSchedulerPrisma`, un double synchrone find-then-mutate
+  fidèle aux contraintes Postgres réelles (voir
+  `automation-scheduler.service.spec.ts`), plus le test séquentiel
+  crash-puis-récupération qui rejoue deux ticks sur le même état partagé.
 
 ## Fichiers créés
 
 - `src/ops-automation/cron-schedule.ts`
 - `src/ops-automation/automation-scheduler.service.ts` (+ `.spec.ts`)
 - `prisma/migrations/20260916080000_add_automation_trigger_timezone/`
+- `prisma/migrations/20260916090000_automation_scheduled_claim_and_index/`
 - `docs/RC25_SCHEDULED_AUTOMATIONS.md`
 
 ## Fichiers modifiés
 
-- `prisma/schema.prisma` — `AutomationTrigger.timezone`.
+- `prisma/schema.prisma` — `AutomationTrigger.timezone` ;
+  `Automation.scheduledClaimedAt` (bail de réclamation) ;
+  `@@index([enabled, nextRunAt])`.
 - `src/ops-automation/dto/automation-trigger.dto.ts` — `timezone?: string`.
 - `src/ops-automation/automations.service.ts` — `validateTrigger()` valide
-  cron+tz ; `create()`/`update()`/`setEnabled()` recalculent `nextRunAt` ;
-  nouvelle méthode publique `triggerScheduled()`.
+  cron+tz et rejette les combinaisons de champs incohérentes par type de
+  trigger ; `create()`/`update()`/`setEnabled()` recalculent `nextRunAt` via
+  `resolveNextRunAt()` (jamais d'exception propagée, dégrade en `null` avec
+  un warning loggé) ; nouvelle méthode publique `triggerScheduled()`.
 - `src/ops-automation/automations.service.spec.ts` — tests `nextRunAt` +
-  `triggerScheduled`.
+  `triggerScheduled` + validation des combinaisons de champs.
 - `src/ops-automation/ops-automation.module.ts` — enregistre
   `AutomationSchedulerService`.
 - `src/app.module.ts` — `ScheduleModule.forRoot()`.
@@ -160,11 +256,12 @@ hardening séparée (même schéma que RC23/RC24).
 ## Tests exécutés
 
 ```
-npx jest --silent                    → 55 suites, 364 tests, tous passants
-                                        (338 pré-existants + 26 nouveaux)
+npx jest --silent                    → 55 suites, 368 tests, tous passants
 npx tsc --noEmit -p tsconfig.json    → aucune nouvelle erreur (1 erreur
                                         pré-existante et sans rapport,
                                         documentée depuis RC23)
+npx eslint "{src,apps,libs,test}/**/*.ts" --format json
+  --output-file eslint-report.json
 node scripts/check-eslint-baseline.mjs
   eslint-report.json 74 23           → ESLint debt: 74 errors, 23 warnings
                                         (baseline: 74/23) — aucune hausse
@@ -172,5 +269,6 @@ npm run build                        → prisma generate + nest build : succès
 sh -n deploy/github-deploy.sh        → syntaxe shell OK
 python -m unittest discover
   -s deploy/tests -p "test_*.py"     → 22 tests, tous passants
-docker compose ... config --quiet    → configuration valide
+docker compose -f docker-compose.production.yml
+  config --quiet                     → configuration valide
 ```

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import {
   ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
@@ -58,6 +59,8 @@ interface StartRunOptions {
 
 @Injectable()
 export class AutomationsService {
+  private readonly logger = new Logger(AutomationsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly context: AutomationContextService,
@@ -807,6 +810,15 @@ export class AutomationsService {
           'A scheduled trigger requires a cronExpression.',
         );
       }
+      // RC-25 review fix: reject incoherent combinations explicitly —
+      // eventType only ever means something for an `event` trigger.
+      // Silently accepting (and persisting) a stray eventType here would
+      // let bad data through that later code has to defensively tolerate.
+      if (trigger.eventType) {
+        throw new AutomationValidationError(
+          'A scheduled trigger cannot have an eventType.',
+        );
+      }
       // Validates both the cron expression and the timezone by actually
       // computing an occurrence with them — the same function used later
       // to compute the real nextRunAt, so "this trigger validated" and
@@ -826,11 +838,38 @@ export class AutomationsService {
         }
         throw error;
       }
-    }
-    if (trigger.type === 'event' && !trigger.eventType) {
-      throw new AutomationValidationError(
-        'An event trigger requires an eventType.',
-      );
+    } else if (trigger.type === 'event') {
+      if (!trigger.eventType) {
+        throw new AutomationValidationError(
+          'An event trigger requires an eventType.',
+        );
+      }
+      if (trigger.cronExpression) {
+        throw new AutomationValidationError(
+          'An event trigger cannot have a cronExpression.',
+        );
+      }
+      if (trigger.timezone) {
+        throw new AutomationValidationError(
+          'An event trigger cannot have a timezone.',
+        );
+      }
+    } else if (trigger.type === 'manual') {
+      if (trigger.cronExpression) {
+        throw new AutomationValidationError(
+          'A manual trigger cannot have a cronExpression.',
+        );
+      }
+      if (trigger.timezone) {
+        throw new AutomationValidationError(
+          'A manual trigger cannot have a timezone.',
+        );
+      }
+      if (trigger.eventType) {
+        throw new AutomationValidationError(
+          'A manual trigger cannot have an eventType.',
+        );
+      }
     }
   }
 
@@ -838,8 +877,15 @@ export class AutomationsService {
   // given the trigger/enabled state that will be persisted. Returns null
   // for every case that must never carry a scheduled nextRunAt: disabled,
   // manual, or event-triggered (see RC25 doc's "nextRunAt semantics").
-  // Assumes cronExpression/timezone already passed validateTrigger — this
-  // is never called with unvalidated input.
+  //
+  // Assumes cronExpression/timezone already passed validateTrigger when
+  // they were *written* — but this method also runs on every update/
+  // setEnabled call that doesn't touch the trigger at all, using
+  // `existing.trigger` data that could, in principle, predate this
+  // validation (or a future bug). It must therefore never throw: a
+  // computation failure here degrades to "can't schedule yet" (null) with
+  // a logged warning, never a 500 on an unrelated field change (e.g.
+  // renaming the automation).
   private resolveNextRunAt(params: {
     enabled: boolean;
     triggerType: string;
@@ -853,11 +899,20 @@ export class AutomationsService {
     ) {
       return null;
     }
-    return computeNextOccurrence(
-      params.cronExpression,
-      params.timezone,
-      new Date(),
-    );
+    try {
+      return computeNextOccurrence(
+        params.cronExpression,
+        params.timezone,
+        new Date(),
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Impossible de calculer nextRunAt (cron="${params.cronExpression}", timezone="${params.timezone}") : ${
+          error instanceof Error ? error.message : 'erreur inconnue'
+        }`,
+      );
+      return null;
+    }
   }
 
   // Mutates each step's `input` in place, replacing it with the action's own
