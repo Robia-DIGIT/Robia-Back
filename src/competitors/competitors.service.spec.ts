@@ -220,6 +220,38 @@ describe('CompetitorsService', () => {
       );
     });
 
+    // Real-world case (Novotel): the multi-page crawl finds accessible
+    // pages, but the second, single-page audit call still can't read the
+    // page (heavy client-side JS, a redirect the scraper didn't follow —
+    // novotel.com → novotel.accor.com). The engine returns global_score: 0
+    // with page_accessible: false in that case; a completed benchmark must
+    // never store that 0 as a real score.
+    it('marks the competitor failed — never a fabricated 0 score — when the second audit could not read the page', async () => {
+      auditRunner.runAudit.mockResolvedValue({
+        global_score: 0,
+        subscores: {
+          local: 0,
+          technical: 0,
+          content: 0,
+          performance: 0,
+          ai_readiness: 0,
+        },
+        missing_data: [
+          'Site inaccessible : redirection non suivie par le scraper',
+        ],
+        summary: "Le site n'a pas pu être analysé car il est inaccessible.",
+        page_accessible: false,
+      });
+
+      const result = await service.run(organizationId, competitorId);
+
+      expect(result.status).toBe('failed');
+      expect(result.globalScore).toBeUndefined();
+      expect(result.errorMessage).toBe(
+        'Site inaccessible : redirection non suivie par le scraper',
+      );
+    });
+
     it('marks the competitor failed instead of completing with zero accessible pages', async () => {
       auditRunner.runSiteAudit.mockResolvedValue({
         ...siteResult,

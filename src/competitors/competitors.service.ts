@@ -118,6 +118,20 @@ export class CompetitorsService {
         country: organization?.country,
       });
 
+      // The multi-page crawl above found accessible pages, but this
+      // second, single-page audit call can still fail to read the page
+      // (JS-heavy rendering, a redirect the scraper didn't follow,
+      // timeout...). The engine returns global_score: 0 as a placeholder
+      // in that case — page_accessible: false is what actually says so.
+      // Without this check a real read failure would be stored as a
+      // completed benchmark with a fabricated 0 score.
+      if (result.page_accessible === false) {
+        throw new Error(
+          result.missing_data?.[0] ??
+            "Le second audit n'a pas pu lire la page (site inaccessible pour ce module)",
+        );
+      }
+
       return this.prisma.competitor.update({
         where: { id: competitor.id },
         data: {
