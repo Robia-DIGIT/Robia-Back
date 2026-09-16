@@ -2,6 +2,8 @@ import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AuditsService } from '../../audits/audits.service';
 import { OpportunitiesService } from '../../opportunities/opportunities.service';
+import { NotificationsService } from '../../notifications/notifications.service';
+import { maskEmail } from '../../notifications/mask-email';
 
 /**
  * RC-20 — the Ops action registry.
@@ -22,7 +24,8 @@ export type OpsActionType =
   | 'robia.audit.run_diagnostic'
   | 'robia.opportunities.regenerate'
   | 'robia.report.prepare_organization_summary'
-  | 'robia.action_items.create_internal_task';
+  | 'robia.action_items.create_internal_task'
+  | 'robia.notification.send_email';
 
 export type OpsActionInput = Record<string, unknown>;
 export type OpsActionEvidence = Record<string, unknown>;
@@ -30,17 +33,35 @@ export type OpsActionEvidence = Record<string, unknown>;
 export class UnknownOpsActionError extends Error {}
 export class InvalidOpsActionInputError extends Error {}
 
+// RC-26 — trusted, server-resolved context passed alongside a step's own
+// (caller-influenced) input. Never derived from anything a user supplies:
+// automationId/runId/stepRunId always come from the real AutomationRun/
+// AutomationStepRun rows executeSteps() just created. Only
+// robia.notification.send_email reads this today; every other action
+// ignores the extra parameter.
+export interface OpsActionExecutionContext {
+  automationId: string;
+  runId: string;
+  stepRunId: string;
+}
+
 interface OpsActionDescriptor {
   type: OpsActionType;
   description: string;
-  // The exhaustive list of input keys this action ever reads. Anything else
-  // present on the caller-supplied input — a stray `token`/`apiKey`, or any
-  // other extraneous field — is never persisted or executed: see
-  // canonicalizeInput().
+  // The exhaustive list of *string* input keys this action ever reads.
+  // Anything else present on the caller-supplied input — a stray
+  // `token`/`apiKey`, or any other extraneous field — is never persisted or
+  // executed: see canonicalizeInput().
   inputSchema: string[];
+  // Additional keys that, when declared, must each be a plain JSON object
+  // (defaulting to `{}` when absent) rather than a string — e.g.
+  // send_email's `templateData`. Declared separately from inputSchema
+  // because these are structured data, not a single string value.
+  objectInputFields?: string[];
   execute: (
     organizationId: string,
     input: OpsActionInput | null | undefined,
+    context?: OpsActionExecutionContext,
   ) => Promise<OpsActionEvidence>;
 }
 
@@ -57,12 +78,14 @@ export class OpsActionsRegistryService {
     private readonly prisma: PrismaService,
     private readonly audits: AuditsService,
     private readonly opportunities: OpportunitiesService,
+    private readonly notifications: NotificationsService,
   ) {
     const registered = [
       this.buildRunDiagnostic(),
       this.buildRegenerateOpportunities(),
       this.buildPrepareOrganizationSummary(),
       this.buildCreateInternalTask(),
+      this.buildSendEmail(),
     ];
     this.actions = new Map(registered.map((action) => [action.type, action]));
   }
@@ -105,6 +128,9 @@ export class OpsActionsRegistryService {
     for (const field of action.inputSchema) {
       canonical[field] = (input as OpsActionInput)[field];
     }
+    for (const field of action.objectInputFields ?? []) {
+      canonical[field] = this.canonicalizeObjectInput(input, field);
+    }
     return canonical;
   }
 
@@ -112,6 +138,7 @@ export class OpsActionsRegistryService {
     actionType: string,
     organizationId: string,
     input: OpsActionInput | null | undefined,
+    context?: OpsActionExecutionContext,
   ): Promise<OpsActionEvidence> {
     const action = this.actions.get(actionType as OpsActionType);
     if (!action) {
@@ -119,7 +146,31 @@ export class OpsActionsRegistryService {
         `Action type "${actionType}" is not in the Ops action allowlist.`,
       );
     }
-    return action.execute(organizationId, input);
+    return action.execute(organizationId, input, context);
+  }
+
+  // Validates and returns a declared object-typed field (e.g. send_email's
+  // templateData): must be a plain object when present (never an array or
+  // class instance), defaults to `{}` when absent — never required to be
+  // non-empty, since some templates need no variables at all. Per-template
+  // variable validation itself happens in notification-templates.ts, not
+  // here: this is only structural hygiene, the same choke point that keeps
+  // canonicalizeInput() the single place anything outside an action's own
+  // declared inputs could ever leak through.
+  private canonicalizeObjectInput(
+    input: OpsActionInput | null | undefined,
+    field: string,
+  ): Record<string, unknown> {
+    const value = input?.[field];
+    if (value === undefined || value === null) {
+      return {};
+    }
+    if (typeof value !== 'object' || Array.isArray(value)) {
+      throw new InvalidOpsActionInputError(
+        `"${field}" must be a plain object.`,
+      );
+    }
+    return { ...(value as Record<string, unknown>) };
   }
 
   private requireStringInput(
@@ -262,6 +313,62 @@ export class OpsActionsRegistryService {
           title: actionItem.title,
           approvalStatus: actionItem.approvalStatus,
           executionStatus: actionItem.executionStatus,
+        };
+      },
+    };
+  }
+
+  // "Envoi d'un email de notification" — RC-26. Deliberately the most
+  // restricted action in this registry:
+  //   - templateKey must be one of NOTIFICATION_TEMPLATES' own keys
+  //     (checked again, redundantly, by NotificationsService itself —
+  //     never trust a single choke point for something this sensitive).
+  //   - templateData carries only plain, size-bounded, allowlisted-per-
+  //     template variables — never a subject, a body, or raw HTML.
+  //   - the recipient is never part of the input at all: it is always
+  //     Automation.createdById -> User.email, resolved server-side by
+  //     NotificationsService from the trusted `context` this method
+  //     receives (never from anything a caller-supplied `input` could
+  //     influence) — there is no way to name an arbitrary address here.
+  //   - no replyTo, no custom headers: NotificationTransport's own
+  //     sendEmail() signature doesn't accept any.
+  // Creating a NotificationDelivery here never sends anything by itself —
+  // NotificationDispatcherService is the only thing that ever attempts the
+  // actual send, on its own schedule.
+  private buildSendEmail(): OpsActionDescriptor {
+    return {
+      type: 'robia.notification.send_email',
+      description:
+        "Crée une notification email (en attente d'envoi) à partir d'un template allowlisté, adressée exclusivement au créateur de l'automatisation.",
+      inputSchema: ['templateKey'],
+      objectInputFields: ['templateData'],
+      execute: async (organizationId, input, context) => {
+        const templateKey = this.requireStringInput(input, 'templateKey');
+        const templateData = (input as OpsActionInput)?.templateData ?? {};
+        if (!context) {
+          // Can only happen if this action is ever invoked outside
+          // executeSteps() (it never is in this codebase) — fails loudly
+          // rather than silently resolving no recipient.
+          throw new InvalidOpsActionInputError(
+            'robia.notification.send_email requires automation execution context.',
+          );
+        }
+        const { delivery, recipientEmail } =
+          await this.notifications.createEmailDelivery({
+            organizationId,
+            automationId: context.automationId,
+            automationRunId: context.runId,
+            automationStepRunId: context.stepRunId,
+            templateKey,
+            templateData,
+          });
+        return {
+          deliveryId: delivery.id,
+          channel: delivery.channel,
+          templateKey: delivery.templateKey,
+          status: delivery.status,
+          // Never the full address — see maskEmail()'s own doc comment.
+          recipientMasked: maskEmail(recipientEmail),
         };
       },
     };

@@ -769,6 +769,11 @@ export class AutomationsService {
           step.actionType,
           run.organizationId,
           resolvedInput,
+          {
+            automationId: run.automationId,
+            runId: run.id,
+            stepRunId: stepRun.id,
+          },
         );
         await this.prisma.automationStepRun.update({
           where: { id: stepRun.id },

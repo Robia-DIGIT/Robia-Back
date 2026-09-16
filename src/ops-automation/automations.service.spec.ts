@@ -1282,6 +1282,7 @@ describe('AutomationsService', () => {
       'robia.action_items.create_internal_task',
       orgA,
       { title: 'Original' },
+      expect.objectContaining({ automationId: automation.id, runId: run.id }),
     );
     expect(approved.steps[0].input).toEqual({ title: 'Original' });
   });
@@ -1316,6 +1317,7 @@ describe('AutomationsService', () => {
         'robia.action_items.create_internal_task',
         orgA,
         { title: 'x' },
+        expect.objectContaining({ automationId: automation.id, runId: run.id }),
       );
     });
 
@@ -1497,6 +1499,10 @@ describe('AutomationsService', () => {
         'robia.opportunities.regenerate',
         orgA,
         { auditId: 'audit-real-id' },
+        expect.objectContaining({
+          automationId: automation.id,
+          runId: runs[0].id,
+        }),
       );
       expect(runs[0].steps[0].input).toEqual({ auditId: 'audit-real-id' });
     });
@@ -1542,6 +1548,10 @@ describe('AutomationsService', () => {
         'robia.opportunities.regenerate',
         orgA,
         { auditId: 'audit-123' },
+        expect.objectContaining({
+          automationId: run.automationId,
+          runId: run.id,
+        }),
       );
       expect(approved.steps[0].input).toEqual({ auditId: 'audit-123' });
     });

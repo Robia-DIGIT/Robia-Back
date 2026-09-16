@@ -26,6 +26,7 @@ import { BillingModule } from './billing/billing.module';
 import { OpsAutomationModule } from './ops-automation/ops-automation.module';
 import { IntelligenceModule } from './intelligence/intelligence.module';
 import { CompetitorsModule } from './competitors/competitors.module';
+import { NotificationsModule } from './notifications/notifications.module';
 
 @Module({
   imports: [
@@ -61,6 +62,7 @@ import { CompetitorsModule } from './competitors/competitors.module';
     OpsAutomationModule,
     IntelligenceModule,
     CompetitorsModule,
+    NotificationsModule,
   ],
   controllers: [AppController],
   providers: [
