@@ -4,6 +4,7 @@ import { AuditsService } from '../../audits/audits.service';
 import { OpportunitiesService } from '../../opportunities/opportunities.service';
 import { NotificationsService } from '../../notifications/notifications.service';
 import { maskEmail } from '../../notifications/mask-email';
+import { OdcApplicationsService } from '../../odc/odc-applications.service';
 
 /**
  * RC-20 — the Ops action registry.
@@ -25,7 +26,10 @@ export type OpsActionType =
   | 'robia.opportunities.regenerate'
   | 'robia.report.prepare_organization_summary'
   | 'robia.action_items.create_internal_task'
-  | 'robia.notification.send_email';
+  | 'robia.notification.send_email'
+  | 'robia.odc.prepare_application_summary'
+  | 'robia.odc.flag_missing_documents'
+  | 'robia.odc.create_review_task';
 
 export type OpsActionInput = Record<string, unknown>;
 export type OpsActionEvidence = Record<string, unknown>;
@@ -83,6 +87,7 @@ export class OpsActionsRegistryService {
     private readonly audits: AuditsService,
     private readonly opportunities: OpportunitiesService,
     private readonly notifications: NotificationsService,
+    private readonly odcApplications: OdcApplicationsService,
   ) {
     const registered = [
       this.buildRunDiagnostic(),
@@ -90,6 +95,9 @@ export class OpsActionsRegistryService {
       this.buildPrepareOrganizationSummary(),
       this.buildCreateInternalTask(),
       this.buildSendEmail(),
+      this.buildOdcPrepareApplicationSummary(),
+      this.buildOdcFlagMissingDocuments(),
+      this.buildOdcCreateReviewTask(),
     ];
     this.actions = new Map(registered.map((action) => [action.type, action]));
   }
@@ -394,6 +402,87 @@ export class OpsActionsRegistryService {
           // Never the full address — see maskEmail()'s own doc comment.
           recipientMasked: maskEmail(recipientEmail),
         };
+      },
+    };
+  }
+
+  // RC-29 — "Résumé de candidature (IA)". Never generates a decision, never
+  // touches `status`: only ever writes OdcApplication.summaryDraft, and only
+  // ever from data already persisted on the application itself (no LLM call
+  // exists in this codebase yet — see
+  // OdcApplicationsService.prepareApplicationSummary()'s own doc comment). A
+  // terminal application (accepted/rejected/withdrawn) is a silent no-op,
+  // never an error: an automation racing a human decision must never fight
+  // it or fail the run over it.
+  private buildOdcPrepareApplicationSummary(): OpsActionDescriptor {
+    return {
+      type: 'robia.odc.prepare_application_summary',
+      description:
+        'Prépare un résumé (brouillon) pour une candidature ODC — ne change jamais son statut.',
+      inputSchema: ['applicationId'],
+      execute: async (organizationId, input) => {
+        const applicationId = this.requireStringInput(input, 'applicationId');
+        const result = await this.odcApplications.prepareApplicationSummary(
+          organizationId,
+          applicationId,
+        );
+        return { applicationId, ...result };
+      },
+    };
+  }
+
+  // RC-29 — "Recalcul des pièces manquantes". Re-runs the exact same
+  // deterministic completeness check submit() itself uses — never a
+  // heuristic, never the AI. Only ever acts on a candidature currently
+  // 'incomplete'; can move it to 'in_review' when now complete, never
+  // straight to accepted/rejected/waitlisted (this action never even touches
+  // those values — see OdcApplicationsService.recomputeMissingDocuments()).
+  // A no-op on any other status.
+  private buildOdcFlagMissingDocuments(): OpsActionDescriptor {
+    return {
+      type: 'robia.odc.flag_missing_documents',
+      description:
+        "Recalcule les pièces/champs manquants d'une candidature ODC en attente — peut passer 'incomplete' à 'in_review', jamais à une décision.",
+      inputSchema: ['applicationId'],
+      execute: async (organizationId, input) => {
+        const applicationId = this.requireStringInput(input, 'applicationId');
+        const { changed, application } =
+          await this.odcApplications.recomputeMissingDocuments(
+            organizationId,
+            applicationId,
+          );
+        return {
+          applicationId,
+          changed,
+          status: application.status,
+          missing: application.missing ?? null,
+        };
+      },
+    };
+  }
+
+  // RC-29 — "Tâche de revue de candidature". A plain ActionItem, draft/
+  // not_started via the model's own defaults — same posture as
+  // robia.action_items.create_internal_task, never approved or executed
+  // automatically. The title is always computed server-side from the
+  // application's own applicant/program (see
+  // OdcApplicationsService.createReviewTask()) — deliberately not a caller-
+  // supplied field, so this action can never be used to write arbitrary
+  // free text through an ActionItem title.
+  private buildOdcCreateReviewTask(): OpsActionDescriptor {
+    return {
+      type: 'robia.odc.create_review_task',
+      description:
+        'Crée une tâche ROBIA interne de revue pour une candidature ODC — en brouillon, jamais approuvée automatiquement.',
+      inputSchema: ['applicationId'],
+      execute: async (organizationId, input) => {
+        const applicationId = this.requireStringInput(input, 'applicationId');
+        const { actionItemId, title } =
+          await this.odcApplications.createReviewTask(
+            organizationId,
+            applicationId,
+          );
+        return { applicationId, actionItemId, title };
       },
     };
   }

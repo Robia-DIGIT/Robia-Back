@@ -27,6 +27,7 @@ import { OpsAutomationModule } from './ops-automation/ops-automation.module';
 import { IntelligenceModule } from './intelligence/intelligence.module';
 import { CompetitorsModule } from './competitors/competitors.module';
 import { NotificationsModule } from './notifications/notifications.module';
+import { OdcModule } from './odc/odc.module';
 
 @Module({
   imports: [
@@ -63,6 +64,7 @@ import { NotificationsModule } from './notifications/notifications.module';
     IntelligenceModule,
     CompetitorsModule,
     NotificationsModule,
+    OdcModule,
   ],
   controllers: [AppController],
   providers: [

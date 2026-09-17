@@ -2,6 +2,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { AuditsService } from '../../audits/audits.service';
 import { OpportunitiesService } from '../../opportunities/opportunities.service';
 import { NotificationsService } from '../../notifications/notifications.service';
+import { OdcApplicationsService } from '../../odc/odc-applications.service';
 import {
   InvalidOpsActionInputError,
   OpsActionsRegistryService,
@@ -23,6 +24,11 @@ interface MockOpportunities {
 interface MockNotifications {
   createEmailDelivery: jest.Mock;
 }
+interface MockOdcApplications {
+  prepareApplicationSummary: jest.Mock;
+  recomputeMissingDocuments: jest.Mock;
+  createReviewTask: jest.Mock;
+}
 
 describe('OpsActionsRegistryService', () => {
   const organizationId = 'org-1';
@@ -35,6 +41,7 @@ describe('OpsActionsRegistryService', () => {
   let audits: MockAudits;
   let opportunities: MockOpportunities;
   let notifications: MockNotifications;
+  let odcApplications: MockOdcApplications;
   let registry: OpsActionsRegistryService;
 
   beforeEach(() => {
@@ -75,16 +82,30 @@ describe('OpsActionsRegistryService', () => {
         recipientEmail: 'jane@example.com',
       }),
     };
+    odcApplications = {
+      prepareApplicationSummary: jest
+        .fn()
+        .mockResolvedValue({ skipped: false, summaryDraft: 'Résumé.' }),
+      recomputeMissingDocuments: jest.fn().mockResolvedValue({
+        changed: true,
+        application: { status: 'in_review', missing: null },
+      }),
+      createReviewTask: jest.fn().mockResolvedValue({
+        actionItemId: 'action-2',
+        title: 'Revue de candidature',
+      }),
+    };
     registry = new OpsActionsRegistryService(
       prisma as unknown as PrismaService,
       audits as unknown as AuditsService,
       opportunities as unknown as OpportunitiesService,
       notifications as unknown as NotificationsService,
+      odcApplications as unknown as OdcApplicationsService,
     );
   });
 
   describe('allowlist', () => {
-    it('lists exactly the 5 safe, internal ROBIA actions', () => {
+    it('lists exactly the 8 safe, internal ROBIA actions', () => {
       const types = registry.listAllowedActions().map((a) => a.type);
       expect(types.sort()).toEqual(
         [
@@ -93,6 +114,9 @@ describe('OpsActionsRegistryService', () => {
           'robia.notification.send_email',
           'robia.opportunities.regenerate',
           'robia.report.prepare_organization_summary',
+          'robia.odc.prepare_application_summary',
+          'robia.odc.flag_missing_documents',
+          'robia.odc.create_review_task',
         ].sort(),
       );
     });
@@ -106,6 +130,9 @@ describe('OpsActionsRegistryService', () => {
       'database.delete_all',
       'meta.publish_post',
       'gbp.publish_post',
+      // RC-29 — the AI/automations must never be able to decide a
+      // candidature: no such action is ever registered, at all.
+      'robia.odc.decide',
     ])('rejects the non-allowlisted action "%s"', async (actionType) => {
       expect(registry.isAllowed(actionType)).toBe(false);
       await expect(
@@ -455,6 +482,64 @@ describe('OpsActionsRegistryService', () => {
         { auditId: '{{event.auditId}}' },
       );
       expect(canonical).toEqual({ auditId: '{{event.auditId}}' });
+    });
+  });
+
+  describe('robia.odc.prepare_application_summary', () => {
+    it('delegates to OdcApplicationsService.prepareApplicationSummary and returns its result', async () => {
+      const evidence = await registry.execute(
+        'robia.odc.prepare_application_summary',
+        organizationId,
+        { applicationId: 'app-1' },
+      );
+      expect(odcApplications.prepareApplicationSummary).toHaveBeenCalledWith(
+        organizationId,
+        'app-1',
+      );
+      expect(evidence).toEqual({
+        applicationId: 'app-1',
+        skipped: false,
+        summaryDraft: 'Résumé.',
+      });
+    });
+  });
+
+  describe('robia.odc.flag_missing_documents', () => {
+    it('delegates to OdcApplicationsService.recomputeMissingDocuments and reports the resulting status', async () => {
+      const evidence = await registry.execute(
+        'robia.odc.flag_missing_documents',
+        organizationId,
+        { applicationId: 'app-1' },
+      );
+      expect(odcApplications.recomputeMissingDocuments).toHaveBeenCalledWith(
+        organizationId,
+        'app-1',
+      );
+      expect(evidence).toEqual({
+        applicationId: 'app-1',
+        changed: true,
+        status: 'in_review',
+        missing: null,
+      });
+    });
+  });
+
+  describe('robia.odc.create_review_task', () => {
+    it('delegates to OdcApplicationsService.createReviewTask — the title is never caller-supplied', async () => {
+      const evidence = await registry.execute(
+        'robia.odc.create_review_task',
+        organizationId,
+        { applicationId: 'app-1', title: 'Ignored, never read' },
+      );
+      expect(odcApplications.createReviewTask).toHaveBeenCalledWith(
+        organizationId,
+        'app-1',
+      );
+      expect(evidence).toEqual({
+        applicationId: 'app-1',
+        actionItemId: 'action-2',
+        title: 'Revue de candidature',
+      });
     });
   });
 });
