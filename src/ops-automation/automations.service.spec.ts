@@ -723,6 +723,26 @@ describe('AutomationsService', () => {
       expect(automation.trigger).toMatchObject({ type: 'manual' });
     });
 
+    it('defaults to scope "ORGANIZATION" when none is given (RC-29 activation, unchanged default)', async () => {
+      const automation = await service.create(orgA, userA, createDto());
+      expect(automation.scope).toBe('ORGANIZATION');
+    });
+
+    it('accepts the RC-29 "PROGRAM"/"COHORT" scopes without filtering or rejecting them', async () => {
+      const program = await service.create(
+        orgA,
+        userA,
+        createDto({ scope: 'PROGRAM' } as never),
+      );
+      expect(program.scope).toBe('PROGRAM');
+      const cohort = await service.create(
+        orgA,
+        userA,
+        createDto({ scope: 'COHORT' } as never),
+      );
+      expect(cohort.scope).toBe('COHORT');
+    });
+
     it('rejects a scheduled trigger without a cronExpression', async () => {
       await expect(
         service.create(

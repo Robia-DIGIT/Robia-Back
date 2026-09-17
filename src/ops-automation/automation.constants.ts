@@ -34,3 +34,19 @@ export const SCHEDULER_MAX_CONCURRENCY = 5;
  * a lease that hasn't gone stale yet.
  */
 export const SCHEDULER_MAX_BATCH_SIZE = 50;
+
+// RC-29 — "activating" the PROGRAM/COHORT scopes RC-20 reserved
+// (docs/RC20_OPS_AUTOMATION_CORE.md's "Séparation des scopes (préparée, non
+// construite)") means exactly this: `Automation.scope` becomes a settable,
+// validated field instead of a column nothing ever writes to explicitly.
+// Nothing here filters or branches on `scope` — that stays true after this
+// change too — so an ODC automation using `PROGRAM` is a plain
+// categorization value, never a second isolation dimension layered on top
+// of `organizationId`, which alone remains the only enforced boundary.
+export const AUTOMATION_SCOPES = [
+  'ORGANIZATION',
+  'ROBIA_INTERNAL',
+  'PROGRAM',
+  'COHORT',
+] as const;
+export type AutomationScope = (typeof AUTOMATION_SCOPES)[number];

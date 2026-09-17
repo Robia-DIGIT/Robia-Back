@@ -105,6 +105,11 @@ export class AutomationsService {
     return this.prisma.automation.create({
       data: {
         organizationId,
+        // Omitted entirely (never an explicit `undefined` passed to Prisma)
+        // when the caller doesn't set it, so the Postgres column default
+        // ('ORGANIZATION') still applies exactly as before this field
+        // existed — see CreateAutomationDto.scope's own doc comment.
+        ...(dto.scope !== undefined ? { scope: dto.scope } : {}),
         name: dto.name,
         description: dto.description ?? null,
         enabled,
@@ -204,6 +209,7 @@ export class AutomationsService {
         ...(dto.requiresApproval !== undefined
           ? { requiresApproval: dto.requiresApproval }
           : {}),
+        ...(dto.scope !== undefined ? { scope: dto.scope } : {}),
         nextRunAt,
         // RC-25 review fix: nextRunAt is always rewritten above (recomputed
         // from the effective post-update state), so any scheduler claim

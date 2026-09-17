@@ -2,6 +2,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { AuditsService } from '../../audits/audits.service';
 import { OpportunitiesService } from '../../opportunities/opportunities.service';
 import { NotificationsService } from '../../notifications/notifications.service';
+import { OdcApplicationsService } from '../../odc/odc-applications.service';
 import { OpsActionsRegistryService } from '../actions/ops-actions-registry.service';
 import { validateConditionTree } from '../condition-engine';
 import { resolveStepInput } from '../automation-templating';
@@ -10,12 +11,13 @@ import { EXAMPLE_AUTOMATIONS } from './automation-examples';
 describe('RC-20 demonstration automations', () => {
   // Constructed with no real dependencies: isAllowed() only reads the
   // registry's own internal map, built in the constructor without ever
-  // calling prisma/audits/opportunities/notifications.
+  // calling prisma/audits/opportunities/notifications/odcApplications.
   const registry = new OpsActionsRegistryService(
     {} as unknown as PrismaService,
     {} as unknown as AuditsService,
     {} as unknown as OpportunitiesService,
     {} as unknown as NotificationsService,
+    {} as unknown as OdcApplicationsService,
   );
 
   it('ships exactly the 4 named examples, all disabled', () => {

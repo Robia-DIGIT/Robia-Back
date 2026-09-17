@@ -36,6 +36,11 @@ model User {
   // caller-supplied address (see OpsActionsRegistryService's
   // robia.notification.send_email).
   notificationDeliveries  NotificationDelivery[]
+  // RC-29 — the human who decided an ODC candidature (decide()'s own
+  // decidedById). No relation exists for OdcProgram.createdById or
+  // OdcHistoryEvent.actorUserId: those stay plain, unrelated ids, per the
+  // ODC spec's own Prisma sketch.
+  odcApplicationsDecided  OdcApplication[]
 
   @@map("users")
 }
@@ -78,6 +83,9 @@ model Organization {
   automationEvents  AutomationEvent[]
   competitors       Competitor[]
   notificationDeliveries NotificationDelivery[]
+  odcPrograms       OdcProgram[]
+  odcApplicants     OdcApplicant[]
+  odcApplications   OdcApplication[]
   createdAt DateTime @default(now()) @map("created_at")
 
   @@map("organizations")
@@ -666,4 +674,224 @@ model NotificationDelivery {
   // Serves GET /ops/notifications (list, most recent first).
   @@index([organizationId, createdAt])
   @@map("notification_deliveries")
+}
+
+// RC-29 — Orange Digital Center candidature workflow: programs, cohort-style
+// applications, documents, deterministic completeness/screening, proposed
+// (AI/reviewer) vs. final (human) scores, and an append-only decision
+// history. The one rule every piece of this domain exists to enforce:
+// nothing here — no automation, no action, no scheduled reminder — ever
+// writes `OdcApplication.status` to accepted/rejected/waitlisted. Only
+// OdcApplicationsService.decide() does, and only for a human caller. See
+// docs/RC29_ODC_CANDIDATURES.md.
+
+model OdcProgram {
+  id               String   @id @default(cuid())
+  organizationId   String   @map("organization_id")
+  organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  slug             String
+  name             String
+  description      String?
+  status           String   @default("draft") // draft | open | closed | archived
+  opensAt          DateTime? @map("opens_at")
+  closesAt         DateTime? @map("closes_at")
+  requireDualReview Boolean @default(false) @map("require_dual_review")
+  // Indicative only — decide() never reads this to auto-apply a decision;
+  // see OdcApplicationsService.decide().
+  decisionThreshold Int?    @map("decision_threshold")
+  createdById      String   @map("created_by_id")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  fields       OdcField[]
+  criteria     OdcCriterion[]
+  docTypes     OdcDocumentType[]
+  applications OdcApplication[]
+
+  @@unique([organizationId, slug])
+  @@index([organizationId, status])
+  @@map("odc_programs")
+}
+
+// One row per answer field a program's candidature form collects (name,
+// motivation letter, ...). `required` drives OdcApplicationsService's
+// deterministic completeness check — never the AI, never a heuristic.
+model OdcField {
+  id        String @id @default(cuid())
+  programId String @map("program_id")
+  program   OdcProgram @relation(fields: [programId], references: [id], onDelete: Cascade)
+  key       String
+  label     String
+  required  Boolean @default(false)
+  fieldType String  @map("field_type") // text | longtext | number | date | select
+  options   Json?
+  sortOrder Int     @default(0) @map("sort_order")
+
+  @@unique([programId, key])
+  @@map("odc_fields")
+}
+
+// One row per scoring criterion a program's candidatures are evaluated
+// against. `weight` and `maxPoints` are inputs to the weighted-sum total in
+// odc-completeness.ts — never enforced as a hard cap by the database itself.
+model OdcCriterion {
+  id          String @id @default(cuid())
+  programId   String @map("program_id")
+  program     OdcProgram @relation(fields: [programId], references: [id], onDelete: Cascade)
+  key         String
+  label       String
+  description String?
+  weight      Int     @default(1)
+  maxPoints   Int     @default(5) @map("max_points")
+  required    Boolean @default(true)
+  sortOrder   Int     @default(0) @map("sort_order")
+  scoreLines  OdcScoreLine[]
+
+  @@unique([programId, key])
+  @@map("odc_criteria")
+}
+
+// One row per required (or optional) supporting-document type a program's
+// candidatures must attach (ID card, CV, ...). `required` drives the same
+// deterministic completeness check as OdcField.required.
+model OdcDocumentType {
+  id        String @id @default(cuid())
+  programId String @map("program_id")
+  program   OdcProgram @relation(fields: [programId], references: [id], onDelete: Cascade)
+  key       String
+  label     String
+  required  Boolean @default(true)
+  mimeAllow String[] @default(["application/pdf"]) @map("mime_allow")
+  documents OdcDocument[]
+
+  @@unique([programId, key])
+  @@map("odc_document_types")
+}
+
+// A candidate as a plain, staff/form-entered record (v1 has no public
+// candidate portal or login — see docs/RC29_ODC_CANDIDATURES.md's "Acteurs"
+// section). `userId` is an optional forward-compatible hook for a future
+// portal; nothing in RC-29 reads or writes it.
+model OdcApplicant {
+  id             String @id @default(cuid())
+  organizationId String @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  displayName    String @map("display_name")
+  email          String?
+  phone          String?
+  userId         String? @map("user_id")
+  createdAt      DateTime @default(now()) @map("created_at")
+  applications   OdcApplication[]
+
+  @@index([organizationId, email])
+  @@map("odc_applicants")
+}
+
+model OdcApplication {
+  id             String @id @default(cuid())
+  organizationId String @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  programId      String @map("program_id")
+  program        OdcProgram @relation(fields: [programId], references: [id], onDelete: Cascade)
+  applicantId    String @map("applicant_id")
+  applicant      OdcApplicant @relation(fields: [applicantId], references: [id], onDelete: Restrict)
+  status         String @default("draft")
+  // draft | submitted | screening | incomplete | in_review | waitlisted |
+  // accepted | rejected | withdrawn — see OdcApplicationsService for the
+  // transition table. accepted/rejected/waitlisted are only ever written by
+  // decide(), never by an automation/action.
+  answers        Json   @default("{}")
+  proposedTotal  Int?   @map("proposed_total")
+  finalTotal     Int?   @map("final_total")
+  // Written only by robia.odc.prepare_application_summary — a draft for a
+  // human to read, never a decision input.
+  summaryDraft   String? @map("summary_draft")
+  // string[] of "field:<key>" / "document:<key>" — see odc-completeness.ts.
+  // Null once complete; never an empty-vs-missing ambiguity since a
+  // completeness check always (re)writes this to either a non-empty array
+  // or null.
+  missing        Json?
+  submittedAt    DateTime? @map("submitted_at")
+  decidedAt      DateTime? @map("decided_at")
+  // Plain id, no relation: decide()'s own actor. See decidedBy below for
+  // the actual FK — kept as a separate scalar so it round-trips through the
+  // same create/update `data` shape as every other plain-id field here.
+  decidedById    String? @map("decided_by_id")
+  decidedBy      User?    @relation(fields: [decidedById], references: [id])
+  decisionReason String? @map("decision_reason")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  documents  OdcDocument[]
+  scoreLines OdcScoreLine[]
+  events     OdcHistoryEvent[]
+
+  @@unique([programId, applicantId])
+  @@index([organizationId, status])
+  @@map("odc_applications")
+}
+
+// Metadata only — never a binary blob in this repo/database. `storageKey`
+// is optional (v1 may stub an upload as `pending_upload`, no real storage
+// backend wired up yet); `status` starts at `received` only when the
+// service is given a `storageKey` at creation time, `pending_upload`
+// otherwise — see OdcApplicationsService.addDocument().
+model OdcDocument {
+  id             String @id @default(cuid())
+  organizationId String @map("organization_id")
+  applicationId  String @map("application_id")
+  application    OdcApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  documentTypeId String @map("document_type_id")
+  documentType   OdcDocumentType @relation(fields: [documentTypeId], references: [id])
+  originalName   String @map("original_name")
+  mimeType       String @map("mime_type")
+  sizeBytes      Int    @map("size_bytes")
+  storageKey     String? @map("storage_key")
+  status         String @default("received") // pending_upload | received | rejected
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@index([organizationId, applicationId])
+  @@map("odc_documents")
+}
+
+// One row per (application, criterion). `proposedPoints` (AI or reviewer)
+// and `finalPoints` (human, via PATCH .../scores) are tracked independently
+// so a reviewer can see and correct an AI proposal without ever losing it.
+// See odc-completeness.ts for how these roll up into
+// OdcApplication.proposedTotal/finalTotal (null, never 0, while any
+// required criterion's line is unset).
+model OdcScoreLine {
+  id             String @id @default(cuid())
+  organizationId String @map("organization_id")
+  applicationId  String @map("application_id")
+  application    OdcApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  criterionId    String @map("criterion_id")
+  criterion      OdcCriterion @relation(fields: [criterionId], references: [id])
+  proposedPoints Int?   @map("proposed_points")
+  proposedBy     String @default("ai") @map("proposed_by") // ai | reviewer
+  finalPoints    Int?   @map("final_points")
+  rationale      String?
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  @@unique([applicationId, criterionId])
+  @@map("odc_score_lines")
+}
+
+// Append-only. No update/delete route exists for this model — every status
+// transition (submit, screening outcome, decide, withdraw) writes exactly
+// one new row here, never mutates an existing one.
+model OdcHistoryEvent {
+  id             String @id @default(cuid())
+  organizationId String @map("organization_id")
+  applicationId  String @map("application_id")
+  application    OdcApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  actorUserId    String? @map("actor_user_id")
+  eventType      String @map("event_type")
+  fromStatus     String? @map("from_status")
+  toStatus       String? @map("to_status")
+  payload        Json?
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@index([organizationId, applicationId, createdAt])
+  @@map("odc_history_events")
 }
