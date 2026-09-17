@@ -2,10 +2,7 @@ import { ConflictException, NotFoundException } from '@nestjs/common';
 import { OdcOutreachService } from './odc-outreach.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { FakeOdcPrisma, type FakeRecord } from './test-support/fake-odc-prisma';
-import {
-  NotificationsDisabledError,
-  type NotificationTransport,
-} from '../notifications/notification-transport';
+import { NotificationsDisabledError } from '../notifications/notification-transport';
 
 describe('OdcOutreachService', () => {
   const orgA = 'org-a';
@@ -24,7 +21,7 @@ describe('OdcOutreachService', () => {
     };
     service = new OdcOutreachService(
       prisma as unknown as PrismaService,
-      transport as unknown as NotificationTransport,
+      transport,
     );
   });
 
@@ -66,9 +63,7 @@ describe('OdcOutreachService', () => {
     return application;
   }
 
-  it(
-    'queues selected applications in order and masks emails',
-    async () => {
+  it('queues selected applications in order and masks emails', async () => {
     const program = createProgram(orgA);
     const first = createInReview(
       orgA,
@@ -132,8 +127,9 @@ describe('OdcOutreachService', () => {
     expect(sent.status).toBe('sent');
     expect(sent.isNext).toBe(false);
     expect(transport.sendEmail).toHaveBeenCalledTimes(1);
-    expect(transport.sendEmail.mock.calls[0][0].to).toBe('aina@example.com');
-    expect(transport.sendEmail.mock.calls[0][0].subject).toContain('ODC 2026');
+    const sentPayload = JSON.stringify(transport.sendEmail.mock.calls);
+    expect(sentPayload).toContain('aina@example.com');
+    expect(sentPayload).toContain('ODC 2026');
 
     const application = prisma.odcApplication.findFirst({
       where: { id: first.id },

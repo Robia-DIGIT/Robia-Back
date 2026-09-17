@@ -9,9 +9,7 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { maskEmail } from '../notifications/mask-email';
 import { redactSensitive } from '../common/logging/redact';
-import {
-  renderNotificationTemplate,
-} from '../notifications/notification-templates';
+import { renderNotificationTemplate } from '../notifications/notification-templates';
 import {
   NOTIFICATION_TRANSPORT,
   NotificationsDisabledError,
@@ -157,7 +155,7 @@ export class OdcOutreachService {
           payload: {
             programId,
             programName: program.name,
-          } as Prisma.InputJsonValue,
+          },
         };
       }),
     });
