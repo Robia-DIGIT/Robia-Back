@@ -57,13 +57,17 @@ const SCHEDULED_CLAIM_LEASE_MS = 5 * 60 * 1000;
  *    (the recomputed value is always anchored at the tick's `now`, never
  *    incremented from `scheduledFor`).
  *
- * Bounded concurrency within a tick (RC-25 hardening fix): the due-set is
- * sorted oldest-`nextRunAt`-first (id as a deterministic tie-breaker), the
- * first `SCHEDULER_MAX_BATCH_SIZE` are taken as this tick's batch — anything
- * beyond that waits for the next tick, its own nextRunAt untouched, exactly
- * like an occurrence that lost the claim race — and the batch is worked by
- * up to `SCHEDULER_MAX_CONCURRENCY` automations at a time, never all of it
- * as one unbounded `Promise.allSettled`. Each automation's own Phase 1-4
+ * Bounded concurrency within a tick (RC-25 hardening fix, second pass): the
+ * due-set query itself carries `orderBy: [{ nextRunAt: 'asc' }, { id: 'asc'
+ * }]` and `take: SCHEDULER_MAX_BATCH_SIZE` — Postgres never returns more
+ * than one tick's worth of rows in the first place, so a large due-set never
+ * costs an unbounded read or an unbounded in-memory array, only ever bounds
+ * the batch after the fact (the first pass's mistake: `findMany()` with no
+ * `orderBy`/`take`, sorted and sliced in Node). Anything beyond the batch
+ * waits for the next tick, its own nextRunAt untouched, exactly like an
+ * occurrence that lost the claim race — and the batch is worked by up to
+ * `SCHEDULER_MAX_CONCURRENCY` automations at a time, never all of it as one
+ * unbounded `Promise.allSettled`. Each automation's own Phase 1-4
  * claim/re-fetch/execute/advance above is entirely independent per row, so
  * running several concurrently introduces no new hazard: the same
  * Postgres-serialized CAS that makes two dispatcher *instances* safe (see
@@ -97,6 +101,17 @@ export class AutomationSchedulerService {
     const staleLeaseThreshold = new Date(
       now.getTime() - SCHEDULED_CLAIM_LEASE_MS,
     );
+    // RC-25 hardening fix (second pass): orderBy + take are part of the
+    // query itself, not applied afterwards in Node — however large the
+    // due-set has grown, Postgres never returns more than
+    // SCHEDULER_MAX_BATCH_SIZE rows, oldest nextRunAt first (id as a
+    // deterministic tie-breaker for equal timestamps). The first version of
+    // this fix bounded only the *processing* (an in-memory sort + slice
+    // after an unbounded findMany()) — the query itself, and the memory it
+    // would take to hold every due row at once, stayed unbounded. Whatever
+    // doesn't fit in this tick's `take` is simply re-read, still due, by the
+    // next tick's own query a minute later — see the class doc's "Bounded
+    // concurrency".
     const due = await this.prisma.automation.findMany({
       where: {
         enabled: true,
@@ -108,24 +123,12 @@ export class AutomationSchedulerService {
         ],
       },
       include: { trigger: true },
+      orderBy: [{ nextRunAt: 'asc' }, { id: 'asc' }],
+      take: SCHEDULER_MAX_BATCH_SIZE,
     });
-
-    // Deterministic order — oldest due occurrence first, id as a stable
-    // tie-breaker — so which automations make this tick's bounded batch,
-    // and in what order they're attempted, never depends on the DB's own
-    // unspecified row order.
-    const ordered = [...due].sort((a, b) => {
-      const at = a.nextRunAt?.getTime() ?? 0;
-      const bt = b.nextRunAt?.getTime() ?? 0;
-      if (at !== bt) return at - bt;
-      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-    });
-    // Bounded batch: whatever doesn't fit is left for the next tick, in the
-    // same oldest-first order — see the class doc's "Bounded concurrency".
-    const batch = ordered.slice(0, SCHEDULER_MAX_BATCH_SIZE);
 
     await this.runWithBoundedConcurrency(
-      batch,
+      due,
       SCHEDULER_MAX_CONCURRENCY,
       async (automation) => {
         try {

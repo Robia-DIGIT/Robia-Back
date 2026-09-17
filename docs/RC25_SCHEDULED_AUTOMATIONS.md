@@ -70,17 +70,24 @@ retardait toutes les suivantes du même tick. Corrigé sans toucher à la
 réclamation CAS/bail elle-même (Phases 1 à 4 ci-dessous, chacune totalement
 indépendante par ligne — donc sûre à paralléliser) :
 
-- **Ordre déterministe** : le due-set est trié par `nextRunAt` croissant
-  (l'échéance la plus en retard en premier), `id` comme départage stable —
-  jamais l'ordre de retour, non spécifié, de la requête SQL.
+- **Ordre déterministe ET borné dans la requête elle-même** (`orderBy: [{
+  nextRunAt: 'asc' }, { id: 'asc' }], take: SCHEDULER_MAX_BATCH_SIZE`
+  directement sur le `findMany()` du due-set — **deuxième revue Codex** :
+  la toute première version de ce fix triait et tronquait en mémoire, côté
+  Node, après un `findMany()` sans `orderBy`/`take` — donc un due-set
+  volumineux coûtait toujours une lecture Postgres et un tableau en mémoire
+  non bornés, seul le *traitement* l'était. Corrigé en poussant l'ordre et
+  la limite dans la requête elle-même : Postgres ne renvoie jamais plus de
+  `SCHEDULER_MAX_BATCH_SIZE` lignes, échéance la plus en retard en premier,
+  `id` comme départage stable pour une échéance identique.
 - **Batch borné** : au plus `SCHEDULER_MAX_BATCH_SIZE` (50) automations
   tentées par tick, quelle que soit la taille du due-set. Le reste attend
-  simplement le tick suivant (une minute plus tard) — son propre `nextRunAt`
-  n'est jamais touché, exactement comme une occurrence qui aurait perdu la
-  course de réclamation ou dont le bail n'est pas encore périmé : rien n'est
-  perdu, seulement retardé, et la prochaine fois ce sera nécessairement le
-  tour des occurrences alors les plus en retard (l'ordre est recalculé à
-  chaque tick).
+  simplement le tick suivant (une minute plus tard), qui les relira via son
+  propre `take` — son propre `nextRunAt` n'est jamais touché, exactement
+  comme une occurrence qui aurait perdu la course de réclamation ou dont le
+  bail n'est pas encore périmé : rien n'est perdu, seulement retardé, et la
+  prochaine fois ce sera nécessairement le tour des occurrences alors les
+  plus en retard (l'ordre est recalculé à chaque tick).
 - **Concurrence bornée** : le batch est traité par un petit pool
   (`runWithBoundedConcurrency()`, sans nouvelle dépendance) d'au plus
   `SCHEDULER_MAX_CONCURRENCY` (5) automations en vol simultanément — ni tout
@@ -273,6 +280,34 @@ trigger déjà confirmé `scheduled` (Phase 4, réconciliation) ; un `null`
 inattendu à cet endroit précis dégrade sur `UTC` avec un warning loggé —
 défensif seulement, jamais le chemin attendu sous l'invariant ci-dessus.
 
+### Contrainte CHECK en base (deuxième revue Codex)
+
+L'invariant ci-dessus n'était, jusque-là, appliqué qu'au niveau applicatif
+par `resolveTriggerTimezone()` — une écriture directe (un correctif SQL
+manuel, une future migration, un bug qui contournerait cette seule méthode)
+aurait pu le violer silencieusement. La même migration ajoute donc, **après**
+le correctif des données historiques (une `CHECK` est validée contre les
+lignes déjà existantes au moment où elle est créée — elle doit donc arriver
+après, jamais avant, ce nettoyage) :
+
+```sql
+ALTER TABLE "automation_triggers" ADD CONSTRAINT "automation_triggers_timezone_by_type_check"
+  CHECK (
+    ("type" = 'scheduled' AND "timezone" IS NOT NULL)
+    OR
+    ("type" <> 'scheduled' AND "timezone" IS NULL)
+  );
+```
+
+Cette contrainte n'est pas représentée dans `schema.prisma` : la version de
+Prisma utilisée par ce projet ne reconnaît pas l'attribut `@@check` sans
+activer une preview feature dont rien d'autre dans ce projet n'a besoin
+(`prisma validate` échoue explicitement avec `Attribute not known: "@check"`
+si on l'ajoute). Le fichier de migration reste donc la seule source de
+vérité pour cette contrainte ; un commentaire dans `schema.prisma`, sur le
+modèle `AutomationTrigger`, le rappelle explicitement pour qu'elle ne soit
+pas manquée à une lecture future du schéma.
+
 ## Contrat cron : 5 champs uniquement (RC-25 review fix)
 
 `computeNextOccurrence()` rejette explicitement (`assertFiveFieldCronExpression()`,
@@ -419,14 +454,30 @@ document affirmait :
 2. Traitement strictement séquentiel du due-set au sein d'un tick — voir
    « Concurrence bornée au sein d'un tick ».
 
-Les deux sont corrigés sur une branche séparée (`fix/rc25-scheduler-hardening`),
-sans toucher au reste du moteur RC25 (réclamation CAS/bail, garanties
-multi-instance, dédup) — voir les sections dédiées ci-dessus pour le détail.
+Les deux sont corrigés sur une branche séparée (`fix/rc25-scheduler-hardening`,
+PR #49), sans toucher au reste du moteur RC25 (réclamation CAS/bail,
+garanties multi-instance, dédup) — voir les sections dédiées ci-dessus pour
+le détail.
+
+### Deuxième revue (Codex, sur PR#49 elle-même)
+
+Deux points supplémentaires relevés sur le premier correctif :
+
+1. Le tri et la limite du batch (`SCHEDULER_MAX_BATCH_SIZE`) se faisaient en
+   mémoire, côté Node, après un `findMany()` non borné — donc la requête
+   Postgres elle-même, et la mémoire nécessaire pour tenir tout le due-set,
+   restaient non bornées pour un due-set volumineux. Corrigé en poussant
+   `orderBy`/`take` directement dans la requête Prisma — voir « Ordre
+   déterministe ET borné dans la requête elle-même » ci-dessus. Prouvé par
+   un test dédié qui inspecte les arguments exacts envoyés à `findMany()`.
+2. L'invariant de timezone n'était appliqué qu'au niveau applicatif.
+   Ajout d'une contrainte `CHECK` PostgreSQL — voir « Contrainte CHECK en
+   base » ci-dessus.
 
 ## Tests exécutés
 
 ```
-npx jest --silent                    → 62 suites, 481 tests, tous passants
+npx jest --silent                    → 62 suites, 482 tests, tous passants
 npx tsc --noEmit -p tsconfig.json    → aucune nouvelle erreur (1 erreur
                                         pré-existante et sans rapport,
                                         documentée depuis RC23)

@@ -64,8 +64,17 @@ class FakeSchedulerPrisma {
   }
 
   automation = {
+    // RC-25 hardening fix (Codex second review): orderBy/take must be
+    // genuinely enforced HERE, in the fake's own findMany() — not just
+    // trusted to be present in the caller's args — otherwise a test could
+    // pass by accident even if AutomationSchedulerService stopped sending
+    // them and went back to sorting/slicing an unbounded read in Node. A
+    // dedicated test below also asserts on the exact args passed, to catch
+    // that regression even more directly (belt and suspenders).
     findMany: ({
       where,
+      orderBy,
+      take,
     }: {
       where: {
         enabled?: boolean;
@@ -73,43 +82,66 @@ class FakeSchedulerPrisma {
         trigger?: { type: string };
         OR?: ClaimedAtClause[];
       };
+      orderBy?: Array<{ nextRunAt: 'asc' | 'desc' } | { id: 'asc' | 'desc' }>;
+      take?: number;
     }): AutomationWithTrigger[] => {
-      return Array.from(this.records.values())
-        .filter((r) => {
-          if (where.enabled !== undefined && r.enabled !== where.enabled) {
+      let records = Array.from(this.records.values()).filter((r) => {
+        if (where.enabled !== undefined && r.enabled !== where.enabled) {
+          return false;
+        }
+        if (where.nextRunAt !== undefined) {
+          if (where.nextRunAt === null) {
+            if (r.nextRunAt !== null) return false;
+          } else if (
+            r.nextRunAt === null ||
+            r.nextRunAt.getTime() > where.nextRunAt.lte.getTime()
+          ) {
             return false;
           }
-          if (where.nextRunAt !== undefined) {
-            if (where.nextRunAt === null) {
-              if (r.nextRunAt !== null) return false;
-            } else if (
-              r.nextRunAt === null ||
-              r.nextRunAt.getTime() > where.nextRunAt.lte.getTime()
-            ) {
-              return false;
+        }
+        if (
+          where.trigger?.type !== undefined &&
+          r.trigger?.type !== where.trigger.type
+        ) {
+          return false;
+        }
+        if (
+          where.OR !== undefined &&
+          !where.OR.some((clause) => matchesClaimedAtClause(r, clause))
+        ) {
+          return false;
+        }
+        return true;
+      });
+      if (orderBy) {
+        records = [...records].sort((a, b) => {
+          for (const clause of orderBy) {
+            if ('nextRunAt' in clause) {
+              const at = a.nextRunAt?.getTime() ?? 0;
+              const bt = b.nextRunAt?.getTime() ?? 0;
+              if (at !== bt) {
+                return clause.nextRunAt === 'asc' ? at - bt : bt - at;
+              }
+            } else if ('id' in clause) {
+              if (a.id !== b.id) {
+                const cmp = a.id < b.id ? -1 : 1;
+                return clause.id === 'asc' ? cmp : -cmp;
+              }
             }
           }
-          if (
-            where.trigger?.type !== undefined &&
-            r.trigger?.type !== where.trigger.type
-          ) {
-            return false;
-          }
-          if (
-            where.OR !== undefined &&
-            !where.OR.some((clause) => matchesClaimedAtClause(r, clause))
-          ) {
-            return false;
-          }
-          return true;
-        })
-        .map(
-          (r) =>
-            ({
-              ...r,
-              trigger: r.trigger ? { ...r.trigger } : null,
-            }) as unknown as AutomationWithTrigger,
-        );
+          return 0;
+        });
+      }
+      if (take !== undefined) {
+        records = records.slice(0, take);
+      }
+      return records.map(
+        (r) =>
+          ({
+            ...r,
+            trigger: r.trigger ? { ...r.trigger } : null,
+          }) as unknown as AutomationWithTrigger,
+      );
     },
     findFirst: ({
       where,
@@ -680,6 +712,48 @@ describe('AutomationSchedulerService', () => {
         }),
       );
     }
+
+    // Codex second review: the batch bound and the deterministic order must
+    // be part of the Postgres query itself (orderBy/take), never an
+    // in-memory sort + slice after an unbounded findMany() — otherwise a
+    // large due-set still costs an unbounded read and an unbounded
+    // in-memory array, only the *processing* was ever bounded. This asserts
+    // the exact args sent to findMany(), independent of the fake's own
+    // (also-fixed) enforcement of them.
+    it('requests the due-set query with take: SCHEDULER_MAX_BATCH_SIZE and orderBy nextRunAt asc, id asc', async () => {
+      const now = new Date('2026-09-21T06:05:00.000Z');
+      const { scheduler, prisma } = buildScheduler(dueAutomations(3, now));
+      const originalFindMany = prisma.automation.findMany;
+      const calls: unknown[] = [];
+      prisma.automation.findMany = (
+        args: Parameters<typeof originalFindMany>[0],
+      ) => {
+        calls.push(args);
+        return originalFindMany(args);
+      };
+
+      await scheduler.runDueAutomations(now);
+
+      // reconcileMissingNextRunAt() also calls findMany() (where.nextRunAt
+      // is exactly `null` — no orderBy/take, it has no batch to bound), so
+      // pick out the due-set query specifically: the one whose
+      // where.nextRunAt is a `{ lte }` clause, not the literal `null`.
+      const dueSetCall = calls.find(
+        (c): c is { where: { nextRunAt?: { lte: Date } }; take?: number } =>
+          typeof c === 'object' &&
+          c !== null &&
+          'where' in c &&
+          typeof (c as { where: { nextRunAt?: unknown } }).where.nextRunAt ===
+            'object' &&
+          (c as { where: { nextRunAt?: { lte: Date } } }).where.nextRunAt !==
+            null,
+      );
+      expect(dueSetCall).toBeDefined();
+      expect(dueSetCall).toMatchObject({
+        orderBy: [{ nextRunAt: 'asc' }, { id: 'asc' }],
+        take: SCHEDULER_MAX_BATCH_SIZE,
+      });
+    });
 
     it('does not let a slow first automation block the start of the others', async () => {
       const now = new Date('2026-09-21T06:05:00.000Z');

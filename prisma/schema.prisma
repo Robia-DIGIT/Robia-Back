@@ -483,6 +483,14 @@ model AutomationTrigger {
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @updatedAt @map("updated_at")
 
+  // A DB-level CHECK constraint (`automation_triggers_timezone_by_type_check`)
+  // also enforces the timezone invariant documented above — added via raw
+  // SQL in the 20260917090000_automation_trigger_timezone_invariant
+  // migration, since this Prisma version's schema DSL has no `@@check`
+  // attribute (it errors "Attribute not known: @check" without a preview
+  // feature this project doesn't otherwise need) to represent it here. The
+  // migration file is the source of truth for that constraint; this comment
+  // exists so it isn't missed on a future schema read.
   @@map("automation_triggers")
 }
 
