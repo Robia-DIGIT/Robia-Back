@@ -715,16 +715,26 @@ export class OdcApplicationsService {
 }
 
 function rankApplicationsByScore<
-  T extends { finalTotal: number | null; submittedAt: Date | null; updatedAt: Date },
+  T extends {
+    finalTotal: number | null;
+    submittedAt: Date | null;
+    updatedAt: Date;
+  },
 >(rows: T[]): T[] {
   return [...rows].sort((a, b) => {
     if (a.finalTotal === null && b.finalTotal === null) {
-      return compareDatesDesc(a.submittedAt ?? a.updatedAt, b.submittedAt ?? b.updatedAt);
+      return compareDatesDesc(
+        a.submittedAt ?? a.updatedAt,
+        b.submittedAt ?? b.updatedAt,
+      );
     }
     if (a.finalTotal === null) return 1;
     if (b.finalTotal === null) return -1;
     if (b.finalTotal !== a.finalTotal) return b.finalTotal - a.finalTotal;
-    return compareDatesDesc(a.submittedAt ?? a.updatedAt, b.submittedAt ?? b.updatedAt);
+    return compareDatesDesc(
+      a.submittedAt ?? a.updatedAt,
+      b.submittedAt ?? b.updatedAt,
+    );
   });
 }
 

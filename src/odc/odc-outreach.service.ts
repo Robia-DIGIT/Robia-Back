@@ -9,13 +9,15 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { maskEmail } from '../notifications/mask-email';
 import { redactSensitive } from '../common/logging/redact';
-import { renderNotificationTemplate } from '../notifications/notification-templates';
+import {
+  renderNotificationTemplate,
+} from '../notifications/notification-templates';
 import {
   NOTIFICATION_TRANSPORT,
   NotificationsDisabledError,
   IncompleteSmtpConfigurationError,
+  type NotificationTransport,
 } from '../notifications/notification-transport';
-import type { NotificationTransport } from '../notifications/notification-transport';
 import { QueueOdcOutreachDto } from './dto/queue-odc-outreach.dto';
 
 const ELIGIBLE_STATUSES = ['in_review', 'waitlisted'];
@@ -49,7 +51,10 @@ export class OdcOutreachService {
     private readonly transport: NotificationTransport,
   ) {}
 
-  async list(organizationId: string, programId: string): Promise<OdcOutreachPublic[]> {
+  async list(
+    organizationId: string,
+    programId: string,
+  ): Promise<OdcOutreachPublic[]> {
     await this.requireProgram(organizationId, programId);
     const rows = await this.prisma.odcOutreach.findMany({
       where: { organizationId, programId },
@@ -68,7 +73,9 @@ export class OdcOutreachService {
     const program = await this.requireProgram(organizationId, programId);
     const uniqueIds = [...new Set(dto.applicationIds)];
     if (uniqueIds.length !== dto.applicationIds.length) {
-      throw new BadRequestException('applicationIds must not contain duplicates.');
+      throw new BadRequestException(
+        'applicationIds must not contain duplicates.',
+      );
     }
 
     const applications = await this.prisma.odcApplication.findMany({
@@ -83,16 +90,24 @@ export class OdcOutreachService {
     const byId = new Map(applications.map((row) => [row.id, row]));
 
     for (const id of uniqueIds) {
-      const application = byId.get(id)!;
+      const application = byId.get(id);
+      if (!application) {
+        throw new NotFoundException(
+          'One or more applications were not found in this program.',
+        );
+      }
       if (!ELIGIBLE_STATUSES.includes(application.status)) {
         throw new ConflictException(
-          `Application ${id} cannot be queued (status "${application.status}"). Eligible: in_review, waitlisted.`,
+          `Application ${id} cannot be queued ` +
+            `(status "${application.status}"). ` +
+            'Eligible: in_review, waitlisted.',
         );
       }
       const email = application.applicant.email?.trim() ?? '';
       if (!email) {
         throw new ConflictException(
-          `Applicant "${application.applicant.displayName}" has no email on file.`,
+          `Applicant "${application.applicant.displayName}" ` +
+            'has no email on file.',
         );
       }
     }
@@ -129,15 +144,22 @@ export class OdcOutreachService {
     }
 
     await this.prisma.odcHistoryEvent.createMany({
-      data: uniqueIds.map((applicationId) => ({
-        organizationId,
-        applicationId,
-        actorUserId: null,
-        eventType: 'odc.outreach.queued',
-        fromStatus: byId.get(applicationId)!.status,
-        toStatus: byId.get(applicationId)!.status,
-        payload: { programId, programName: program.name } as Prisma.InputJsonValue,
-      })),
+      data: uniqueIds.map((applicationId) => {
+        const application = byId.get(applicationId);
+        const status = application?.status ?? 'in_review';
+        return {
+          organizationId,
+          applicationId,
+          actorUserId: null,
+          eventType: 'odc.outreach.queued',
+          fromStatus: status,
+          toStatus: status,
+          payload: {
+            programId,
+            programName: program.name,
+          } as Prisma.InputJsonValue,
+        };
+      }),
     });
 
     return this.list(organizationId, programId);
@@ -167,7 +189,8 @@ export class OdcOutreachService {
     const nextId = this.nextSendableId(queue);
     if (nextId !== outreach.id) {
       throw new ConflictException(
-        'Emails must be sent one by one, in queue order. This is not the next item.',
+        'Emails must be sent one by one, in queue order. ' +
+          'This is not the next item.',
       );
     }
 
@@ -234,6 +257,7 @@ export class OdcOutreachService {
       orderBy: { sortOrder: 'asc' },
     });
     return this.toPublic(updated, this.nextSendableId(refreshed));
+  }
 
   async skip(
     organizationId: string,

@@ -2,8 +2,10 @@ import { ConflictException, NotFoundException } from '@nestjs/common';
 import { OdcOutreachService } from './odc-outreach.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { FakeOdcPrisma, type FakeRecord } from './test-support/fake-odc-prisma';
-import type { NotificationTransport } from '../notifications/notification-transport';
-import { NotificationsDisabledError } from '../notifications/notification-transport';
+import {
+  NotificationsDisabledError,
+  type NotificationTransport,
+} from '../notifications/notification-transport';
 
 describe('OdcOutreachService', () => {
   const orgA = 'org-a';
@@ -64,10 +66,24 @@ describe('OdcOutreachService', () => {
     return application;
   }
 
-  it('queues selected applications in the given order and masks recipient emails', async () => {
+  it(
+    'queues selected applications in order and masks emails',
+    async () => {
     const program = createProgram(orgA);
-    const first = createInReview(orgA, program.id, 'Aina', 'aina@example.com', 80);
-    const second = createInReview(orgA, program.id, 'Bema', 'bema@example.com', 70);
+    const first = createInReview(
+      orgA,
+      program.id,
+      'Aina',
+      'aina@example.com',
+      80,
+    );
+    const second = createInReview(
+      orgA,
+      program.id,
+      'Bema',
+      'bema@example.com',
+      70,
+    );
 
     const queued = await service.queue(orgA, program.id, {
       applicationIds: [second.id, first.id],
@@ -100,7 +116,7 @@ describe('OdcOutreachService', () => {
     ).rejects.toBeInstanceOf(ConflictException);
   });
 
-  it('sends the next email only, never a later one, and never writes accepted', async () => {
+  it('sends only the next email and never writes accepted', async () => {
     const program = createProgram(orgA);
     const first = createInReview(orgA, program.id, 'Aina', 'aina@example.com');
     const second = createInReview(orgA, program.id, 'Bema', 'bema@example.com');
@@ -108,9 +124,9 @@ describe('OdcOutreachService', () => {
       applicationIds: [first.id, second.id],
     });
 
-    await expect(service.send(orgA, userA, queued[1].id)).rejects.toBeInstanceOf(
-      ConflictException,
-    );
+    await expect(
+      service.send(orgA, userA, queued[1].id),
+    ).rejects.toBeInstanceOf(ConflictException);
 
     const sent = await service.send(orgA, userA, queued[0].id);
     expect(sent.status).toBe('sent');
@@ -141,23 +157,28 @@ describe('OdcOutreachService', () => {
     expect(list[1].isNext).toBe(true);
   });
 
-  it('does not leak another org program and refuses send while SMTP is off', async () => {
+  it('isolates orgs and refuses send while SMTP is off', async () => {
     const programB = createProgram(orgB);
     await expect(service.list(orgA, programB.id)).rejects.toBeInstanceOf(
       NotFoundException,
     );
 
     const program = createProgram(orgA);
-    const application = createInReview(orgA, program.id, 'Aina', 'aina@example.com');
+    const application = createInReview(
+      orgA,
+      program.id,
+      'Aina',
+      'aina@example.com',
+    );
     const queued = await service.queue(orgA, program.id, {
       applicationIds: [application.id],
     });
     transport.ensureReady.mockImplementation(() => {
       throw new NotificationsDisabledError();
     });
-    await expect(service.send(orgA, userA, queued[0].id)).rejects.toBeInstanceOf(
-      ConflictException,
-    );
+    await expect(
+      service.send(orgA, userA, queued[0].id),
+    ).rejects.toBeInstanceOf(ConflictException);
     const list = await service.list(orgA, program.id);
     expect(list[0].status).toBe('failed');
   });

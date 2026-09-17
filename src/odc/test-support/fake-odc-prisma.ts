@@ -604,7 +604,9 @@ export class FakeOdcPrisma {
           (a, b) => (a.sortOrder as number) - (b.sortOrder as number),
         );
       }
-      return records.map((record) => this.outreachWithRelations(record, include));
+      return records.map((record) =>
+        this.outreachWithRelations(record, include),
+      );
     },
     count: ({
       where,
