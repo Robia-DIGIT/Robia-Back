@@ -8,11 +8,12 @@ import {
 
 describe('notification-templates', () => {
   describe('allowlist', () => {
-    it('lists exactly the 3 allowlisted templates', () => {
+    it('lists exactly the 4 allowlisted templates', () => {
       expect(listNotificationTemplateKeys().sort()).toEqual(
         [
           'audit_completed',
           'automation_failed',
+          'odc_candidate_invite',
           'weekly_opportunities_summary',
         ].sort(),
       );
@@ -134,6 +135,18 @@ describe('notification-templates', () => {
       );
       expect(rendered.text).toContain('ACME');
       expect(rendered.text).toContain('4');
+    });
+  });
+
+  describe('odc_candidate_invite', () => {
+    it('renders a candidate invite without injecting caller-supplied addresses', () => {
+      const rendered = renderNotificationTemplate('odc_candidate_invite', {
+        applicantName: 'Aina R.',
+        programName: 'ODC 2026',
+      });
+      expect(rendered.subject).toContain('ODC 2026');
+      expect(rendered.text).toContain('Aina R.');
+      expect(rendered.text).not.toMatch(/@/);
     });
   });
 });

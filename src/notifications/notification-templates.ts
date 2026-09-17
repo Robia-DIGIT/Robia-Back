@@ -9,7 +9,10 @@
 // variables.
 
 export type NotificationTemplateKey =
-  'audit_completed' | 'automation_failed' | 'weekly_opportunities_summary';
+  | 'audit_completed'
+  | 'automation_failed'
+  | 'weekly_opportunities_summary'
+  | 'odc_candidate_invite';
 
 export class UnknownNotificationTemplateError extends Error {
   constructor(templateKey: string) {
@@ -82,6 +85,21 @@ const NOTIFICATION_TEMPLATES: Record<
         `Opportunités ouvertes : ${data.openOpportunityCount}`,
         '',
         'Ceci est une notification automatique ROBIA.',
+      ].join('\n'),
+  },
+  // RC-31 — candidate invite. Variables are resolved server-side from the
+  // application + program; the client never supplies the recipient or body.
+  odc_candidate_invite: {
+    variables: ['applicantName', 'programName'],
+    subject: (data) => `Candidature « ${data.programName} » — prochaine étape`,
+    text: (data) =>
+      [
+        `Bonjour ${data.applicantName},`,
+        '',
+        `Votre dossier pour « ${data.programName} » a été présélectionné.`,
+        'Nous vous recontactons pour la suite du processus.',
+        '',
+        '— Orange Digital Center',
       ].join('\n'),
   },
 };

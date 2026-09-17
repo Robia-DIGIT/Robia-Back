@@ -41,6 +41,7 @@ model User {
   // OdcHistoryEvent.actorUserId: those stay plain, unrelated ids, per the
   // ODC spec's own Prisma sketch.
   odcApplicationsDecided  OdcApplication[]
+  odcOutreachesApproved   OdcOutreach[]
 
   @@map("users")
 }
@@ -86,6 +87,7 @@ model Organization {
   odcPrograms       OdcProgram[]
   odcApplicants     OdcApplicant[]
   odcApplications   OdcApplication[]
+  odcOutreaches     OdcOutreach[]
   createdAt DateTime @default(now()) @map("created_at")
 
   @@map("organizations")
@@ -707,6 +709,7 @@ model OdcProgram {
   criteria     OdcCriterion[]
   docTypes     OdcDocumentType[]
   applications OdcApplication[]
+  outreaches   OdcOutreach[]
 
   @@unique([organizationId, slug])
   @@index([organizationId, status])
@@ -825,6 +828,7 @@ model OdcApplication {
   documents  OdcDocument[]
   scoreLines OdcScoreLine[]
   events     OdcHistoryEvent[]
+  outreaches OdcOutreach[]
 
   @@unique([programId, applicantId])
   @@index([organizationId, status])
@@ -894,4 +898,30 @@ model OdcHistoryEvent {
 
   @@index([organizationId, applicationId, createdAt])
   @@map("odc_history_events")
+}
+
+// RC-31 — sequential, human-approved candidate emails. Recipient address
+// is always resolved server-side from OdcApplicant.email — never accepted
+// from the client. Sending never writes accepted/rejected/waitlisted.
+model OdcOutreach {
+  id             String   @id @default(cuid())
+  organizationId String   @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  programId      String   @map("program_id")
+  program        OdcProgram @relation(fields: [programId], references: [id], onDelete: Cascade)
+  applicationId  String   @unique @map("application_id")
+  application    OdcApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  sortOrder      Int      @map("sort_order")
+  // queued | sent | failed | skipped
+  status         String   @default("queued")
+  templateKey    String   @default("odc_candidate_invite") @map("template_key")
+  approvedById   String?  @map("approved_by_id")
+  approvedBy     User?    @relation(fields: [approvedById], references: [id])
+  sentAt         DateTime? @map("sent_at")
+  lastError      String?  @map("last_error")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  @@index([organizationId, programId, sortOrder])
+  @@map("odc_outreaches")
 }
