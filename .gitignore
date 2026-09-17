@@ -72,3 +72,7 @@ __pycache__/
 
 # Local test outputs
 site_result.json
+
+# RC-33 — LocalOdcStorage's default upload directory (real ODC candidate
+# files land here in dev/self-hosted deployments). Never committed.
+var/odc-uploads/

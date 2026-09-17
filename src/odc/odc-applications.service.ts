@@ -207,35 +207,32 @@ export class OdcApplicationsService {
     return this.getApplication(organizationId, id);
   }
 
+  // Metadata-only path — no file ever passes through here. Kept exactly as
+  // RC-29 shipped it (staff/seed can still record a document by hand, e.g.
+  // RC-32's demo seed) even though RC-33 added a real upload path
+  // (addUploadedDocument() below, via POST .../documents/upload): this one
+  // still accepts a caller-supplied storageKey and never touches
+  // OdcStorage.
   async addDocument(
     organizationId: string,
     id: string,
     dto: CreateOdcDocumentDto,
   ): Promise<OdcApplicationWithRelations> {
     const application = await this.getApplication(organizationId, id);
-    if (!['draft', 'incomplete', 'in_review'].includes(application.status)) {
-      throw new ConflictException(
-        `Documents can only be added while the application is "draft", "incomplete" or "in_review" (current: "${application.status}").`,
-      );
-    }
-    const docType = application.program.docTypes.find(
-      (dt) => dt.id === dto.documentTypeId,
+    const docType = this.resolveAddableDocumentType(
+      application,
+      dto.documentTypeId,
     );
-    if (!docType) {
-      throw new NotFoundException(
-        "This document type does not belong to the application's program.",
-      );
-    }
 
-    // storageKey is optional in v1 (no real upload backend wired up yet —
-    // see docs/RC29_ODC_CANDIDATURES.md): its presence alone decides
-    // whether this document already counts toward completeness.
+    // storageKey is optional here (no file backs this path): its presence
+    // alone decides whether this document already counts toward
+    // completeness.
     const status = dto.storageKey ? 'received' : 'pending_upload';
     const document = await this.prisma.odcDocument.create({
       data: {
         organizationId,
         applicationId: id,
-        documentTypeId: dto.documentTypeId,
+        documentTypeId: docType.id,
         originalName: dto.originalName,
         mimeType: dto.mimeType,
         sizeBytes: dto.sizeBytes,
@@ -249,12 +246,115 @@ export class OdcApplicationsService {
         organizationId,
         applicationId: id,
         documentId: document.id,
-        documentTypeId: dto.documentTypeId,
+        documentTypeId: docType.id,
       };
       this.events.emit(ODC_DOCUMENT_RECEIVED_EVENT, payload);
     }
 
     return this.getApplication(organizationId, id);
+  }
+
+  // RC-33 — the real-upload path. Called only by OdcDocumentsService, only
+  // after it has already written the file to OdcStorage and confirmed
+  // `exists()` is true — so unlike addDocument() above, this never accepts
+  // a "no file yet" state: status is always 'received'. `input.id` is the
+  // same id OdcDocumentsService already embedded in the storage key
+  // (buildOdcStorageKey's {documentId} segment), passed through so the
+  // OdcDocument row's own id always matches the key that was actually
+  // written — never a second, independently generated id.
+  async addUploadedDocument(
+    organizationId: string,
+    id: string,
+    input: {
+      id: string;
+      documentTypeId: string;
+      originalName: string;
+      mimeType: string;
+      sizeBytes: number;
+      storageKey: string;
+    },
+  ): Promise<OdcApplicationWithRelations> {
+    const application = await this.getApplication(organizationId, id);
+    const docType = this.resolveAddableDocumentType(
+      application,
+      input.documentTypeId,
+    );
+
+    const document = await this.prisma.odcDocument.create({
+      data: {
+        id: input.id,
+        organizationId,
+        applicationId: id,
+        documentTypeId: docType.id,
+        originalName: input.originalName,
+        mimeType: input.mimeType,
+        sizeBytes: input.sizeBytes,
+        storageKey: input.storageKey,
+        status: 'received',
+      },
+    });
+
+    const payload: OdcDocumentReceivedEvent = {
+      organizationId,
+      applicationId: id,
+      documentId: document.id,
+      documentTypeId: docType.id,
+    };
+    this.events.emit(ODC_DOCUMENT_RECEIVED_EVENT, payload);
+
+    return this.getApplication(organizationId, id);
+  }
+
+  // Called only by OdcDocumentsService.upload(), *before* it writes
+  // anything to OdcStorage — the same status/docType checks
+  // addUploadedDocument() itself re-checks on the way in, run early enough
+  // that a rejection here never leaves an orphan file on disk. Throws
+  // exactly like addDocument()/addUploadedDocument() do; returns the
+  // resolved docType so the caller can validate its own MIME allowlist too.
+  async assertDocumentAddable(
+    organizationId: string,
+    applicationId: string,
+    documentTypeId: string,
+  ) {
+    const application = await this.getApplication(
+      organizationId,
+      applicationId,
+    );
+    return this.resolveAddableDocumentType(application, documentTypeId);
+  }
+
+  // Called only by OdcDocumentsService.getFile() — a raw, single-document
+  // lookup (no application/program join needed for a download). Returns
+  // null rather than throwing: the caller decides what a missing/foreign
+  // document means for its own response (always 404, never 403 — see
+  // docs/RC33_ODC_UPLOAD.md).
+  async findDocument(organizationId: string, documentId: string) {
+    return this.prisma.odcDocument.findFirst({
+      where: { id: documentId, organizationId },
+    });
+  }
+
+  // Shared by addDocument() and addUploadedDocument() — the exact same
+  // status/docType-membership checks regardless of which path a document
+  // arrives through, so the two can never silently diverge.
+  private resolveAddableDocumentType(
+    application: OdcApplicationWithRelations,
+    documentTypeId: string,
+  ) {
+    if (!['draft', 'incomplete', 'in_review'].includes(application.status)) {
+      throw new ConflictException(
+        `Documents can only be added while the application is "draft", "incomplete" or "in_review" (current: "${application.status}").`,
+      );
+    }
+    const docType = application.program.docTypes.find(
+      (dt) => dt.id === documentTypeId,
+    );
+    if (!docType) {
+      throw new NotFoundException(
+        "This document type does not belong to the application's program.",
+      );
+    }
+    return docType;
   }
 
   // ---------------------------------------------------------------------
