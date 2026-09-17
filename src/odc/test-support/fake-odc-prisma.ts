@@ -452,17 +452,35 @@ export class FakeOdcPrisma {
   };
 
   odcDocument = {
+    // `data.id` wins when the caller supplies one (RC-33's
+    // addUploadedDocument() always does, so the row's id matches the
+    // storage key's own {documentId} segment) — this must key the Map by
+    // the record's final id, never by a freshly generated one that then
+    // disagrees with `record.id`.
     create: ({ data }: { data: FakeRecord }) => {
-      const id = this.id('document');
       const record: FakeRecord = {
-        id,
+        id: this.id('document'),
         storageKey: null,
         status: 'received',
         createdAt: new Date(),
         ...normalizeJsonSentinels(data),
       };
-      this.documents.set(id, record);
+      this.documents.set(record.id as string, record);
       return record;
+    },
+    findFirst: ({
+      where,
+    }: {
+      where: { id?: string; organizationId?: string };
+    }) => {
+      return (
+        Array.from(this.documents.values()).find(
+          (d) =>
+            (where.id === undefined || d.id === where.id) &&
+            (where.organizationId === undefined ||
+              d.organizationId === where.organizationId),
+        ) ?? null
+      );
     },
   };
 

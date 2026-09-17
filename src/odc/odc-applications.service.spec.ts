@@ -212,6 +212,75 @@ describe('OdcApplicationsService', () => {
   });
 
   // ---------------------------------------------------------------------
+  // Uploaded documents (RC-33) — same rules as addDocument(), always received
+  // ---------------------------------------------------------------------
+
+  it('addUploadedDocument() always creates a received document, with the given id, and emits the event', async () => {
+    const program = createProgram(orgA);
+    const application = await createDraftApplication(orgA, program.id);
+    const docTypeId = program.docTypes[0].id as string;
+
+    const result = await service.addUploadedDocument(orgA, application.id, {
+      id: 'doc-fixed-id',
+      documentTypeId: docTypeId,
+      originalName: 'cv.pdf',
+      mimeType: 'application/pdf',
+      sizeBytes: 12_345,
+      storageKey: `${orgA}/${application.id}/doc-fixed-id/uuid.pdf`,
+    });
+
+    const document = result.documents.find(
+      (d: FakeRecord) => d.id === 'doc-fixed-id',
+    );
+    expect(document).toBeDefined();
+    expect(document?.status).toBe('received');
+    expect(document?.storageKey).toBe(
+      `${orgA}/${application.id}/doc-fixed-id/uuid.pdf`,
+    );
+    expect(events.emit).toHaveBeenCalledWith(
+      ODC_DOCUMENT_RECEIVED_EVENT,
+      expect.objectContaining({
+        applicationId: application.id,
+        documentId: 'doc-fixed-id',
+      }),
+    );
+  });
+
+  it('addUploadedDocument() enforces the same status/docType rules as addDocument()', async () => {
+    const program = createProgram(orgA);
+    const application = await createDraftApplication(orgA, program.id);
+
+    await expect(
+      service.addUploadedDocument(orgA, application.id, {
+        id: 'doc-x',
+        documentTypeId: 'not-a-real-doc-type',
+        originalName: 'x.pdf',
+        mimeType: 'application/pdf',
+        sizeBytes: 1,
+        storageKey: 'k',
+      }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('findDocument() only returns a document scoped to its own organization', async () => {
+    const program = createProgram(orgA);
+    const application = await createDraftApplication(orgA, program.id);
+    const docTypeId = program.docTypes[0].id as string;
+    await service.addUploadedDocument(orgA, application.id, {
+      id: 'doc-fixed-id',
+      documentTypeId: docTypeId,
+      originalName: 'cv.pdf',
+      mimeType: 'application/pdf',
+      sizeBytes: 1,
+      storageKey: 'key',
+    });
+
+    expect(await service.findDocument(orgA, 'doc-fixed-id')).not.toBeNull();
+    expect(await service.findDocument(orgB, 'doc-fixed-id')).toBeNull();
+    expect(await service.findDocument(orgA, 'does-not-exist')).toBeNull();
+  });
+
+  // ---------------------------------------------------------------------
   // Submit & screening
   // ---------------------------------------------------------------------
 
@@ -640,8 +709,8 @@ describe('OdcApplicationsService', () => {
 
   it('listByProgram() 404s for a program in another org', async () => {
     const programB = createProgram(orgB, { fields: [], docTypes: [] });
-    await expect(service.listByProgram(orgA, programB.id)).rejects.toBeInstanceOf(
-      NotFoundException,
-    );
+    await expect(
+      service.listByProgram(orgA, programB.id),
+    ).rejects.toBeInstanceOf(NotFoundException);
   });
 });
