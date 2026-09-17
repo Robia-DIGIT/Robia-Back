@@ -3,6 +3,10 @@ import { AutomationsService } from './automations.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { computeNextOccurrence } from './cron-schedule';
 import { AutomationWithTrigger } from './automation.types';
+import {
+  SCHEDULER_MAX_BATCH_SIZE,
+  SCHEDULER_MAX_CONCURRENCY,
+} from './automation.constants';
 
 interface FakeTriggerRecord {
   type: string;
@@ -60,8 +64,17 @@ class FakeSchedulerPrisma {
   }
 
   automation = {
+    // RC-25 hardening fix (Codex second review): orderBy/take must be
+    // genuinely enforced HERE, in the fake's own findMany() — not just
+    // trusted to be present in the caller's args — otherwise a test could
+    // pass by accident even if AutomationSchedulerService stopped sending
+    // them and went back to sorting/slicing an unbounded read in Node. A
+    // dedicated test below also asserts on the exact args passed, to catch
+    // that regression even more directly (belt and suspenders).
     findMany: ({
       where,
+      orderBy,
+      take,
     }: {
       where: {
         enabled?: boolean;
@@ -69,43 +82,66 @@ class FakeSchedulerPrisma {
         trigger?: { type: string };
         OR?: ClaimedAtClause[];
       };
+      orderBy?: Array<{ nextRunAt: 'asc' | 'desc' } | { id: 'asc' | 'desc' }>;
+      take?: number;
     }): AutomationWithTrigger[] => {
-      return Array.from(this.records.values())
-        .filter((r) => {
-          if (where.enabled !== undefined && r.enabled !== where.enabled) {
+      let records = Array.from(this.records.values()).filter((r) => {
+        if (where.enabled !== undefined && r.enabled !== where.enabled) {
+          return false;
+        }
+        if (where.nextRunAt !== undefined) {
+          if (where.nextRunAt === null) {
+            if (r.nextRunAt !== null) return false;
+          } else if (
+            r.nextRunAt === null ||
+            r.nextRunAt.getTime() > where.nextRunAt.lte.getTime()
+          ) {
             return false;
           }
-          if (where.nextRunAt !== undefined) {
-            if (where.nextRunAt === null) {
-              if (r.nextRunAt !== null) return false;
-            } else if (
-              r.nextRunAt === null ||
-              r.nextRunAt.getTime() > where.nextRunAt.lte.getTime()
-            ) {
-              return false;
+        }
+        if (
+          where.trigger?.type !== undefined &&
+          r.trigger?.type !== where.trigger.type
+        ) {
+          return false;
+        }
+        if (
+          where.OR !== undefined &&
+          !where.OR.some((clause) => matchesClaimedAtClause(r, clause))
+        ) {
+          return false;
+        }
+        return true;
+      });
+      if (orderBy) {
+        records = [...records].sort((a, b) => {
+          for (const clause of orderBy) {
+            if ('nextRunAt' in clause) {
+              const at = a.nextRunAt?.getTime() ?? 0;
+              const bt = b.nextRunAt?.getTime() ?? 0;
+              if (at !== bt) {
+                return clause.nextRunAt === 'asc' ? at - bt : bt - at;
+              }
+            } else if ('id' in clause) {
+              if (a.id !== b.id) {
+                const cmp = a.id < b.id ? -1 : 1;
+                return clause.id === 'asc' ? cmp : -cmp;
+              }
             }
           }
-          if (
-            where.trigger?.type !== undefined &&
-            r.trigger?.type !== where.trigger.type
-          ) {
-            return false;
-          }
-          if (
-            where.OR !== undefined &&
-            !where.OR.some((clause) => matchesClaimedAtClause(r, clause))
-          ) {
-            return false;
-          }
-          return true;
-        })
-        .map(
-          (r) =>
-            ({
-              ...r,
-              trigger: r.trigger ? { ...r.trigger } : null,
-            }) as unknown as AutomationWithTrigger,
-        );
+          return 0;
+        });
+      }
+      if (take !== undefined) {
+        records = records.slice(0, take);
+      }
+      return records.map(
+        (r) =>
+          ({
+            ...r,
+            trigger: r.trigger ? { ...r.trigger } : null,
+          }) as unknown as AutomationWithTrigger,
+      );
     },
     findFirst: ({
       where,
@@ -654,5 +690,210 @@ describe('AutomationSchedulerService', () => {
     expect(prisma.get('manual-1')?.nextRunAt).toBeNull();
     expect(prisma.get('event-1')?.nextRunAt).toBeNull();
     expect(triggerScheduled).not.toHaveBeenCalled();
+  });
+
+  // ---------------------------------------------------------------------
+  // RC-25 hardening fix: bounded-concurrency batch processing within a
+  // single tick — SCHEDULER_MAX_CONCURRENCY in flight at a time,
+  // SCHEDULER_MAX_BATCH_SIZE attempted at most, oldest nextRunAt first.
+  // Every automation's own two-phase claim/re-fetch is untouched (proven by
+  // the existing concurrency/reclaim tests above, all still green with
+  // this batch/pool wrapped around them) — these tests only exercise the
+  // pool itself.
+  // ---------------------------------------------------------------------
+
+  describe('bounded concurrency within a tick', () => {
+    function dueAutomations(count: number, now: Date): FakeAutomationRecord[] {
+      const scheduledFor = new Date(now.getTime() - 60_000);
+      return Array.from({ length: count }, (_, i) =>
+        automation({
+          id: `automation-${i + 1}`,
+          nextRunAt: scheduledFor,
+        }),
+      );
+    }
+
+    // Codex second review: the batch bound and the deterministic order must
+    // be part of the Postgres query itself (orderBy/take), never an
+    // in-memory sort + slice after an unbounded findMany() — otherwise a
+    // large due-set still costs an unbounded read and an unbounded
+    // in-memory array, only the *processing* was ever bounded. This asserts
+    // the exact args sent to findMany(), independent of the fake's own
+    // (also-fixed) enforcement of them.
+    it('requests the due-set query with take: SCHEDULER_MAX_BATCH_SIZE and orderBy nextRunAt asc, id asc', async () => {
+      const now = new Date('2026-09-21T06:05:00.000Z');
+      const { scheduler, prisma } = buildScheduler(dueAutomations(3, now));
+      const originalFindMany = prisma.automation.findMany;
+      const calls: unknown[] = [];
+      prisma.automation.findMany = (
+        args: Parameters<typeof originalFindMany>[0],
+      ) => {
+        calls.push(args);
+        return originalFindMany(args);
+      };
+
+      await scheduler.runDueAutomations(now);
+
+      // reconcileMissingNextRunAt() also calls findMany() (where.nextRunAt
+      // is exactly `null` — no orderBy/take, it has no batch to bound), so
+      // pick out the due-set query specifically: the one whose
+      // where.nextRunAt is a `{ lte }` clause, not the literal `null`.
+      const dueSetCall = calls.find(
+        (c): c is { where: { nextRunAt?: { lte: Date } }; take?: number } =>
+          typeof c === 'object' &&
+          c !== null &&
+          'where' in c &&
+          typeof (c as { where: { nextRunAt?: unknown } }).where.nextRunAt ===
+            'object' &&
+          (c as { where: { nextRunAt?: { lte: Date } } }).where.nextRunAt !==
+            null,
+      );
+      expect(dueSetCall).toBeDefined();
+      expect(dueSetCall).toMatchObject({
+        orderBy: [{ nextRunAt: 'asc' }, { id: 'asc' }],
+        take: SCHEDULER_MAX_BATCH_SIZE,
+      });
+    });
+
+    it('does not let a slow first automation block the start of the others', async () => {
+      const now = new Date('2026-09-21T06:05:00.000Z');
+      let releaseSlow!: () => void;
+      const slowPromise = new Promise<void>((resolve) => {
+        releaseSlow = resolve;
+      });
+      const started: string[] = [];
+      triggerScheduled.mockImplementation(
+        async (a: { id: string }): Promise<{ id: string }> => {
+          started.push(a.id);
+          if (a.id === 'automation-1') {
+            await slowPromise;
+          }
+          return { id: `run-${a.id}` };
+        },
+      );
+      const { scheduler } = buildScheduler(dueAutomations(4, now));
+
+      const runPromise = scheduler.runDueAutomations(now);
+      // Flush microtasks so every worker gets to start its first item
+      // without waiting for automation-1's own artificial delay to clear.
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(started).toEqual(
+        expect.arrayContaining([
+          'automation-1',
+          'automation-2',
+          'automation-3',
+          'automation-4',
+        ]),
+      );
+
+      releaseSlow();
+      await runPromise;
+      expect(triggerScheduled).toHaveBeenCalledTimes(4);
+    });
+
+    it('never runs more than SCHEDULER_MAX_CONCURRENCY automations at the same time', async () => {
+      const now = new Date('2026-09-21T06:05:00.000Z');
+      const total = SCHEDULER_MAX_CONCURRENCY * 2 + 3;
+      let inFlight = 0;
+      let maxInFlight = 0;
+      triggerScheduled.mockImplementation(
+        async (a: { id: string }): Promise<{ id: string }> => {
+          inFlight += 1;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          inFlight -= 1;
+          return { id: `run-${a.id}` };
+        },
+      );
+      const { scheduler } = buildScheduler(dueAutomations(total, now));
+
+      await scheduler.runDueAutomations(now);
+
+      expect(triggerScheduled).toHaveBeenCalledTimes(total);
+      expect(maxInFlight).toBeLessThanOrEqual(SCHEDULER_MAX_CONCURRENCY);
+      // The pool is actually exercised (not accidentally serialized) —
+      // otherwise this assertion would be vacuous.
+      expect(maxInFlight).toBeGreaterThan(1);
+    });
+
+    it('a rejected automation in the middle of the batch never prevents the others from completing', async () => {
+      const now = new Date('2026-09-21T06:05:00.000Z');
+      const total = SCHEDULER_MAX_CONCURRENCY + 2;
+      triggerScheduled.mockImplementation(
+        (a: { id: string }): Promise<{ id: string }> => {
+          if (a.id === 'automation-3') {
+            return Promise.reject(new Error('boom'));
+          }
+          return Promise.resolve({ id: `run-${a.id}` });
+        },
+      );
+      const { scheduler, prisma } = buildScheduler(dueAutomations(total, now));
+
+      await scheduler.runDueAutomations(now);
+
+      expect(triggerScheduled).toHaveBeenCalledTimes(total);
+      for (let i = 1; i <= total; i += 1) {
+        const id = `automation-${i}`;
+        if (id === 'automation-3') {
+          // Failed to durably create a run: nextRunAt is left untouched,
+          // to be retried, never silently advanced.
+          expect(prisma.get(id)?.nextRunAt).not.toBeNull();
+          expect(prisma.get(id)?.scheduledClaimedAt).toEqual(now);
+        } else {
+          expect(prisma.get(id)?.scheduledClaimedAt).toBeNull();
+        }
+      }
+    });
+
+    it('attempts at most SCHEDULER_MAX_BATCH_SIZE automations in one tick, oldest nextRunAt first', async () => {
+      const now = new Date('2026-09-21T06:05:00.000Z');
+      const total = SCHEDULER_MAX_BATCH_SIZE + 5;
+      // Distinct, strictly increasing nextRunAt per automation so "oldest
+      // first" has an unambiguous, verifiable order — automation-1 is the
+      // most overdue, automation-N the least.
+      const records = Array.from({ length: total }, (_, i) =>
+        automation({
+          id: `automation-${i + 1}`,
+          nextRunAt: new Date(now.getTime() - (total - i) * 1_000),
+        }),
+      );
+      const { scheduler } = buildScheduler(records);
+
+      await scheduler.runDueAutomations(now);
+
+      expect(triggerScheduled).toHaveBeenCalledTimes(SCHEDULER_MAX_BATCH_SIZE);
+      const attemptedIds = triggerScheduled.mock.calls.map(
+        ([a]: [{ id: string }]) => a.id,
+      );
+      const expectedIds = Array.from(
+        { length: SCHEDULER_MAX_BATCH_SIZE },
+        (_, i) => `automation-${i + 1}`,
+      );
+      expect(new Set(attemptedIds)).toEqual(new Set(expectedIds));
+    });
+
+    it('leaves the automations left out of a bounded batch untouched, to be picked up by the next tick', async () => {
+      const now = new Date('2026-09-21T06:05:00.000Z');
+      const total = SCHEDULER_MAX_BATCH_SIZE + 1;
+      const records = Array.from({ length: total }, (_, i) =>
+        automation({
+          id: `automation-${i + 1}`,
+          nextRunAt: new Date(now.getTime() - (total - i) * 1_000),
+        }),
+      );
+      const { scheduler, prisma } = buildScheduler(records);
+      const leftOutId = `automation-${total}`; // the least-overdue one
+
+      await scheduler.runDueAutomations(now);
+
+      expect(triggerScheduled).not.toHaveBeenCalledWith(
+        expect.objectContaining({ id: leftOutId }),
+        expect.anything(),
+      );
+      const leftOut = prisma.get(leftOutId);
+      expect(leftOut?.scheduledClaimedAt).toBeNull();
+      expect(leftOut?.nextRunAt).toEqual(new Date(now.getTime() - 1_000));
+    });
   });
 });

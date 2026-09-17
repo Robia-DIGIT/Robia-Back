@@ -14,3 +14,23 @@ export const MAX_STEPS_PER_AUTOMATION = 20;
  * rejected instead of silently recursing.
  */
 export const MAX_TRIGGER_DEPTH = 3;
+
+// RC-25 hardening guardrails — AutomationSchedulerService's own tick.
+
+/**
+ * How many due automations AutomationSchedulerService will process
+ * concurrently within a single tick. Bounds worst-case load on the DB and
+ * on whatever an ops action's step actually does (real I/O), independent of
+ * how many automations happen to be due at once — never unbounded
+ * `Promise.allSettled` over the whole due-set.
+ */
+export const SCHEDULER_MAX_CONCURRENCY = 5;
+
+/**
+ * How many due automations a single tick will attempt at most, however
+ * large the due-set has grown. Anything beyond this is simply left for the
+ * next tick (a minute later) — its own nextRunAt is never touched, so
+ * nothing is lost, only delayed, exactly like a claim that lost the race or
+ * a lease that hasn't gone stale yet.
+ */
+export const SCHEDULER_MAX_BATCH_SIZE = 50;

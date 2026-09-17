@@ -833,6 +833,130 @@ describe('AutomationsService', () => {
   });
 
   // ---------------------------------------------------------------------
+  // RC-25 hardening fix: the persisted timezone invariant.
+  //   - scheduled: always a non-null timezone, UTC by default.
+  //   - event / manual: always null — never a residual value from a prior
+  //     scheduled trigger.
+  // See AutomationsService.resolveTriggerTimezone().
+  // ---------------------------------------------------------------------
+
+  describe('trigger timezone invariant', () => {
+    function scheduledDto(
+      overrides: Partial<Parameters<AutomationsService['create']>[2]> = {},
+    ) {
+      return createDto({
+        trigger: {
+          type: 'scheduled',
+          cronExpression: '0 9 * * 1',
+          timezone: 'Indian/Antananarivo',
+        },
+        enabled: true,
+        ...overrides,
+      });
+    }
+
+    it('persists a null timezone for a manual trigger created with no timezone', async () => {
+      const automation = await service.create(orgA, userA, createDto());
+      expect(automation.trigger).toMatchObject({
+        type: 'manual',
+        timezone: null,
+      });
+    });
+
+    it('persists a null timezone for an event trigger created with no timezone', async () => {
+      const automation = await service.create(
+        orgA,
+        userA,
+        createDto({ trigger: { type: 'event', eventType: 'audit.completed' } }),
+      );
+      expect(automation.trigger).toMatchObject({
+        type: 'event',
+        timezone: null,
+      });
+    });
+
+    it('clears the timezone when a scheduled trigger is switched to event', async () => {
+      const automation = await service.create(orgA, userA, scheduledDto());
+      expect(automation.trigger).toMatchObject({
+        timezone: 'Indian/Antananarivo',
+      });
+
+      const updated = await service.update(orgA, automation.id, {
+        trigger: { type: 'event', eventType: 'audit.completed' },
+      });
+
+      expect(updated.trigger).toMatchObject({ type: 'event', timezone: null });
+      expect(updated.trigger?.cronExpression).toBeNull();
+      expect(updated.nextRunAt).toBeNull();
+    });
+
+    it('clears the timezone when a scheduled trigger is switched to manual', async () => {
+      const automation = await service.create(orgA, userA, scheduledDto());
+
+      const updated = await service.update(orgA, automation.id, {
+        trigger: { type: 'manual' },
+      });
+
+      expect(updated.trigger).toMatchObject({ type: 'manual', timezone: null });
+      expect(updated.trigger?.cronExpression).toBeNull();
+      expect(updated.nextRunAt).toBeNull();
+    });
+
+    it('defaults to UTC when a non-scheduled trigger is switched to scheduled with no timezone given', async () => {
+      const automation = await service.create(orgA, userA, createDto());
+      expect(automation.trigger).toMatchObject({
+        type: 'manual',
+        timezone: null,
+      });
+
+      const updated = await service.update(orgA, automation.id, {
+        trigger: { type: 'scheduled', cronExpression: '0 9 * * 1' },
+      });
+
+      expect(updated.trigger).toMatchObject({
+        type: 'scheduled',
+        timezone: 'UTC',
+      });
+    });
+
+    it('keeps the existing timezone when a scheduled trigger is updated without a new timezone', async () => {
+      const automation = await service.create(orgA, userA, scheduledDto());
+      expect(automation.trigger).toMatchObject({
+        timezone: 'Indian/Antananarivo',
+      });
+
+      const updated = await service.update(orgA, automation.id, {
+        trigger: { type: 'scheduled', cronExpression: '0 10 * * 2' },
+      });
+
+      expect(updated.trigger).toMatchObject({
+        type: 'scheduled',
+        timezone: 'Indian/Antananarivo',
+      });
+    });
+
+    it('never reuses a residual timezone left on a historically inconsistent non-scheduled trigger', async () => {
+      const automation = await service.create(orgA, userA, createDto());
+      // Simulate pre-hardening inconsistent data: a manual trigger whose
+      // timezone column was never null'd out (the historical default was
+      // 'UTC' for every trigger type, not just scheduled — see the RC-25
+      // hardening migration). This must never surface as "the existing
+      // timezone" once switched to scheduled.
+      const triggerRecord = prisma.triggers.get(automation.id)!;
+      triggerRecord.timezone = 'Europe/Paris';
+
+      const updated = await service.update(orgA, automation.id, {
+        trigger: { type: 'scheduled', cronExpression: '0 9 * * 1' },
+      });
+
+      expect(updated.trigger).toMatchObject({
+        type: 'scheduled',
+        timezone: 'UTC',
+      });
+    });
+  });
+
+  // ---------------------------------------------------------------------
   // RC-25: triggerScheduled() — the dispatcher's own entry point into the
   // engine. It's a thin wrapper over the same startRun() every other
   // trigger type uses, so these tests only prove the wiring (trigger type,
