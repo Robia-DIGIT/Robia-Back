@@ -573,11 +573,26 @@ model AutomationStepRun {
   sequence   Int
   actionType String   @map("action_type")
   input      Json?
-  status     String   @default("queued") // queued | running | succeeded | failed | skipped | cancelled
+  status     String   @default("queued") // queued | running | succeeded | failed | skipped | cancelled | retry_scheduled
   // Action-produced evidence (redacted before persisting).
   evidence   Json?
   // Cleaned/redacted error text — never a raw stack trace or exception object.
   error      String?
+  // RC-27 — automatic step-level retries. Incremented atomically at the
+  // start of every attempt (the initial synchronous one included), never at
+  // finalize time — so a crash mid-attempt still counts as spent, the same
+  // discipline as NotificationDelivery.attemptCount (RC-26). Bounded by
+  // MAX_STEP_ATTEMPTS (see step-retry-policy.ts).
+  attemptCount Int @default(0) @map("attempt_count")
+  // When status='retry_scheduled', the instant AutomationStepRetryDispatcherService
+  // may next attempt this step again. Null otherwise.
+  nextAttemptAt DateTime? @map("next_attempt_at")
+  // A lease on an in-flight retry claim — mirrors Automation.scheduledClaimedAt
+  // (RC-25) and NotificationDelivery.claimedAt (RC-26). Never set for the
+  // initial synchronous attempt (only a real concurrency hazard — two
+  // dispatcher instances/ticks racing on the same due retry — needs a
+  // claim); null once no retry attempt is in flight.
+  claimedAt  DateTime? @map("claimed_at")
   startedAt  DateTime? @map("started_at")
   finishedAt DateTime? @map("finished_at")
   createdAt  DateTime @default(now()) @map("created_at")
@@ -585,6 +600,8 @@ model AutomationStepRun {
   notificationDeliveries NotificationDelivery[]
 
   @@unique([runId, sequence])
+  // Serves AutomationStepRetryDispatcherService's periodic due-set scan.
+  @@index([status, nextAttemptAt])
   @@map("automation_step_runs")
 }
 

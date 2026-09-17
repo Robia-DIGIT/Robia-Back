@@ -1,4 +1,8 @@
-import { ConflictException, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  InternalServerErrorException,
+  NotFoundException,
+} from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { AutomationsService } from './automations.service';
 import { AutomationContextService } from './automation-context.service';
@@ -20,6 +24,11 @@ import {
 } from './automation.constants';
 import { computeNextOccurrence } from './cron-schedule';
 import type { AutomationConditionContext } from './condition-engine';
+import {
+  MAX_STEP_ATTEMPTS,
+  STEP_RETRY_BACKOFF_MS,
+  STEP_RETRY_CLAIM_LEASE_MS,
+} from './step-retry-policy';
 
 // ---------------------------------------------------------------------
 // A small, purpose-built in-memory fake of the exact Prisma call surface
@@ -382,6 +391,9 @@ class FakePrisma {
         createdAt: new Date(),
         evidence: null,
         error: null,
+        attemptCount: 0,
+        nextAttemptAt: null,
+        claimedAt: null,
         startedAt: null,
         finishedAt: null,
         ...normalizeJsonSentinels(data),
@@ -401,7 +413,140 @@ class FakePrisma {
       Object.assign(record, normalizeJsonSentinels(data));
       return record;
     },
+    findFirst: ({ where }: { where: { id?: string } }) => {
+      const record = Array.from(this.steps.values()).find(
+        (s) => where.id === undefined || s.id === where.id,
+      );
+      return record ?? null;
+    },
+    findMany: ({
+      where,
+    }: {
+      where: {
+        AND?: Array<{
+          OR?: Array<Record<string, unknown>>;
+        }>;
+      };
+    }) => {
+      return Array.from(this.steps.values()).filter((record) =>
+        this.matchesDueStepRetryWhere(record, where),
+      );
+    },
+    // Same real-conditional-UPDATE semantics as automationRun.updateMany
+    // above — see its comment.
+    updateMany: ({
+      where,
+      data,
+    }: {
+      where: {
+        id: string;
+        attemptCount?: { lt?: number; gte?: number };
+        claimedAt?: unknown;
+        AND?: Array<{ OR?: Array<Record<string, unknown>> }>;
+      };
+    } & { data: Record<string, unknown> }) => {
+      const record = this.steps.get(where.id);
+      if (!record) return { count: 0 };
+      if (
+        where.attemptCount?.lt !== undefined &&
+        !((record.attemptCount as number) < where.attemptCount.lt)
+      ) {
+        return { count: 0 };
+      }
+      if ('claimedAt' in where && where.claimedAt !== undefined) {
+        const expected = where.claimedAt as Date | null;
+        const actual = record.claimedAt as Date | null;
+        const matches =
+          expected === null
+            ? actual === null
+            : actual !== null && actual.getTime() === expected.getTime();
+        if (!matches) return { count: 0 };
+      }
+      if (where.AND && !this.matchesDueStepRetryWhere(record, where)) {
+        return { count: 0 };
+      }
+      Object.assign(
+        record,
+        normalizeJsonSentinels(this.resolveIncrements(record, data)),
+      );
+      return { count: 1 };
+    },
   };
+
+  // Real Prisma's `{ field: { increment: n } }` update operator, applied
+  // relative to the record's *current* value — FakePrisma stores plain
+  // values, so a bare Object.assign would otherwise overwrite the field
+  // with the literal `{ increment: n }` object instead of adding to it.
+  // Only automationStepRun.updateMany uses this operator today
+  // (attemptCount), see AutomationsService.retryStep().
+  private resolveIncrements(
+    record: FakeRecord,
+    data: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const resolved: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(data)) {
+      if (
+        value &&
+        typeof value === 'object' &&
+        !(value instanceof Date) &&
+        'increment' in (value as Record<string, unknown>)
+      ) {
+        const current = (record[key] as number | undefined) ?? 0;
+        resolved[key] = current + (value as { increment: number }).increment;
+      } else {
+        resolved[key] = value;
+      }
+    }
+    return resolved;
+  }
+
+  // Mirrors dueStepRetryWhere() from step-retry-policy.ts against the fake's
+  // in-memory records — see that function for the actual due-set rules this
+  // reproduces (used by both automationStepRun.findMany and .updateMany
+  // above, exactly like the real query and the real claim UPDATE share the
+  // same shape in production).
+  private matchesDueStepRetryWhere(
+    record: FakeRecord,
+    where: { AND?: Array<{ OR?: Array<Record<string, unknown>> }> },
+  ): boolean {
+    if (!where.AND) return true;
+    return where.AND.every((clause) => {
+      if (!clause.OR) return true;
+      return clause.OR.some((branch) => {
+        return Object.entries(branch).every(([key, condition]) => {
+          const value = record[key];
+          if (condition === null) return value === null;
+          if (
+            condition &&
+            typeof condition === 'object' &&
+            !(condition instanceof Date)
+          ) {
+            const cond = condition as {
+              lte?: Date;
+              lt?: Date;
+              not?: null;
+            };
+            if (cond.lte !== undefined) {
+              return (
+                value !== null &&
+                (value as Date).getTime() <= cond.lte.getTime()
+              );
+            }
+            if (cond.lt !== undefined) {
+              return (
+                value !== null && (value as Date).getTime() < cond.lt.getTime()
+              );
+            }
+            if ('not' in cond) {
+              return value !== cond.not;
+            }
+            return false;
+          }
+          return value === condition;
+        });
+      });
+    });
+  }
 
   automationEvent = {
     findUnique: ({
@@ -1150,10 +1295,15 @@ describe('AutomationsService', () => {
   // Step failure
   // ---------------------------------------------------------------------
 
-  it('marks the run failed and stops after the first failing step, without running later steps', async () => {
+  it('marks the run failed and stops after the first failing step, without running later steps (permanent error)', async () => {
+    // A permanent (4xx) error — see step-retry-policy.ts — fails the run
+    // outright on the very first attempt, same as before RC-27's step
+    // retries existed. A transient error's very different behavior (retry
+    // scheduled, run stays 'running') is covered under "Step-level retries
+    // (RC-27)" below.
     actionsRegistry.execute
       .mockResolvedValueOnce({ ok: true })
-      .mockRejectedValueOnce(new Error('Boom'));
+      .mockRejectedValueOnce(new NotFoundException('Boom'));
     const automation = await service.create(
       orgA,
       userA,
@@ -1186,12 +1336,231 @@ describe('AutomationsService', () => {
   });
 
   // ---------------------------------------------------------------------
+  // Step-level retries (RC-27)
+  // ---------------------------------------------------------------------
+
+  describe('step-level retries (RC-27)', () => {
+    it('schedules a retry instead of failing the run on a transient (non-HTTP) error', async () => {
+      actionsRegistry.execute.mockRejectedValueOnce(new Error('ECONNRESET'));
+      const automation = await service.create(orgA, userA, createDto());
+      const started = await service.triggerManual(orgA, userA, automation.id);
+      const run = await service.getRun(orgA, started.id);
+
+      expect(run.status).toBe('running');
+      expect(run.steps).toHaveLength(1);
+      expect(run.steps[0].status).toBe('retry_scheduled');
+      expect(run.steps[0].attemptCount).toBe(1);
+      expect(run.steps[0].error).toContain('ECONNRESET');
+      expect(run.steps[0].nextAttemptAt).toBeInstanceOf(Date);
+      expect(
+        (run.steps[0].nextAttemptAt as Date).getTime() -
+          (run.steps[0].startedAt as Date).getTime(),
+      ).toBeCloseTo(STEP_RETRY_BACKOFF_MS[0], -2);
+    });
+
+    it('schedules a retry for a 5xx HttpException too — only 4xx is permanent', async () => {
+      actionsRegistry.execute.mockRejectedValueOnce(
+        new InternalServerErrorException('upstream unavailable'),
+      );
+      const automation = await service.create(orgA, userA, createDto());
+      const started = await service.triggerManual(orgA, userA, automation.id);
+      const run = await service.getRun(orgA, started.id);
+
+      expect(run.status).toBe('running');
+      expect(run.steps[0].status).toBe('retry_scheduled');
+    });
+
+    it('never schedules a retry for InvalidOpsActionInputError or UnknownOpsActionError — fails the run outright', async () => {
+      for (const error of [
+        new InvalidOpsActionInputError('bad input'),
+        new UnknownOpsActionError('unknown action'),
+      ]) {
+        actionsRegistry.execute.mockRejectedValueOnce(error);
+        const automation = await service.create(orgA, userA, createDto());
+        const started = await service.triggerManual(orgA, userA, automation.id);
+        const run = await service.getRun(orgA, started.id);
+        expect(run.status).toBe('failed');
+        expect(run.steps[0].status).toBe('failed');
+        expect(run.steps[0].attemptCount).toBe(1);
+      }
+    });
+
+    it('retryStep(): re-attempting a due retry succeeds and resumes the remaining steps to completion', async () => {
+      actionsRegistry.execute
+        .mockRejectedValueOnce(new Error('temporary blip'))
+        .mockResolvedValueOnce({ ok: true }) // the retried first step
+        .mockResolvedValueOnce({ ok: true }); // the second step
+      const automation = await service.create(
+        orgA,
+        userA,
+        createDto({
+          steps: [
+            {
+              actionType: 'robia.report.prepare_organization_summary',
+              input: {},
+            },
+            {
+              actionType: 'robia.action_items.create_internal_task',
+              input: { title: 'x' },
+            },
+          ],
+        }),
+      );
+      const started = await service.triggerManual(orgA, userA, automation.id);
+      const scheduled = await service.getRun(orgA, started.id);
+      const stepRunId = scheduled.steps[0].id;
+      const dueAt = new Date(
+        (scheduled.steps[0].nextAttemptAt as Date).getTime() + 1,
+      );
+
+      await service.retryStep(stepRunId, dueAt);
+
+      const run = await service.getRun(orgA, started.id);
+      expect(run.status).toBe('succeeded');
+      expect(run.steps).toHaveLength(2);
+      expect(run.steps[0].status).toBe('succeeded');
+      expect(run.steps[0].attemptCount).toBe(2);
+      expect(run.steps[1].status).toBe('succeeded');
+      expect(actionsRegistry.execute).toHaveBeenCalledTimes(3);
+    });
+
+    it('retryStep(): a second transient failure reschedules the next backoff tier', async () => {
+      actionsRegistry.execute
+        .mockRejectedValueOnce(new Error('blip 1'))
+        .mockRejectedValueOnce(new Error('blip 2'));
+      const automation = await service.create(orgA, userA, createDto());
+      const started = await service.triggerManual(orgA, userA, automation.id);
+      const scheduled = await service.getRun(orgA, started.id);
+      const stepRunId = scheduled.steps[0].id;
+      const firstDueAt = new Date(
+        (scheduled.steps[0].nextAttemptAt as Date).getTime() + 1,
+      );
+
+      await service.retryStep(stepRunId, firstDueAt);
+
+      const run = await service.getRun(orgA, started.id);
+      expect(run.status).toBe('running');
+      expect(run.steps[0].status).toBe('retry_scheduled');
+      expect(run.steps[0].attemptCount).toBe(2);
+      expect(
+        (run.steps[0].nextAttemptAt as Date).getTime() - firstDueAt.getTime(),
+      ).toBeCloseTo(STEP_RETRY_BACKOFF_MS[1], -2);
+    });
+
+    it('retryStep(): fails the run once MAX_STEP_ATTEMPTS is reached', async () => {
+      actionsRegistry.execute.mockRejectedValue(new Error('always fails'));
+      const automation = await service.create(orgA, userA, createDto());
+      const started = await service.triggerManual(orgA, userA, automation.id);
+
+      const stepRunId = (await service.getRun(orgA, started.id)).steps[0].id;
+      // attemptCount starts at 1 (the initial synchronous attempt); drive it
+      // through every remaining retry until the budget (MAX_STEP_ATTEMPTS) is
+      // exhausted.
+      for (let attempt = 1; attempt < MAX_STEP_ATTEMPTS; attempt++) {
+        const step = (await service.getRun(orgA, started.id)).steps[0];
+        const now = new Date((step.nextAttemptAt as Date).getTime() + 1);
+        await service.retryStep(stepRunId, now);
+      }
+
+      const run = await service.getRun(orgA, started.id);
+      expect(run.status).toBe('failed');
+      expect(run.steps[0].status).toBe('failed');
+      expect(run.steps[0].attemptCount).toBe(MAX_STEP_ATTEMPTS);
+      expect(actionsRegistry.execute).toHaveBeenCalledTimes(MAX_STEP_ATTEMPTS);
+    });
+
+    it('retryStep(): a no-op before nextAttemptAt is due, and before the lease is free', async () => {
+      actionsRegistry.execute.mockRejectedValueOnce(new Error('blip'));
+      const automation = await service.create(orgA, userA, createDto());
+      const started = await service.triggerManual(orgA, userA, automation.id);
+      const scheduled = await service.getRun(orgA, started.id);
+      const stepRunId = scheduled.steps[0].id;
+      const nextAttemptAt = scheduled.steps[0].nextAttemptAt as Date;
+
+      // Called before it's actually due: must not claim or attempt anything.
+      await service.retryStep(stepRunId, new Date(nextAttemptAt.getTime() - 1));
+      expect(actionsRegistry.execute).toHaveBeenCalledTimes(1);
+      const stillScheduled = await service.getRun(orgA, started.id);
+      expect(stillScheduled.steps[0].status).toBe('retry_scheduled');
+    });
+
+    it('retryStep(): only one of two concurrent claims on the same due step wins', async () => {
+      actionsRegistry.execute
+        .mockRejectedValueOnce(new Error('blip'))
+        .mockResolvedValueOnce({ ok: true });
+      const automation = await service.create(orgA, userA, createDto());
+      const started = await service.triggerManual(orgA, userA, automation.id);
+      const scheduled = await service.getRun(orgA, started.id);
+      const stepRunId = scheduled.steps[0].id;
+      const dueAt = new Date(
+        (scheduled.steps[0].nextAttemptAt as Date).getTime() + 1,
+      );
+
+      await Promise.all([
+        service.retryStep(stepRunId, dueAt),
+        service.retryStep(stepRunId, dueAt),
+      ]);
+
+      // Exactly one claim can win a given instant: the second call's claim
+      // UPDATE simply matches nothing once the first has already moved the
+      // row to 'running' — see retryStep()'s claim WHERE.
+      expect(actionsRegistry.execute).toHaveBeenCalledTimes(2);
+      const run = await service.getRun(orgA, started.id);
+      expect(run.status).toBe('succeeded');
+    });
+
+    it('retryStep(): reclaims a step whose retry attempt crashed (stale lease), never one still actively in flight', async () => {
+      actionsRegistry.execute.mockRejectedValueOnce(new Error('blip'));
+      const automation = await service.create(orgA, userA, createDto());
+      const started = await service.triggerManual(orgA, userA, automation.id);
+      const scheduled = await service.getRun(orgA, started.id);
+      const stepRunId = scheduled.steps[0].id;
+      const dueAt = new Date(
+        (scheduled.steps[0].nextAttemptAt as Date).getTime() + 1,
+      );
+
+      // Simulate another instance having already claimed this exact retry
+      // and then crashed mid-attempt, without depending on microtask timing:
+      // directly set the row to what retryStep()'s own claim phase would
+      // have left it at — 'running', claimedAt = dueAt, attemptCount bumped.
+      prisma.automationStepRun.update({
+        where: { id: stepRunId },
+        data: { status: 'running', claimedAt: dueAt, attemptCount: 2 },
+      });
+
+      // A call arriving before the lease goes stale must not touch it...
+      const stillLeased = new Date(
+        dueAt.getTime() + STEP_RETRY_CLAIM_LEASE_MS - 1,
+      );
+      await service.retryStep(stepRunId, stillLeased);
+      expect(actionsRegistry.execute).toHaveBeenCalledTimes(1); // only the initial attempt
+      const notReclaimed = await service.getRun(orgA, started.id);
+      expect(notReclaimed.steps[0].status).toBe('running');
+      expect(notReclaimed.steps[0].claimedAt).toEqual(dueAt);
+
+      // ...but once the lease has gone stale, another call may reclaim it.
+      actionsRegistry.execute.mockResolvedValueOnce({ ok: true });
+      const staleNow = new Date(
+        dueAt.getTime() + STEP_RETRY_CLAIM_LEASE_MS + 1,
+      );
+      await service.retryStep(stepRunId, staleNow);
+      expect(actionsRegistry.execute).toHaveBeenCalledTimes(2);
+      const run = await service.getRun(orgA, started.id);
+      expect(run.status).toBe('succeeded');
+      expect(run.steps[0].attemptCount).toBe(3);
+    });
+  });
+
+  // ---------------------------------------------------------------------
   // Redaction
   // ---------------------------------------------------------------------
 
   it('redacts a secret-shaped string out of a step failure message before persisting it', async () => {
+    // A permanent error here too (see the test above) — this test is about
+    // redaction, not about the retry-vs-fail decision, so it stays on the
+    // "fails immediately" path that existed before RC-27.
     actionsRegistry.execute.mockRejectedValue(
-      new Error(
+      new NotFoundException(
         'Call failed: token=eyJhbGciOiJIUzI1NiJ9.e30.4Adcj3UFYzPUVaVF43FmMab6RlaQD8A9V8wFzzht-KQ',
       ),
     );
