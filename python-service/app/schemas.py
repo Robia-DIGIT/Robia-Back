@@ -47,6 +47,11 @@ class AuditResult(BaseModel):
     strengths: list[str]
     missing_data: list[str]
     summary: str
+    # False when the page could not actually be read (JS-heavy site, hard
+    # redirect the scraper didn't follow, timeout, etc.) — in that case
+    # global_score is 0 by convention, but it is NOT a real score. Callers
+    # must check this field before treating 0 as a genuine result.
+    page_accessible: bool = True
 
 
 class SiteAuditRequest(BaseModel):

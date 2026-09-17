@@ -12,6 +12,12 @@ export interface AuditResult {
   };
   missing_data: string[];
   summary: string;
+  // False when the AI engine's second, single-page audit couldn't actually
+  // read the page (JS-heavy site, redirect the scraper didn't follow,
+  // timeout...) — global_score is 0 by convention in that case, never a
+  // real score. Optional: older engine responses may not send it, and its
+  // absence must be treated as accessible (true), never as a failure.
+  page_accessible?: boolean;
 }
 
 interface RunAuditParams {
@@ -164,7 +170,9 @@ interface RunSiteAuditParams {
 const REQUEST_ID_HEADER = 'X-Request-Id';
 
 function requestHeaders(requestId?: string): Record<string, string> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
   if (requestId) {
     headers[REQUEST_ID_HEADER] = requestId;
   }

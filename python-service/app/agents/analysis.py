@@ -48,6 +48,9 @@ def compute_audit_result(
             "strengths": [],
             "missing_data": [f"Site inaccessible : {page.error or 'raison inconnue'}"],
             "summary": "Le site n'a pas pu être analysé car il est inaccessible.",
+            # 0 here is a placeholder, never a real score — see AuditResult
+            # docstring. Callers must branch on this before trusting global_score.
+            "page_accessible": False,
         }
 
     # --- Sous-score technique ---
@@ -213,6 +216,7 @@ def compute_audit_result(
         "strengths": strengths,
         "missing_data": missing_data,
         "summary": " ".join(summary_parts),
+        "page_accessible": True,
     }
 
 
