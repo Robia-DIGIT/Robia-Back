@@ -155,6 +155,24 @@ export class OdcApplicationsService {
     return application;
   }
 
+  async listByProgram(organizationId: string, programId: string) {
+    const program = await this.prisma.odcProgram.findFirst({
+      where: { id: programId, organizationId },
+    });
+    if (!program) {
+      throw new NotFoundException('Program non trouvé.');
+    }
+    return this.prisma.odcApplication.findMany({
+      where: { organizationId, programId },
+      include: {
+        applicant: true,
+        documents: true,
+        scoreLines: true,
+      },
+      orderBy: { updatedAt: 'desc' },
+    });
+  }
+
   async getHistory(organizationId: string, id: string) {
     const application = await this.getApplication(organizationId, id);
     return application.events;

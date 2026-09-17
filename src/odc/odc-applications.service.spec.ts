@@ -610,4 +610,38 @@ describe('OdcApplicationsService', () => {
       }),
     ).rejects.toBeInstanceOf(ConflictException);
   });
+
+  it('listByProgram() returns only applications of that program in the same org', async () => {
+    const programA = createProgram(orgA, { fields: [], docTypes: [] });
+    const programA2 = prisma.odcProgram.create({
+      data: {
+        organizationId: orgA,
+        slug: 'programme-2',
+        name: 'Programme 2',
+        createdById: userA,
+        status: 'open',
+        fields: { create: [] },
+        criteria: { create: [] },
+        docTypes: { create: [] },
+      },
+      include: { fields: true, criteria: true, docTypes: true },
+    }) as { id: string };
+    const programB = createProgram(orgB, { fields: [], docTypes: [] });
+
+    const inA = await createDraftApplication(orgA, programA.id);
+    await createDraftApplication(orgA, programA2.id);
+    await createDraftApplication(orgB, programB.id);
+
+    const listed = await service.listByProgram(orgA, programA.id);
+    expect(listed).toHaveLength(1);
+    expect(listed[0].id).toBe(inA.id);
+    expect(listed[0].applicant).toBeDefined();
+  });
+
+  it('listByProgram() 404s for a program in another org', async () => {
+    const programB = createProgram(orgB, { fields: [], docTypes: [] });
+    await expect(service.listByProgram(orgA, programB.id)).rejects.toBeInstanceOf(
+      NotFoundException,
+    );
+  });
 });
