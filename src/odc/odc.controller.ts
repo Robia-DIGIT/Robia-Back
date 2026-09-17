@@ -56,6 +56,16 @@ export class OdcController {
     return this.programs.findAll(req.organizationId);
   }
 
+  @Get('programs/:id')
+  getProgram(@Req() req: ScopedRequest, @Param('id') id: string) {
+    return this.programs.findOne(req.organizationId, id);
+  }
+
+  @Get('programs/:id/applications')
+  listApplications(@Req() req: ScopedRequest, @Param('id') id: string) {
+    return this.applications.listByProgram(req.organizationId, id);
+  }
+
   @Patch('programs/:id')
   updateProgram(
     @Req() req: ScopedRequest,

@@ -371,6 +371,32 @@ export class FakeOdcPrisma {
       );
       return record ? this.applicationWithRelations(record, include) : null;
     },
+    findMany: ({
+      where,
+      include,
+      orderBy,
+    }: {
+      where: { organizationId?: string; programId?: string };
+      include?: Parameters<FakeOdcPrisma['applicationWithRelations']>[1];
+      orderBy?: { updatedAt?: 'asc' | 'desc' };
+    }) => {
+      let records = Array.from(this.applications.values()).filter(
+        (a) =>
+          (where.organizationId === undefined ||
+            a.organizationId === where.organizationId) &&
+          (where.programId === undefined || a.programId === where.programId),
+      );
+      if (orderBy?.updatedAt === 'desc') {
+        records = records.sort(
+          (a, b) =>
+            new Date(b.updatedAt as Date).getTime() -
+            new Date(a.updatedAt as Date).getTime(),
+        );
+      }
+      return records.map((record) =>
+        this.applicationWithRelations(record, include),
+      );
+    },
     update: ({ where, data }: { where: { id: string }; data: FakeRecord }) => {
       const record = this.applications.get(where.id);
       if (!record) throw new Error('FakeOdcPrisma: application not found');

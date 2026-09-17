@@ -118,4 +118,11 @@ describe('OdcProgramsService', () => {
       service.update(orgA, program.id, { name: 'x' }),
     ).rejects.toBeInstanceOf(ConflictException);
   });
+
+  it('findOne() 404s across organizations', async () => {
+    const program = await service.create(orgA, userA, createDto());
+    await expect(service.findOne(orgB, program.id)).rejects.toBeInstanceOf(
+      NotFoundException,
+    );
+  });
 });
