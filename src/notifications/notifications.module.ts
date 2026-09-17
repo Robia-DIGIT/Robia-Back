@@ -15,6 +15,6 @@ import { NOTIFICATION_TRANSPORT } from './notification-transport';
       useClass: SmtpNotificationTransport,
     },
   ],
-  exports: [NotificationsService],
+  exports: [NotificationsService, NOTIFICATION_TRANSPORT],
 })
 export class NotificationsModule {}

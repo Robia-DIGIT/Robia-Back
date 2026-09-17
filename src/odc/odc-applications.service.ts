@@ -162,7 +162,7 @@ export class OdcApplicationsService {
     if (!program) {
       throw new NotFoundException('Program non trouvé.');
     }
-    return this.prisma.odcApplication.findMany({
+    const rows = await this.prisma.odcApplication.findMany({
       where: { organizationId, programId },
       include: {
         applicant: true,
@@ -171,6 +171,7 @@ export class OdcApplicationsService {
       },
       orderBy: { updatedAt: 'desc' },
     });
+    return rankApplicationsByScore(rows);
   }
 
   async getHistory(organizationId: string, id: string) {
@@ -711,4 +712,32 @@ export class OdcApplicationsService {
       },
     });
   }
+}
+
+function rankApplicationsByScore<
+  T extends {
+    finalTotal: number | null;
+    submittedAt: Date | null;
+    updatedAt: Date;
+  },
+>(rows: T[]): T[] {
+  return [...rows].sort((a, b) => {
+    if (a.finalTotal === null && b.finalTotal === null) {
+      return compareDatesDesc(
+        a.submittedAt ?? a.updatedAt,
+        b.submittedAt ?? b.updatedAt,
+      );
+    }
+    if (a.finalTotal === null) return 1;
+    if (b.finalTotal === null) return -1;
+    if (b.finalTotal !== a.finalTotal) return b.finalTotal - a.finalTotal;
+    return compareDatesDesc(
+      a.submittedAt ?? a.updatedAt,
+      b.submittedAt ?? b.updatedAt,
+    );
+  });
+}
+
+function compareDatesDesc(a: Date, b: Date): number {
+  return new Date(b).getTime() - new Date(a).getTime();
 }

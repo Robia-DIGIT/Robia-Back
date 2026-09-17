@@ -23,6 +23,8 @@ import { ProposeScoresDto } from './dto/propose-scores.dto';
 import { UpdateScoresDto } from './dto/update-scores.dto';
 import { DecideApplicationDto } from './dto/decide-application.dto';
 import { WithdrawApplicationDto } from './dto/withdraw-application.dto';
+import { OdcOutreachService } from './odc-outreach.service';
+import { QueueOdcOutreachDto } from './dto/queue-odc-outreach.dto';
 
 interface ScopedRequest extends Request {
   user: { userId: string; email: string };
@@ -40,6 +42,7 @@ export class OdcController {
   constructor(
     private readonly programs: OdcProgramsService,
     private readonly applications: OdcApplicationsService,
+    private readonly outreach: OdcOutreachService,
   ) {}
 
   // ---------------------------------------------------------------------
@@ -83,6 +86,30 @@ export class OdcController {
   @Post('programs/:id/close')
   closeProgram(@Req() req: ScopedRequest, @Param('id') id: string) {
     return this.programs.close(req.organizationId, id);
+  }
+
+  @Get('programs/:id/outreach')
+  listOutreach(@Req() req: ScopedRequest, @Param('id') id: string) {
+    return this.outreach.list(req.organizationId, id);
+  }
+
+  @Post('programs/:id/outreach')
+  queueOutreach(
+    @Req() req: ScopedRequest,
+    @Param('id') id: string,
+    @Body() dto: QueueOdcOutreachDto,
+  ) {
+    return this.outreach.queue(req.organizationId, id, dto);
+  }
+
+  @Post('outreach/:id/send')
+  sendOutreach(@Req() req: ScopedRequest, @Param('id') id: string) {
+    return this.outreach.send(req.organizationId, req.user.userId, id);
+  }
+
+  @Post('outreach/:id/skip')
+  skipOutreach(@Req() req: ScopedRequest, @Param('id') id: string) {
+    return this.outreach.skip(req.organizationId, req.user.userId, id);
   }
 
   // ---------------------------------------------------------------------

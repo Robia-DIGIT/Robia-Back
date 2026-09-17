@@ -35,6 +35,7 @@ export class FakeOdcPrisma {
   scoreLines = new Map<string, FakeRecord>();
   historyEvents = new Map<string, FakeRecord>();
   actionItems = new Map<string, FakeRecord>();
+  outreaches = new Map<string, FakeRecord>();
   private seq = 0;
 
   private id(prefix: string): string {
@@ -105,6 +106,30 @@ export class FakeOdcPrisma {
       result.program = program
         ? this.programWithRelations(program, include.program.include)
         : null;
+    }
+    return result;
+  }
+
+  private outreachWithRelations(
+    outreach: FakeRecord,
+    include?: {
+      application?: { include?: { applicant?: unknown } };
+      program?: unknown;
+    },
+  ): FakeRecord {
+    const result: FakeRecord = { ...outreach };
+    if (include?.application) {
+      const application = this.applications.get(
+        outreach.applicationId as string,
+      );
+      result.application = application
+        ? this.applicationWithRelations(application, {
+            applicant: include.application.include?.applicant,
+          })
+        : null;
+    }
+    if (include?.program) {
+      result.program = this.programs.get(outreach.programId as string) ?? null;
     }
     return result;
   }
@@ -376,16 +401,35 @@ export class FakeOdcPrisma {
       include,
       orderBy,
     }: {
-      where: { organizationId?: string; programId?: string };
+      where: {
+        organizationId?: string;
+        programId?: string;
+        id?: string | { in: string[] };
+      };
       include?: Parameters<FakeOdcPrisma['applicationWithRelations']>[1];
       orderBy?: { updatedAt?: 'asc' | 'desc' };
     }) => {
-      let records = Array.from(this.applications.values()).filter(
-        (a) =>
-          (where.organizationId === undefined ||
-            a.organizationId === where.organizationId) &&
-          (where.programId === undefined || a.programId === where.programId),
-      );
+      let records = Array.from(this.applications.values()).filter((a) => {
+        if (
+          where.organizationId !== undefined &&
+          a.organizationId !== where.organizationId
+        ) {
+          return false;
+        }
+        if (where.programId !== undefined && a.programId !== where.programId) {
+          return false;
+        }
+        if (typeof where.id === 'string' && a.id !== where.id) return false;
+        if (
+          where.id &&
+          typeof where.id === 'object' &&
+          Array.isArray(where.id.in) &&
+          !where.id.in.includes(a.id as string)
+        ) {
+          return false;
+        }
+        return true;
+      });
       if (orderBy?.updatedAt === 'desc') {
         records = records.sort(
           (a, b) =>
@@ -481,6 +525,116 @@ export class FakeOdcPrisma {
       };
       this.historyEvents.set(id, record);
       return record;
+    },
+    createMany: ({ data }: { data: FakeRecord[] }) => {
+      for (const item of data) {
+        this.odcHistoryEvent.create({ data: item });
+      }
+      return { count: data.length };
+    },
+  };
+
+  odcOutreach = {
+    create: ({
+      data,
+      include,
+    }: {
+      data: FakeRecord;
+      include?: { application?: { include?: { applicant?: unknown } } };
+    }) => {
+      const clash = Array.from(this.outreaches.values()).find(
+        (row) => row.applicationId === data.applicationId,
+      );
+      if (clash) {
+        throw new Prisma.PrismaClientKnownRequestError(
+          'Unique constraint failed',
+          { code: 'P2002', clientVersion: '7.8.0' },
+        );
+      }
+      const id = this.id('outreach');
+      const record: FakeRecord = {
+        id,
+        status: 'queued',
+        templateKey: 'odc_candidate_invite',
+        approvedById: null,
+        sentAt: null,
+        lastError: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        ...normalizeJsonSentinels(data),
+      };
+      this.outreaches.set(id, record);
+      return this.outreachWithRelations(record, include);
+    },
+    findFirst: ({
+      where,
+      include,
+    }: {
+      where: { id?: string; organizationId?: string };
+      include?: {
+        application?: { include?: { applicant?: unknown } };
+        program?: unknown;
+      };
+    }) => {
+      const record = Array.from(this.outreaches.values()).find(
+        (row) =>
+          (where.id === undefined || row.id === where.id) &&
+          (where.organizationId === undefined ||
+            row.organizationId === where.organizationId),
+      );
+      return record ? this.outreachWithRelations(record, include) : null;
+    },
+    findMany: ({
+      where,
+      include,
+      orderBy,
+    }: {
+      where: { organizationId?: string; programId?: string };
+      include?: { application?: { include?: { applicant?: unknown } } };
+      orderBy?: { sortOrder?: 'asc' | 'desc' };
+    }) => {
+      let records = Array.from(this.outreaches.values()).filter(
+        (row) =>
+          (where.organizationId === undefined ||
+            row.organizationId === where.organizationId) &&
+          (where.programId === undefined || row.programId === where.programId),
+      );
+      if (orderBy?.sortOrder === 'asc') {
+        records = records.sort(
+          (a, b) => (a.sortOrder as number) - (b.sortOrder as number),
+        );
+      }
+      return records.map((record) =>
+        this.outreachWithRelations(record, include),
+      );
+    },
+    count: ({
+      where,
+    }: {
+      where: { organizationId?: string; programId?: string };
+    }) => {
+      return Array.from(this.outreaches.values()).filter(
+        (row) =>
+          (where.organizationId === undefined ||
+            row.organizationId === where.organizationId) &&
+          (where.programId === undefined || row.programId === where.programId),
+      ).length;
+    },
+    update: ({
+      where,
+      data,
+      include,
+    }: {
+      where: { id: string };
+      data: FakeRecord;
+      include?: { application?: { include?: { applicant?: unknown } } };
+    }) => {
+      const record = this.outreaches.get(where.id);
+      if (!record) throw new Error('FakeOdcPrisma: outreach not found');
+      Object.assign(record, normalizeJsonSentinels(data), {
+        updatedAt: new Date(),
+      });
+      return this.outreachWithRelations(record, include);
     },
   };
 
