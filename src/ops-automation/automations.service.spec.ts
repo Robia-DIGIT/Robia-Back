@@ -18,6 +18,7 @@ import {
   MAX_STEPS_PER_AUTOMATION,
   MAX_TRIGGER_DEPTH,
 } from './automation.constants';
+import { computeNextOccurrence } from './cron-schedule';
 import type { AutomationConditionContext } from './condition-engine';
 
 // ---------------------------------------------------------------------
@@ -640,6 +641,389 @@ describe('AutomationsService', () => {
   });
 
   // ---------------------------------------------------------------------
+  // RC-25: scheduled triggers — nextRunAt computation
+  // ---------------------------------------------------------------------
+
+  describe('scheduled trigger — nextRunAt', () => {
+    function scheduledDto(
+      overrides: Partial<Parameters<AutomationsService['create']>[2]> = {},
+    ) {
+      return createDto({
+        trigger: {
+          type: 'scheduled',
+          cronExpression: '0 9 * * 1', // every Monday, 9am
+          timezone: 'Indian/Antananarivo',
+        },
+        enabled: true,
+        ...overrides,
+      });
+    }
+
+    it('computes nextRunAt on create for an enabled scheduled automation', async () => {
+      const automation = await service.create(orgA, userA, scheduledDto());
+      expect(automation.nextRunAt).toEqual(
+        computeNextOccurrence('0 9 * * 1', 'Indian/Antananarivo', new Date()),
+      );
+    });
+
+    it('never sets nextRunAt for a disabled scheduled automation', async () => {
+      const automation = await service.create(
+        orgA,
+        userA,
+        scheduledDto({ enabled: false }),
+      );
+      expect(automation.nextRunAt).toBeNull();
+    });
+
+    it('never sets nextRunAt for a manual trigger', async () => {
+      const automation = await service.create(orgA, userA, createDto());
+      expect(automation.nextRunAt).toBeNull();
+    });
+
+    it('never sets nextRunAt for an event trigger', async () => {
+      const automation = await service.create(
+        orgA,
+        userA,
+        createDto({ trigger: { type: 'event', eventType: 'audit.completed' } }),
+      );
+      expect(automation.nextRunAt).toBeNull();
+    });
+
+    it('rejects an invalid cron expression', async () => {
+      await expect(
+        service.create(
+          orgA,
+          userA,
+          scheduledDto({
+            trigger: {
+              type: 'scheduled',
+              cronExpression: 'not a cron',
+              timezone: 'UTC',
+            },
+          }),
+        ),
+      ).rejects.toBeInstanceOf(AutomationValidationError);
+    });
+
+    it('rejects an invalid IANA timezone', async () => {
+      await expect(
+        service.create(
+          orgA,
+          userA,
+          scheduledDto({
+            trigger: {
+              type: 'scheduled',
+              cronExpression: '0 9 * * 1',
+              timezone: 'Not/AZone',
+            },
+          }),
+        ),
+      ).rejects.toBeInstanceOf(AutomationValidationError);
+    });
+
+    it('defaults to UTC when no timezone is given', async () => {
+      const automation = await service.create(
+        orgA,
+        userA,
+        scheduledDto({
+          trigger: { type: 'scheduled', cronExpression: '0 9 * * 1' },
+        }),
+      );
+      expect(automation.trigger).toMatchObject({ timezone: 'UTC' });
+      expect(automation.nextRunAt).toEqual(
+        computeNextOccurrence('0 9 * * 1', 'UTC', new Date()),
+      );
+    });
+
+    it('recomputes nextRunAt when the cron expression is edited', async () => {
+      const automation = await service.create(orgA, userA, scheduledDto());
+      const updated = await service.update(orgA, automation.id, {
+        trigger: {
+          type: 'scheduled',
+          cronExpression: '0 10 * * 2', // Tuesday, 10am now
+          timezone: 'Indian/Antananarivo',
+        },
+      });
+      expect(updated.nextRunAt).toEqual(
+        computeNextOccurrence('0 10 * * 2', 'Indian/Antananarivo', new Date()),
+      );
+      expect(updated.nextRunAt).not.toEqual(automation.nextRunAt);
+    });
+
+    it('recomputes nextRunAt when only the timezone is edited', async () => {
+      const automation = await service.create(orgA, userA, scheduledDto());
+      const updated = await service.update(orgA, automation.id, {
+        trigger: {
+          type: 'scheduled',
+          cronExpression: '0 9 * * 1',
+          timezone: 'Europe/Paris',
+        },
+      });
+      expect(updated.nextRunAt).toEqual(
+        computeNextOccurrence('0 9 * * 1', 'Europe/Paris', new Date()),
+      );
+      expect(updated.nextRunAt).not.toEqual(automation.nextRunAt);
+    });
+
+    // RC-25 second review fix: update() always rewrites nextRunAt from the
+    // effective post-update state, so any scheduler claim in flight for the
+    // *previous* nextRunAt is necessarily stale the instant this commits —
+    // AutomationSchedulerService's own re-fetch relies on this being
+    // cleared here, not left for the claim's lease to expire.
+    it('clears an in-flight scheduler claim (scheduledClaimedAt) whenever update() rewrites nextRunAt', async () => {
+      const automation = await service.create(orgA, userA, scheduledDto());
+      const record = prisma.automations.get(automation.id)!;
+      record.scheduledClaimedAt = new Date('2026-09-21T06:05:00.000Z');
+
+      const updated = await service.update(orgA, automation.id, {
+        trigger: {
+          type: 'scheduled',
+          cronExpression: '0 10 * * 2',
+          timezone: 'Indian/Antananarivo',
+        },
+      });
+
+      expect(updated.scheduledClaimedAt).toBeNull();
+    });
+
+    it('clears an in-flight scheduler claim (scheduledClaimedAt) whenever setEnabled() rewrites nextRunAt', async () => {
+      const automation = await service.create(orgA, userA, scheduledDto());
+      const record = prisma.automations.get(automation.id)!;
+      record.scheduledClaimedAt = new Date('2026-09-21T06:05:00.000Z');
+
+      const disabled = await service.setEnabled(orgA, automation.id, false);
+      expect(disabled.scheduledClaimedAt).toBeNull();
+
+      record.scheduledClaimedAt = new Date('2026-09-21T06:06:00.000Z');
+      const reenabled = await service.setEnabled(orgA, automation.id, true);
+      expect(reenabled.scheduledClaimedAt).toBeNull();
+    });
+
+    it('clears nextRunAt when the trigger type changes away from scheduled', async () => {
+      const automation = await service.create(orgA, userA, scheduledDto());
+      expect(automation.nextRunAt).not.toBeNull();
+
+      const updated = await service.update(orgA, automation.id, {
+        trigger: { type: 'manual' },
+      });
+      expect(updated.nextRunAt).toBeNull();
+    });
+
+    it('sets nextRunAt when a scheduled automation is enabled via setEnabled()', async () => {
+      const automation = await service.create(
+        orgA,
+        userA,
+        scheduledDto({ enabled: false }),
+      );
+      expect(automation.nextRunAt).toBeNull();
+
+      const enabled = await service.setEnabled(orgA, automation.id, true);
+      expect(enabled.nextRunAt).toEqual(
+        computeNextOccurrence('0 9 * * 1', 'Indian/Antananarivo', new Date()),
+      );
+    });
+
+    it('clears nextRunAt when a scheduled automation is disabled via setEnabled()', async () => {
+      const automation = await service.create(orgA, userA, scheduledDto());
+      expect(automation.nextRunAt).not.toBeNull();
+
+      const disabled = await service.setEnabled(orgA, automation.id, false);
+      expect(disabled.nextRunAt).toBeNull();
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // RC-25 hardening fix: the persisted timezone invariant.
+  //   - scheduled: always a non-null timezone, UTC by default.
+  //   - event / manual: always null — never a residual value from a prior
+  //     scheduled trigger.
+  // See AutomationsService.resolveTriggerTimezone().
+  // ---------------------------------------------------------------------
+
+  describe('trigger timezone invariant', () => {
+    function scheduledDto(
+      overrides: Partial<Parameters<AutomationsService['create']>[2]> = {},
+    ) {
+      return createDto({
+        trigger: {
+          type: 'scheduled',
+          cronExpression: '0 9 * * 1',
+          timezone: 'Indian/Antananarivo',
+        },
+        enabled: true,
+        ...overrides,
+      });
+    }
+
+    it('persists a null timezone for a manual trigger created with no timezone', async () => {
+      const automation = await service.create(orgA, userA, createDto());
+      expect(automation.trigger).toMatchObject({
+        type: 'manual',
+        timezone: null,
+      });
+    });
+
+    it('persists a null timezone for an event trigger created with no timezone', async () => {
+      const automation = await service.create(
+        orgA,
+        userA,
+        createDto({ trigger: { type: 'event', eventType: 'audit.completed' } }),
+      );
+      expect(automation.trigger).toMatchObject({
+        type: 'event',
+        timezone: null,
+      });
+    });
+
+    it('clears the timezone when a scheduled trigger is switched to event', async () => {
+      const automation = await service.create(orgA, userA, scheduledDto());
+      expect(automation.trigger).toMatchObject({
+        timezone: 'Indian/Antananarivo',
+      });
+
+      const updated = await service.update(orgA, automation.id, {
+        trigger: { type: 'event', eventType: 'audit.completed' },
+      });
+
+      expect(updated.trigger).toMatchObject({ type: 'event', timezone: null });
+      expect(updated.trigger?.cronExpression).toBeNull();
+      expect(updated.nextRunAt).toBeNull();
+    });
+
+    it('clears the timezone when a scheduled trigger is switched to manual', async () => {
+      const automation = await service.create(orgA, userA, scheduledDto());
+
+      const updated = await service.update(orgA, automation.id, {
+        trigger: { type: 'manual' },
+      });
+
+      expect(updated.trigger).toMatchObject({ type: 'manual', timezone: null });
+      expect(updated.trigger?.cronExpression).toBeNull();
+      expect(updated.nextRunAt).toBeNull();
+    });
+
+    it('defaults to UTC when a non-scheduled trigger is switched to scheduled with no timezone given', async () => {
+      const automation = await service.create(orgA, userA, createDto());
+      expect(automation.trigger).toMatchObject({
+        type: 'manual',
+        timezone: null,
+      });
+
+      const updated = await service.update(orgA, automation.id, {
+        trigger: { type: 'scheduled', cronExpression: '0 9 * * 1' },
+      });
+
+      expect(updated.trigger).toMatchObject({
+        type: 'scheduled',
+        timezone: 'UTC',
+      });
+    });
+
+    it('keeps the existing timezone when a scheduled trigger is updated without a new timezone', async () => {
+      const automation = await service.create(orgA, userA, scheduledDto());
+      expect(automation.trigger).toMatchObject({
+        timezone: 'Indian/Antananarivo',
+      });
+
+      const updated = await service.update(orgA, automation.id, {
+        trigger: { type: 'scheduled', cronExpression: '0 10 * * 2' },
+      });
+
+      expect(updated.trigger).toMatchObject({
+        type: 'scheduled',
+        timezone: 'Indian/Antananarivo',
+      });
+    });
+
+    it('never reuses a residual timezone left on a historically inconsistent non-scheduled trigger', async () => {
+      const automation = await service.create(orgA, userA, createDto());
+      // Simulate pre-hardening inconsistent data: a manual trigger whose
+      // timezone column was never null'd out (the historical default was
+      // 'UTC' for every trigger type, not just scheduled — see the RC-25
+      // hardening migration). This must never surface as "the existing
+      // timezone" once switched to scheduled.
+      const triggerRecord = prisma.triggers.get(automation.id)!;
+      triggerRecord.timezone = 'Europe/Paris';
+
+      const updated = await service.update(orgA, automation.id, {
+        trigger: { type: 'scheduled', cronExpression: '0 9 * * 1' },
+      });
+
+      expect(updated.trigger).toMatchObject({
+        type: 'scheduled',
+        timezone: 'UTC',
+      });
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // RC-25: triggerScheduled() — the dispatcher's own entry point into the
+  // engine. It's a thin wrapper over the same startRun() every other
+  // trigger type uses, so these tests only prove the wiring (trigger type,
+  // dedupKey shape) — approval/plannedSteps/idempotency guarantees
+  // themselves are already covered generically above.
+  // ---------------------------------------------------------------------
+
+  describe('triggerScheduled', () => {
+    it('creates a run with triggerType "scheduled" and a deterministic dedupKey', async () => {
+      const automation = await service.create(orgA, userA, createDto());
+      const scheduledFor = new Date('2026-09-21T06:00:00.000Z');
+
+      const run = await service.triggerScheduled(automation, scheduledFor);
+
+      expect(run.triggerType).toBe('scheduled');
+      expect(run.dedupKey).toBe(
+        `automation:${automation.id}:scheduled:2026-09-21T06:00:00.000Z`,
+      );
+      expect(run.status).toBe('succeeded');
+    });
+
+    it('deduplicates two calls for the exact same scheduledFor into one run', async () => {
+      const automation = await service.create(orgA, userA, createDto());
+      const scheduledFor = new Date('2026-09-21T06:00:00.000Z');
+
+      const first = await service.triggerScheduled(automation, scheduledFor);
+      const second = await service.triggerScheduled(automation, scheduledFor);
+
+      expect(second.id).toBe(first.id);
+      expect(
+        prisma.runs.size, // only one run row was ever created
+      ).toBe(1);
+    });
+
+    it('creates a distinct run for a different scheduledFor', async () => {
+      const automation = await service.create(orgA, userA, createDto());
+
+      const first = await service.triggerScheduled(
+        automation,
+        new Date('2026-09-21T06:00:00.000Z'),
+      );
+      const second = await service.triggerScheduled(
+        automation,
+        new Date('2026-09-28T06:00:00.000Z'),
+      );
+
+      expect(second.id).not.toBe(first.id);
+    });
+
+    it('respects requiresApproval — a scheduled run waits for approval like any other', async () => {
+      const automation = await service.create(
+        orgA,
+        userA,
+        createDto({ requiresApproval: true }),
+      );
+
+      const run = await service.triggerScheduled(
+        automation,
+        new Date('2026-09-21T06:00:00.000Z'),
+      );
+
+      expect(run.status).toBe('waiting_approval');
+      expect(run.plannedSteps).not.toBeNull();
+    });
+  });
+
+  // ---------------------------------------------------------------------
   // Organization isolation / unauthorized access
   // ---------------------------------------------------------------------
 
@@ -1022,6 +1406,7 @@ describe('AutomationsService', () => {
       'robia.action_items.create_internal_task',
       orgA,
       { title: 'Original' },
+      expect.objectContaining({ automationId: automation.id, runId: run.id }),
     );
     expect(approved.steps[0].input).toEqual({ title: 'Original' });
   });
@@ -1056,6 +1441,7 @@ describe('AutomationsService', () => {
         'robia.action_items.create_internal_task',
         orgA,
         { title: 'x' },
+        expect.objectContaining({ automationId: automation.id, runId: run.id }),
       );
     });
 
@@ -1237,6 +1623,10 @@ describe('AutomationsService', () => {
         'robia.opportunities.regenerate',
         orgA,
         { auditId: 'audit-real-id' },
+        expect.objectContaining({
+          automationId: automation.id,
+          runId: runs[0].id,
+        }),
       );
       expect(runs[0].steps[0].input).toEqual({ auditId: 'audit-real-id' });
     });
@@ -1282,6 +1672,10 @@ describe('AutomationsService', () => {
         'robia.opportunities.regenerate',
         orgA,
         { auditId: 'audit-123' },
+        expect.objectContaining({
+          automationId: run.automationId,
+          runId: run.id,
+        }),
       );
       expect(approved.steps[0].input).toEqual({ auditId: 'audit-123' });
     });

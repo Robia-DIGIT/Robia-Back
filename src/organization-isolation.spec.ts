@@ -1,4 +1,5 @@
 import { NotFoundException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PinoLogger } from 'nestjs-pino';
 import { ActionItemsService } from './action-items/action-items.service';
@@ -125,6 +126,7 @@ describe('Organization isolation', () => {
       {} as unknown as OpportunityGeneratorService,
       {} as unknown as N8nWebhookService,
       {} as unknown as IntelligenceRegistryService,
+      {} as unknown as ConfigService,
     );
 
     await expect(

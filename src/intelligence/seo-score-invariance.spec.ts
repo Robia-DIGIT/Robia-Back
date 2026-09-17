@@ -108,6 +108,7 @@ describe('seo_score_v2 invariance through the real Unified Intelligence Core (RC
       generator,
       webhooks,
       registry,
+      config,
     );
   }
 
