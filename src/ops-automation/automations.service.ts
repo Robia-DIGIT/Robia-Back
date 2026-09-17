@@ -22,9 +22,17 @@ import { AutomationContextService } from './automation-context.service';
 import { resolveStepInput } from './automation-templating';
 import {
   InvalidOpsActionInputError,
+  OpsActionEvidence,
   OpsActionsRegistryService,
   UnknownOpsActionError,
 } from './actions/ops-actions-registry.service';
+import {
+  MAX_STEP_ATTEMPTS,
+  STEP_RETRY_BACKOFF_MS,
+  STEP_RETRY_CLAIM_LEASE_MS,
+  dueStepRetryWhere,
+  isPermanentStepError,
+} from './step-retry-policy';
 import {
   AutomationLoopError,
   AutomationRunConflictError,
@@ -740,17 +748,30 @@ export class AutomationsService {
         `Automation exceeds the maximum of ${MAX_STEPS_PER_AUTOMATION} steps.`,
       );
     }
+    return this.runStepsFrom(run, steps, 0);
+  }
 
-    // Never re-resolve a {{event.<key>}} placeholder here: startRun() already
-    // resolved every step's input against the triggering event's payload
-    // before persisting plannedSteps, precisely so that what an approver
-    // reads on a waiting_approval run IS the value that executes — re-doing
-    // the resolution at this point would defeat that guarantee. This is the
-    // final, already-canonical, already-resolved input, used verbatim.
-    let sequence = 0;
-    for (const step of steps) {
-      sequence += 1;
-      const resolvedInput = step.input;
+  // RC-27 — executes plannedSteps[startIndex..] in order, creating a fresh
+  // AutomationStepRun for each one. Shared by two entry points: executeSteps()
+  // above (startIndex 0, at initial trigger/approval time) and retryStep()
+  // below (startIndex = the sequence right after a step whose own retry just
+  // succeeded) — so "resume after a retry" and "run from the start" are
+  // exactly the same code path, never a second, divergent implementation.
+  //
+  // Never re-resolve a {{event.<key>}} placeholder here: startRun() already
+  // resolved every step's input against the triggering event's payload
+  // before persisting plannedSteps, precisely so that what an approver reads
+  // on a waiting_approval run IS the value that executes. This is the final,
+  // already-canonical, already-resolved input, used verbatim on every
+  // attempt, initial or retried.
+  private async runStepsFrom(
+    run: AutomationRunWithSteps,
+    steps: StoredAutomationStep[],
+    startIndex: number,
+  ): Promise<AutomationRunWithSteps> {
+    for (let index = startIndex; index < steps.length; index++) {
+      const step = steps[index];
+      const sequence = index + 1;
 
       if (!this.actionsRegistry.isAllowed(step.actionType)) {
         await this.prisma.automationStepRun.create({
@@ -758,7 +779,7 @@ export class AutomationsService {
             runId: run.id,
             sequence,
             actionType: step.actionType,
-            input: (resolvedInput ?? Prisma.JsonNull) as Prisma.InputJsonValue,
+            input: (step.input ?? Prisma.JsonNull) as Prisma.InputJsonValue,
             status: 'failed',
             error: `Action type "${step.actionType}" is not in the Ops action allowlist.`,
             startedAt: new Date(),
@@ -777,48 +798,211 @@ export class AutomationsService {
           runId: run.id,
           sequence,
           actionType: step.actionType,
-          input: (resolvedInput ?? Prisma.JsonNull) as Prisma.InputJsonValue,
+          input: (step.input ?? Prisma.JsonNull) as Prisma.InputJsonValue,
           status: 'running',
           startedAt: new Date(),
+          attemptCount: 1,
         },
       });
 
-      try {
-        const evidence = await this.actionsRegistry.execute(
-          step.actionType,
-          run.organizationId,
-          resolvedInput,
-          {
-            automationId: run.automationId,
-            runId: run.id,
-            stepRunId: stepRun.id,
-          },
-        );
+      const result = await this.attemptStep(run, stepRun.id, step);
+      if (result.ok) {
         await this.prisma.automationStepRun.update({
           where: { id: stepRun.id },
           data: {
             status: 'succeeded',
-            evidence: redactSensitive(evidence) as Prisma.InputJsonValue,
+            evidence: redactSensitive(result.evidence) as Prisma.InputJsonValue,
             finishedAt: new Date(),
           },
         });
-      } catch (error) {
-        const rawMessage =
-          error instanceof Error ? error.message : String(error);
-        const cleanedMessage = redactSensitive(rawMessage) as string;
+        continue;
+      }
+
+      if (result.permanent || 1 >= MAX_STEP_ATTEMPTS) {
         await this.prisma.automationStepRun.update({
           where: { id: stepRun.id },
           data: {
             status: 'failed',
-            error: cleanedMessage,
+            error: result.message,
             finishedAt: new Date(),
           },
         });
-        return this.finishRun(run.id, 'failed', cleanedMessage);
+        return this.finishRun(run.id, 'failed', result.message);
       }
+
+      // Transient failure, retries remain: schedule this step's first retry
+      // instead of failing the whole run. AutomationStepRetryDispatcherService
+      // picks it up once due; execution then resumes right here — via
+      // retryStep() calling this same method — never re-creating this
+      // AutomationStepRun row and never re-attempting an already-succeeded
+      // earlier step.
+      await this.prisma.automationStepRun.update({
+        where: { id: stepRun.id },
+        data: {
+          status: 'retry_scheduled',
+          error: result.message,
+          nextAttemptAt: new Date(Date.now() + STEP_RETRY_BACKOFF_MS[0]),
+        },
+      });
+      return this.refetchRun(run.id);
     }
 
     return this.finishRun(run.id, 'succeeded');
+  }
+
+  // Runs one step's action, never throwing — every outcome (success,
+  // permanent failure, retryable failure) is returned as data so callers
+  // (runStepsFrom() and retryStep()) can each decide what a failure means
+  // for the run without duplicating the try/catch or the error
+  // classification/redaction.
+  private async attemptStep(
+    run: Pick<AutomationRunWithSteps, 'id' | 'organizationId' | 'automationId'>,
+    stepRunId: string,
+    step: StoredAutomationStep,
+  ): Promise<
+    | { ok: true; evidence: OpsActionEvidence }
+    | { ok: false; permanent: boolean; message: string }
+  > {
+    try {
+      const evidence = await this.actionsRegistry.execute(
+        step.actionType,
+        run.organizationId,
+        step.input,
+        {
+          automationId: run.automationId,
+          runId: run.id,
+          stepRunId,
+        },
+      );
+      return { ok: true, evidence };
+    } catch (error) {
+      const rawMessage = error instanceof Error ? error.message : String(error);
+      return {
+        ok: false,
+        permanent: isPermanentStepError(error),
+        message: redactSensitive(rawMessage) as string,
+      };
+    }
+  }
+
+  private async refetchRun(runId: string): Promise<AutomationRunWithSteps> {
+    const run = await this.prisma.automationRun.findFirst({
+      where: { id: runId },
+      include: { steps: { orderBy: { sequence: 'asc' } } },
+    });
+    if (!run) {
+      throw new NotFoundException('Run non trouvé.');
+    }
+    return run;
+  }
+
+  // RC-27 — called by AutomationStepRetryDispatcherService for one due
+  // AutomationStepRun at a time. Two-phase claim, mirroring RC-25's
+  // AutomationSchedulerService and RC-26's NotificationDispatcherService:
+  //
+  // 1. Claim: a conditional UPDATE moves the row to 'running' and sets
+  //    claimedAt = now, gated on dueStepRetryWhere() (lease free/stale) and
+  //    attemptCount still under budget. Picks a single winner among
+  //    concurrent dispatcher instances/ticks the same way Postgres
+  //    serializes two concurrent UPDATEs on the same row. attemptCount is
+  //    incremented right here, not at finalize time, so a crash mid-attempt
+  //    still counts as spent (same discipline as RC-26).
+  // 2. Re-fetch: confirms this call actually holds the claim it just won.
+  // 3. Attempt: via the same attemptStep() every other step uses. On
+  //    success, execution resumes with runStepsFrom() for whatever steps
+  //    remain — this is the only place a run continues past a step that
+  //    once failed. On failure, either reschedules another retry (with the
+  //    next backoff tier) or — permanent error, or attempts exhausted —
+  //    fails the run outright, exactly like the very first attempt would.
+  //
+  // Never throws: one step's retry failing to even claim (lost the race, or
+  // no longer due) is not an error, it's simply "nothing to do this tick" —
+  // the caller (AutomationStepRetryDispatcherService) treats an actual thrown
+  // error as its own, separate, per-row failure to catch and log.
+  async retryStep(stepRunId: string, now: Date): Promise<void> {
+    const staleThreshold = new Date(now.getTime() - STEP_RETRY_CLAIM_LEASE_MS);
+    const claim = await this.prisma.automationStepRun.updateMany({
+      where: {
+        id: stepRunId,
+        ...dueStepRetryWhere(now, staleThreshold),
+        attemptCount: { lt: MAX_STEP_ATTEMPTS },
+      },
+      data: {
+        status: 'running',
+        claimedAt: now,
+        startedAt: now,
+        nextAttemptAt: null,
+        attemptCount: { increment: 1 },
+      },
+    });
+    if (claim.count === 0) {
+      return;
+    }
+
+    const fresh = await this.prisma.automationStepRun.findFirst({
+      where: { id: stepRunId },
+    });
+    if (
+      !fresh ||
+      fresh.status !== 'running' ||
+      fresh.claimedAt?.getTime() !== now.getTime()
+    ) {
+      return;
+    }
+
+    const run = await this.prisma.automationRun.findFirst({
+      where: { id: fresh.runId },
+      include: { steps: { orderBy: { sequence: 'asc' } } },
+    });
+    if (!run) {
+      return;
+    }
+    const steps = readStoredSteps(run.plannedSteps);
+    const step = steps[fresh.sequence - 1];
+    if (!step) {
+      return;
+    }
+
+    const result = await this.attemptStep(run, fresh.id, step);
+    if (result.ok) {
+      await this.prisma.automationStepRun.updateMany({
+        where: { id: fresh.id, claimedAt: now },
+        data: {
+          status: 'succeeded',
+          evidence: redactSensitive(result.evidence) as Prisma.InputJsonValue,
+          finishedAt: now,
+          claimedAt: null,
+        },
+      });
+      await this.runStepsFrom(run, steps, fresh.sequence);
+      return;
+    }
+
+    if (result.permanent || fresh.attemptCount >= MAX_STEP_ATTEMPTS) {
+      await this.prisma.automationStepRun.updateMany({
+        where: { id: fresh.id, claimedAt: now },
+        data: {
+          status: 'failed',
+          error: result.message,
+          finishedAt: now,
+          claimedAt: null,
+        },
+      });
+      await this.finishRun(run.id, 'failed', result.message);
+      return;
+    }
+
+    await this.prisma.automationStepRun.updateMany({
+      where: { id: fresh.id, claimedAt: now },
+      data: {
+        status: 'retry_scheduled',
+        error: result.message,
+        nextAttemptAt: new Date(
+          now.getTime() + STEP_RETRY_BACKOFF_MS[fresh.attemptCount - 1],
+        ),
+        claimedAt: null,
+      },
+    });
   }
 
   private async finishRun(
