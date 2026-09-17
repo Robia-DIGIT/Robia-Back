@@ -470,10 +470,14 @@ model AutomationTrigger {
   cronExpression String?  @map("cron_expression") // for type: scheduled
   // IANA zone (e.g. "Indian/Antananarivo", "Europe/Paris", "UTC") the
   // cronExpression is evaluated in — never inferred from the org's
-  // city/country. Defaults to UTC for pre-RC25 rows. See RC25's
-  // cron-schedule.ts for the strict validation (Intl-based, not left to
-  // cron-parser's own unclear error on an invalid zone).
-  timezone       String   @default("UTC") @map("timezone")
+  // city/country. Persisted invariant (RC-25 hardening fix): non-null (UTC
+  // by default) for a `scheduled` trigger, always null for `event`/`manual`
+  // — a residual value from a prior scheduled trigger is never carried over
+  // when a trigger's type changes. See AutomationsService's
+  // resolveTriggerTimezone() and RC25's cron-schedule.ts for the strict
+  // cron/timezone validation (Intl-based, not left to cron-parser's own
+  // unclear error on an invalid zone).
+  timezone       String?  @map("timezone")
   eventType      String?  @map("event_type")      // for type: event, e.g. "audit.completed"
   config         Json?    // extra, non-sensitive trigger config
   createdAt      DateTime @default(now()) @map("created_at")

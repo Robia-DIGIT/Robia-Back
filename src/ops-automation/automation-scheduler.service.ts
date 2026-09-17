@@ -5,6 +5,10 @@ import { AutomationsService } from './automations.service';
 import { computeNextOccurrence } from './cron-schedule';
 import { redactSensitive } from '../common/logging/redact';
 import { AutomationWithTrigger } from './automation.types';
+import {
+  SCHEDULER_MAX_BATCH_SIZE,
+  SCHEDULER_MAX_CONCURRENCY,
+} from './automation.constants';
 
 // How long a claim lease is honored before another dispatcher instance may
 // reclaim the same occurrence. Must comfortably exceed how long a single
@@ -53,6 +57,21 @@ const SCHEDULED_CLAIM_LEASE_MS = 5 * 60 * 1000;
  *    (the recomputed value is always anchored at the tick's `now`, never
  *    incremented from `scheduledFor`).
  *
+ * Bounded concurrency within a tick (RC-25 hardening fix): the due-set is
+ * sorted oldest-`nextRunAt`-first (id as a deterministic tie-breaker), the
+ * first `SCHEDULER_MAX_BATCH_SIZE` are taken as this tick's batch — anything
+ * beyond that waits for the next tick, its own nextRunAt untouched, exactly
+ * like an occurrence that lost the claim race — and the batch is worked by
+ * up to `SCHEDULER_MAX_CONCURRENCY` automations at a time, never all of it
+ * as one unbounded `Promise.allSettled`. Each automation's own Phase 1-4
+ * claim/re-fetch/execute/advance above is entirely independent per row, so
+ * running several concurrently introduces no new hazard: the same
+ * Postgres-serialized CAS that makes two dispatcher *instances* safe (see
+ * above) equally makes two automations processed *concurrently by one
+ * instance* safe. One automation's failure is caught right where it always
+ * was, per automation, so it can never stop its concurrent siblings, let
+ * alone the rest of the batch.
+ *
  * See docs/RC25_SCHEDULED_AUTOMATIONS.md for the full reasoning.
  */
 @Injectable()
@@ -91,22 +110,63 @@ export class AutomationSchedulerService {
       include: { trigger: true },
     });
 
-    for (const automation of due) {
-      try {
-        await this.processDueAutomation(automation, now, staleLeaseThreshold);
-      } catch (error) {
-        // One automation's failure — a bad cron expression that somehow got
-        // persisted, a transient DB error, anything — must never stop the
-        // rest of this tick from being processed.
-        this.logger.warn(
-          `Scheduler : échec du traitement de l'automation ${automation.id} (organization=${automation.organizationId}) : ${
-            redactSensitive(
-              error instanceof Error ? error.message : 'erreur inconnue',
-            ) as string
-          }`,
-        );
+    // Deterministic order — oldest due occurrence first, id as a stable
+    // tie-breaker — so which automations make this tick's bounded batch,
+    // and in what order they're attempted, never depends on the DB's own
+    // unspecified row order.
+    const ordered = [...due].sort((a, b) => {
+      const at = a.nextRunAt?.getTime() ?? 0;
+      const bt = b.nextRunAt?.getTime() ?? 0;
+      if (at !== bt) return at - bt;
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    });
+    // Bounded batch: whatever doesn't fit is left for the next tick, in the
+    // same oldest-first order — see the class doc's "Bounded concurrency".
+    const batch = ordered.slice(0, SCHEDULER_MAX_BATCH_SIZE);
+
+    await this.runWithBoundedConcurrency(
+      batch,
+      SCHEDULER_MAX_CONCURRENCY,
+      async (automation) => {
+        try {
+          await this.processDueAutomation(automation, now, staleLeaseThreshold);
+        } catch (error) {
+          // One automation's failure — a bad cron expression that somehow
+          // got persisted, a transient DB error, anything — must never stop
+          // its concurrent siblings, let alone the rest of this tick.
+          this.logger.warn(
+            `Scheduler : échec du traitement de l'automation ${automation.id} (organization=${automation.organizationId}) : ${
+              redactSensitive(
+                error instanceof Error ? error.message : 'erreur inconnue',
+              ) as string
+            }`,
+          );
+        }
+      },
+    );
+  }
+
+  // A minimal worker-pool: up to `concurrency` calls to `worker` in flight
+  // at any time, each pulling the next item off `items` as soon as it's
+  // free — never all of `items` launched at once (unbounded
+  // `Promise.allSettled`) and never strictly one-at-a-time (a plain
+  // sequential `for...await` loop, where one slow item delays every later
+  // one). No new dependency: the whole primitive is this loop.
+  private async runWithBoundedConcurrency<T>(
+    items: T[],
+    concurrency: number,
+    worker: (item: T) => Promise<void>,
+  ): Promise<void> {
+    let cursor = 0;
+    const workerCount = Math.min(concurrency, items.length);
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (cursor < items.length) {
+        const index = cursor;
+        cursor += 1;
+        await worker(items[index]);
       }
-    }
+    });
+    await Promise.all(workers);
   }
 
   private async processDueAutomation(
@@ -213,9 +273,22 @@ export class AutomationSchedulerService {
     // by another instance — can never release or overwrite that other
     // instance's claim here, even in the rare case nextRunAt happens to
     // still read back the same value.
+    // fresh.trigger.timezone is only ever null for an event/manual trigger
+    // under the persisted invariant (see AutomationsService.
+    // resolveTriggerTimezone()) — the check just above already guarantees
+    // trigger.type === 'scheduled' here, so this fallback is purely
+    // defensive against a broken invariant (corrupted data, a future bug),
+    // never the expected path; it degrades to UTC rather than crashing the
+    // whole tick, same posture as resolveNextRunAt's own degradation.
+    const timezone = fresh.trigger.timezone ?? 'UTC';
+    if (fresh.trigger.timezone === null) {
+      this.logger.warn(
+        `Scheduler : trigger scheduled sans timezone persistée pour l'automation ${automation.id} (organization=${automation.organizationId}) — repli sur UTC.`,
+      );
+    }
     const following = computeNextOccurrence(
       fresh.trigger.cronExpression,
-      fresh.trigger.timezone,
+      timezone,
       now,
     );
     await this.prisma.automation.updateMany({
@@ -252,9 +325,12 @@ export class AutomationSchedulerService {
         continue;
       }
       try {
+        // Same defensive UTC fallback as processDueAutomation() above — see
+        // its comment. trigger.type === 'scheduled' is already guaranteed
+        // by the query above.
         const next = computeNextOccurrence(
           trigger.cronExpression,
-          trigger.timezone,
+          trigger.timezone ?? 'UTC',
           now,
         );
         // Concurrency-safe: only initializes while still null, so two

@@ -81,12 +81,17 @@ export class AutomationsService {
     this.validateConditions(dto.conditions);
 
     const enabled = dto.enabled ?? false;
-    const timezone = dto.trigger.timezone ?? 'UTC';
+    const timezone = this.resolveTriggerTimezone(
+      dto.trigger.type,
+      dto.trigger.timezone,
+      null,
+      undefined,
+    );
     const nextRunAt = this.resolveNextRunAt({
       enabled,
       triggerType: dto.trigger.type,
       cronExpression: dto.trigger.cronExpression ?? null,
-      timezone,
+      timezone: timezone ?? 'UTC',
     });
 
     return this.prisma.automation.create({
@@ -156,14 +161,28 @@ export class AutomationsService {
     // type changed away from scheduled, cron/timezone edited, ...) the way
     // a per-field conditional easily could.
     const effectiveEnabled = dto.enabled ?? existing.enabled;
-    const effectiveTimezone =
-      dto.trigger?.timezone ?? existing.trigger?.timezone ?? 'UTC';
+    // RC-25 hardening fix: only actually recomputed (and only ever
+    // persisted below) when dto.trigger rewrites the trigger row — when it
+    // doesn't, the row is untouched, so the *current* persisted timezone is
+    // reused verbatim, never re-derived. See resolveTriggerTimezone() for
+    // the persisted invariant this enforces once the trigger row IS
+    // rewritten (scheduled: non-null, UTC by default; event/manual: always
+    // null; never a residual value carried over from a different trigger
+    // type).
+    const effectiveTimezone = dto.trigger
+      ? this.resolveTriggerTimezone(
+          dto.trigger.type,
+          dto.trigger.timezone,
+          existing.trigger?.timezone ?? null,
+          existing.trigger?.type,
+        )
+      : (existing.trigger?.timezone ?? null);
     const nextRunAt = this.resolveNextRunAt({
       enabled: effectiveEnabled,
       triggerType: dto.trigger?.type ?? existing.trigger?.type ?? 'manual',
       cronExpression:
         dto.trigger?.cronExpression ?? existing.trigger?.cronExpression ?? null,
-      timezone: effectiveTimezone,
+      timezone: effectiveTimezone ?? 'UTC',
     });
 
     return this.prisma.automation.update({
@@ -890,6 +909,37 @@ export class AutomationsService {
         );
       }
     }
+  }
+
+  // RC-25 hardening fix: the single place that decides what
+  // AutomationTrigger.timezone should be *persisted* as, given the trigger
+  // type actually being written and whatever timezone (if any) the caller
+  // supplied. Enforces one invariant regardless of caller:
+  //   - `scheduled`: always a non-null IANA zone — the caller's own value
+  //     if given, else the *existing* trigger's own timezone but only if
+  //     that existing trigger was ALSO `scheduled` (never resurrect a
+  //     residual/historical value left behind by an event/manual trigger —
+  //     including inconsistent pre-hardening data, which the accompanying
+  //     migration backfills to null but this guard does not rely on that
+  //     backfill having run), else 'UTC'.
+  //   - `event` / `manual`: always null — a stray timezone can never
+  //     survive a change away from `scheduled`, however it got there.
+  private resolveTriggerTimezone(
+    triggerType: string,
+    requestedTimezone: string | undefined,
+    existingTimezone: string | null,
+    existingTriggerType: string | undefined,
+  ): string | null {
+    if (triggerType !== 'scheduled') {
+      return null;
+    }
+    if (requestedTimezone) {
+      return requestedTimezone;
+    }
+    if (existingTriggerType === 'scheduled' && existingTimezone) {
+      return existingTimezone;
+    }
+    return 'UTC';
   }
 
   // The single place that decides what Automation.nextRunAt should be,

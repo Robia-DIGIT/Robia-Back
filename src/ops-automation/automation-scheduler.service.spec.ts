@@ -3,6 +3,10 @@ import { AutomationsService } from './automations.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { computeNextOccurrence } from './cron-schedule';
 import { AutomationWithTrigger } from './automation.types';
+import {
+  SCHEDULER_MAX_BATCH_SIZE,
+  SCHEDULER_MAX_CONCURRENCY,
+} from './automation.constants';
 
 interface FakeTriggerRecord {
   type: string;
@@ -654,5 +658,168 @@ describe('AutomationSchedulerService', () => {
     expect(prisma.get('manual-1')?.nextRunAt).toBeNull();
     expect(prisma.get('event-1')?.nextRunAt).toBeNull();
     expect(triggerScheduled).not.toHaveBeenCalled();
+  });
+
+  // ---------------------------------------------------------------------
+  // RC-25 hardening fix: bounded-concurrency batch processing within a
+  // single tick — SCHEDULER_MAX_CONCURRENCY in flight at a time,
+  // SCHEDULER_MAX_BATCH_SIZE attempted at most, oldest nextRunAt first.
+  // Every automation's own two-phase claim/re-fetch is untouched (proven by
+  // the existing concurrency/reclaim tests above, all still green with
+  // this batch/pool wrapped around them) — these tests only exercise the
+  // pool itself.
+  // ---------------------------------------------------------------------
+
+  describe('bounded concurrency within a tick', () => {
+    function dueAutomations(count: number, now: Date): FakeAutomationRecord[] {
+      const scheduledFor = new Date(now.getTime() - 60_000);
+      return Array.from({ length: count }, (_, i) =>
+        automation({
+          id: `automation-${i + 1}`,
+          nextRunAt: scheduledFor,
+        }),
+      );
+    }
+
+    it('does not let a slow first automation block the start of the others', async () => {
+      const now = new Date('2026-09-21T06:05:00.000Z');
+      let releaseSlow!: () => void;
+      const slowPromise = new Promise<void>((resolve) => {
+        releaseSlow = resolve;
+      });
+      const started: string[] = [];
+      triggerScheduled.mockImplementation(
+        async (a: { id: string }): Promise<{ id: string }> => {
+          started.push(a.id);
+          if (a.id === 'automation-1') {
+            await slowPromise;
+          }
+          return { id: `run-${a.id}` };
+        },
+      );
+      const { scheduler } = buildScheduler(dueAutomations(4, now));
+
+      const runPromise = scheduler.runDueAutomations(now);
+      // Flush microtasks so every worker gets to start its first item
+      // without waiting for automation-1's own artificial delay to clear.
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(started).toEqual(
+        expect.arrayContaining([
+          'automation-1',
+          'automation-2',
+          'automation-3',
+          'automation-4',
+        ]),
+      );
+
+      releaseSlow();
+      await runPromise;
+      expect(triggerScheduled).toHaveBeenCalledTimes(4);
+    });
+
+    it('never runs more than SCHEDULER_MAX_CONCURRENCY automations at the same time', async () => {
+      const now = new Date('2026-09-21T06:05:00.000Z');
+      const total = SCHEDULER_MAX_CONCURRENCY * 2 + 3;
+      let inFlight = 0;
+      let maxInFlight = 0;
+      triggerScheduled.mockImplementation(
+        async (a: { id: string }): Promise<{ id: string }> => {
+          inFlight += 1;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          inFlight -= 1;
+          return { id: `run-${a.id}` };
+        },
+      );
+      const { scheduler } = buildScheduler(dueAutomations(total, now));
+
+      await scheduler.runDueAutomations(now);
+
+      expect(triggerScheduled).toHaveBeenCalledTimes(total);
+      expect(maxInFlight).toBeLessThanOrEqual(SCHEDULER_MAX_CONCURRENCY);
+      // The pool is actually exercised (not accidentally serialized) —
+      // otherwise this assertion would be vacuous.
+      expect(maxInFlight).toBeGreaterThan(1);
+    });
+
+    it('a rejected automation in the middle of the batch never prevents the others from completing', async () => {
+      const now = new Date('2026-09-21T06:05:00.000Z');
+      const total = SCHEDULER_MAX_CONCURRENCY + 2;
+      triggerScheduled.mockImplementation(
+        (a: { id: string }): Promise<{ id: string }> => {
+          if (a.id === 'automation-3') {
+            return Promise.reject(new Error('boom'));
+          }
+          return Promise.resolve({ id: `run-${a.id}` });
+        },
+      );
+      const { scheduler, prisma } = buildScheduler(dueAutomations(total, now));
+
+      await scheduler.runDueAutomations(now);
+
+      expect(triggerScheduled).toHaveBeenCalledTimes(total);
+      for (let i = 1; i <= total; i += 1) {
+        const id = `automation-${i}`;
+        if (id === 'automation-3') {
+          // Failed to durably create a run: nextRunAt is left untouched,
+          // to be retried, never silently advanced.
+          expect(prisma.get(id)?.nextRunAt).not.toBeNull();
+          expect(prisma.get(id)?.scheduledClaimedAt).toEqual(now);
+        } else {
+          expect(prisma.get(id)?.scheduledClaimedAt).toBeNull();
+        }
+      }
+    });
+
+    it('attempts at most SCHEDULER_MAX_BATCH_SIZE automations in one tick, oldest nextRunAt first', async () => {
+      const now = new Date('2026-09-21T06:05:00.000Z');
+      const total = SCHEDULER_MAX_BATCH_SIZE + 5;
+      // Distinct, strictly increasing nextRunAt per automation so "oldest
+      // first" has an unambiguous, verifiable order — automation-1 is the
+      // most overdue, automation-N the least.
+      const records = Array.from({ length: total }, (_, i) =>
+        automation({
+          id: `automation-${i + 1}`,
+          nextRunAt: new Date(now.getTime() - (total - i) * 1_000),
+        }),
+      );
+      const { scheduler } = buildScheduler(records);
+
+      await scheduler.runDueAutomations(now);
+
+      expect(triggerScheduled).toHaveBeenCalledTimes(SCHEDULER_MAX_BATCH_SIZE);
+      const attemptedIds = triggerScheduled.mock.calls.map(
+        ([a]: [{ id: string }]) => a.id,
+      );
+      const expectedIds = Array.from(
+        { length: SCHEDULER_MAX_BATCH_SIZE },
+        (_, i) => `automation-${i + 1}`,
+      );
+      expect(new Set(attemptedIds)).toEqual(new Set(expectedIds));
+    });
+
+    it('leaves the automations left out of a bounded batch untouched, to be picked up by the next tick', async () => {
+      const now = new Date('2026-09-21T06:05:00.000Z');
+      const total = SCHEDULER_MAX_BATCH_SIZE + 1;
+      const records = Array.from({ length: total }, (_, i) =>
+        automation({
+          id: `automation-${i + 1}`,
+          nextRunAt: new Date(now.getTime() - (total - i) * 1_000),
+        }),
+      );
+      const { scheduler, prisma } = buildScheduler(records);
+      const leftOutId = `automation-${total}`; // the least-overdue one
+
+      await scheduler.runDueAutomations(now);
+
+      expect(triggerScheduled).not.toHaveBeenCalledWith(
+        expect.objectContaining({ id: leftOutId }),
+        expect.anything(),
+      );
+      const leftOut = prisma.get(leftOutId);
+      expect(leftOut?.scheduledClaimedAt).toBeNull();
+      expect(leftOut?.nextRunAt).toEqual(new Date(now.getTime() - 1_000));
+    });
   });
 });

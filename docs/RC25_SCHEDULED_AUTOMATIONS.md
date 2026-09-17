@@ -62,6 +62,43 @@ enregistrement/désenregistrement dynamique via `SchedulerRegistry` — plus
 fragile qu'un scan périodique unique. `@nestjs/schedule` n'est donc utilisé
 que pour **un seul** `@Cron(CronExpression.EVERY_MINUTE)` statique.
 
+## Concurrence bornée au sein d'un tick (hardening fix)
+
+Revue Claude sur PR#47 : `runDueAutomations()` traitait tout le due-set
+strictement séquentiellement (`for...await`), donc une automation lente
+retardait toutes les suivantes du même tick. Corrigé sans toucher à la
+réclamation CAS/bail elle-même (Phases 1 à 4 ci-dessous, chacune totalement
+indépendante par ligne — donc sûre à paralléliser) :
+
+- **Ordre déterministe** : le due-set est trié par `nextRunAt` croissant
+  (l'échéance la plus en retard en premier), `id` comme départage stable —
+  jamais l'ordre de retour, non spécifié, de la requête SQL.
+- **Batch borné** : au plus `SCHEDULER_MAX_BATCH_SIZE` (50) automations
+  tentées par tick, quelle que soit la taille du due-set. Le reste attend
+  simplement le tick suivant (une minute plus tard) — son propre `nextRunAt`
+  n'est jamais touché, exactement comme une occurrence qui aurait perdu la
+  course de réclamation ou dont le bail n'est pas encore périmé : rien n'est
+  perdu, seulement retardé, et la prochaine fois ce sera nécessairement le
+  tour des occurrences alors les plus en retard (l'ordre est recalculé à
+  chaque tick).
+- **Concurrence bornée** : le batch est traité par un petit pool
+  (`runWithBoundedConcurrency()`, sans nouvelle dépendance) d'au plus
+  `SCHEDULER_MAX_CONCURRENCY` (5) automations en vol simultanément — ni tout
+  le batch d'un coup (`Promise.allSettled` illimité), ni une par une.
+- **Isolation des erreurs inchangée** : le `try/catch` par automation est
+  toujours exactement à la même place, seulement maintenant à l'intérieur du
+  worker du pool plutôt que du corps de la boucle — l'échec d'une automation
+  ne peut donc arrêter ni ses siblings concurrents, ni le reste du batch.
+- **Aucune garantie de dédup/multi-instance modifiée** : la réclamation CAS
+  (Phase 1), la relecture fraîche (Phase 2) et l'avance conditionnelle de
+  `nextRunAt` (Phase 4) sont exactement les mêmes qu'avant, ligne par ligne —
+  les tests de concurrence entre deux instances de scheduler et de reprise
+  après plantage (déjà présents avant ce fix) passent tels quels, sans
+  modification, avec le pool ajouté autour.
+
+Les deux constantes vivent dans `automation.constants.ts`, aux côtés des
+autres garde-fous RC-20/RC-25.
+
 ## Réclamation en deux phases avec bail (RC-25 review fix)
 
 La conception initiale réclamait l'occurrence et avançait `nextRunAt` dans le
@@ -180,11 +217,61 @@ réclamation), jamais la nouvelle valeur recalculée.
 
 ## Fuseau horaire
 
-`AutomationTrigger.timezone` (`String @default("UTC")`, colonne dédiée —
-jamais caché dans le JSON `config`). Validation stricte via
+`AutomationTrigger.timezone` (`String?`, colonne dédiée — jamais caché dans
+le JSON `config`). Validation stricte via
 `Intl.DateTimeFormat(undefined, { timeZone })`, **avant** tout appel à
 `cron-parser` (dont l'erreur native sur un fuseau invalide est un message
 interne peu clair). Jamais déduit de la ville/pays de l'organisation.
+
+### Invariant persisté (hardening fix)
+
+Revue Claude sur PR#47 (déjà mergée) : `AutomationsService.update()` pouvait
+laisser survivre un fuseau résiduel d'un ancien trigger `scheduled` sur un
+trigger devenu `event`/`manual` (la colonne avait `@default("UTC")` pour
+**tout** type de trigger, et `validateTrigger()` ne rejetait qu'une valeur
+explicitement fournie, jamais celle héritée du fallback
+`existing.trigger?.timezone`). Contradiction directe avec ce que ce document
+affirmait déjà être impossible.
+
+Invariant désormais réellement appliqué, dans `create()` **et** `update()`,
+via `AutomationsService.resolveTriggerTimezone()` — le seul point qui décide
+ce qui est persisté :
+
+| Type de trigger écrit | Valeur persistée |
+|---|---|
+| `scheduled` | non nulle — la valeur fournie, sinon celle déjà en base **seulement si** le trigger existant était lui-même `scheduled`, sinon `UTC` |
+| `event` | toujours `null` |
+| `manual` | toujours `null` |
+
+Cas particuliers explicitement couverts (tests dans
+`automations.service.spec.ts`, describe `trigger timezone invariant`) :
+
+- `scheduled → event` / `scheduled → manual` : `timezone`, `cronExpression`
+  et `nextRunAt` sont tous effacés dans le même `update()`.
+- `event`/`manual → scheduled` sans nouvelle timezone fournie : `UTC`.
+- `scheduled → scheduled` sans nouvelle timezone fournie : la timezone
+  existante est conservée telle quelle.
+- Une timezone résiduelle sur une ligne historiquement incohérente (un
+  trigger non-`scheduled` dont la colonne n'a, pour une raison quelconque,
+  jamais été mise à `null` — exactement le cas que le bug ci-dessus pouvait
+  produire) n'est **jamais** réutilisée : `resolveTriggerTimezone()` ne
+  regarde la valeur existante que si le type de trigger existant était
+  aussi `scheduled`.
+- `update()` sans `dto.trigger` du tout (un champ non lié au trigger, par
+  ex. `name`) : la ligne `trigger` n'est pas ré-écrite, donc la timezone
+  déjà persistée est simplement reprise telle quelle pour le calcul de
+  `nextRunAt` — jamais re-dérivée.
+
+La migration `20260917090000_automation_trigger_timezone_invariant`
+rend la colonne nullable, supprime le défaut `'UTC'` au niveau DB (la
+décision revient désormais entièrement au code, par type), et corrige les
+données historiques : toute ligne dont le type n'est pas `scheduled` voit sa
+`timezone` mise à `null` rétroactivement.
+
+`AutomationSchedulerService` lit `trigger.timezone` uniquement pour un
+trigger déjà confirmé `scheduled` (Phase 4, réconciliation) ; un `null`
+inattendu à cet endroit précis dégrade sur `UTC` avec un warning loggé —
+défensif seulement, jamais le chemin attendu sous l'invariant ci-dessus.
 
 ## Contrat cron : 5 champs uniquement (RC-25 review fix)
 
@@ -258,12 +345,15 @@ déjà figées — aucune étape ne s'exécute avant approbation manuelle.
 - `src/ops-automation/automation-scheduler.service.ts` (+ `.spec.ts`)
 - `prisma/migrations/20260916080000_add_automation_trigger_timezone/`
 - `prisma/migrations/20260916090000_automation_scheduled_claim_and_index/`
+- `prisma/migrations/20260917090000_automation_trigger_timezone_invariant/`
+  (hardening fix)
 - `docs/RC25_SCHEDULED_AUTOMATIONS.md`
 
 ## Fichiers modifiés
 
-- `prisma/schema.prisma` — `AutomationTrigger.timezone` ;
-  `Automation.scheduledClaimedAt` (bail de réclamation) ;
+- `prisma/schema.prisma` — `AutomationTrigger.timezone` (hardening fix :
+  `String?`, nullable, plus de `@default("UTC")` — voir « Invariant
+  persisté ») ; `Automation.scheduledClaimedAt` (bail de réclamation) ;
   `@@index([enabled, nextRunAt])`.
 - `src/ops-automation/dto/automation-trigger.dto.ts` — `timezone?: string`.
 - `src/ops-automation/automations.service.ts` — `validateTrigger()` valide
@@ -272,10 +362,25 @@ déjà figées — aucune étape ne s'exécute avant approbation manuelle.
   `resolveNextRunAt()` (jamais d'exception propagée, dégrade en `null` avec
   un warning loggé, entièrement redacté) ; `update()`/`setEnabled()` effacent
   aussi `scheduledClaimedAt` à chaque réécriture de `nextRunAt` ; nouvelle
-  méthode publique `triggerScheduled()`.
+  méthode publique `triggerScheduled()` ; **hardening fix** : nouvelle
+  méthode privée `resolveTriggerTimezone()`, seul point qui décide de la
+  timezone persistée (voir « Invariant persisté »).
 - `src/ops-automation/automations.service.spec.ts` — tests `nextRunAt` +
   `triggerScheduled` + validation des combinaisons de champs + effacement de
-  `scheduledClaimedAt` par `update()`/`setEnabled()`.
+  `scheduledClaimedAt` par `update()`/`setEnabled()` ; **hardening fix** :
+  nouveau describe `trigger timezone invariant` (7 tests).
+- `src/ops-automation/automation-scheduler.service.ts` — **hardening fix** :
+  tri déterministe + batch borné (`SCHEDULER_MAX_BATCH_SIZE`) + pool à
+  concurrence bornée (`runWithBoundedConcurrency()`,
+  `SCHEDULER_MAX_CONCURRENCY`) autour de `processDueAutomation()`, inchangé
+  lui-même ; repli défensif `UTC` si `trigger.timezone` est `null` alors que
+  le type est déjà confirmé `scheduled` (ne devrait jamais arriver sous
+  l'invariant, warning loggé si ça arrive quand même).
+- `src/ops-automation/automation-scheduler.service.spec.ts` —
+  **hardening fix** : nouveau describe `bounded concurrency within a tick`
+  (5 tests).
+- `src/ops-automation/automation.constants.ts` — **hardening fix** :
+  `SCHEDULER_MAX_CONCURRENCY` (5), `SCHEDULER_MAX_BATCH_SIZE` (50).
 - `src/ops-automation/ops-automation.module.ts` — enregistre
   `AutomationSchedulerService`.
 - `src/app.module.ts` — `ScheduleModule.forRoot()`.
@@ -303,10 +408,25 @@ hardening séparée (même schéma que RC23/RC24).
   déploiement actuel ; à revisiter si un vrai besoin de scaling horizontal
   apparaît).
 
+## Hardening fix (revue Claude sur PR#47, déjà mergée)
+
+Une revue de code indépendante de la PR déjà mergée #47 a identifié deux
+défauts non bloquants pour la production mais contraires à ce que ce
+document affirmait :
+
+1. Fuite possible d'un fuseau résiduel lors d'un changement de type de
+   trigger — voir « Invariant persisté » sous « Fuseau horaire ».
+2. Traitement strictement séquentiel du due-set au sein d'un tick — voir
+   « Concurrence bornée au sein d'un tick ».
+
+Les deux sont corrigés sur une branche séparée (`fix/rc25-scheduler-hardening`),
+sans toucher au reste du moteur RC25 (réclamation CAS/bail, garanties
+multi-instance, dédup) — voir les sections dédiées ci-dessus pour le détail.
+
 ## Tests exécutés
 
 ```
-npx jest --silent                    → 55 suites, 372 tests, tous passants
+npx jest --silent                    → 62 suites, 481 tests, tous passants
 npx tsc --noEmit -p tsconfig.json    → aucune nouvelle erreur (1 erreur
                                         pré-existante et sans rapport,
                                         documentée depuis RC23)
@@ -316,7 +436,7 @@ node scripts/check-eslint-baseline.mjs
   eslint-report.json 74 23           → ESLint debt: 74 errors, 23 warnings
                                         (baseline: 74/23) — aucune hausse
 npm run build                        → prisma generate + nest build : succès
-sh -n deploy/github-deploy.sh        → syntaxe shell OK
+npx prisma validate                  → schéma valide
 python -m unittest discover
   -s deploy/tests -p "test_*.py"     → 22 tests, tous passants
 docker compose -f docker-compose.production.yml
