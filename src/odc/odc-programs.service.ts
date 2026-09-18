@@ -162,9 +162,9 @@ export class OdcProgramsService {
     id: string,
   ): Promise<OdcProgramWithDefinition> {
     const program = await this.findOne(organizationId, id);
-    if (program.status !== 'draft') {
+    if (program.status !== 'draft' && program.status !== 'closed') {
       throw new ConflictException(
-        `Cannot open a program in status "${program.status}" — only "draft" can open.`,
+        `Cannot open a program in status "${program.status}" — only "draft" or "closed" can open.`,
       );
     }
     await this.prisma.odcProgram.update({
