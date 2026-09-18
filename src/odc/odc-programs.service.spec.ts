@@ -65,11 +65,24 @@ describe('OdcProgramsService', () => {
     );
   });
 
-  it('open(): draft -> open, and only from draft', async () => {
+  it('open(): draft -> open, closed -> open, not from open or archived', async () => {
     const program = await service.create(orgA, userA, createDto());
     const opened = await service.open(orgA, program.id);
     expect(opened.status).toBe('open');
 
+    await expect(service.open(orgA, program.id)).rejects.toBeInstanceOf(
+      ConflictException,
+    );
+
+    const closed = await service.close(orgA, program.id);
+    expect(closed.status).toBe('closed');
+    const reopened = await service.open(orgA, program.id);
+    expect(reopened.status).toBe('open');
+
+    await prisma.odcProgram.update({
+      where: { id: program.id },
+      data: { status: 'archived' },
+    });
     await expect(service.open(orgA, program.id)).rejects.toBeInstanceOf(
       ConflictException,
     );
