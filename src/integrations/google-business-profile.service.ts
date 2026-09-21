@@ -1,6 +1,9 @@
 import {
   BadGatewayException,
   BadRequestException,
+  ConflictException,
+  HttpException,
+  HttpStatus,
   Injectable,
   Logger,
   NotFoundException,
@@ -14,6 +17,7 @@ import {
   createDecipheriv,
   createHmac,
   randomBytes,
+  randomUUID,
   timingSafeEqual,
 } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
@@ -21,15 +25,31 @@ import { PrismaService } from '../prisma/prisma.service';
 const BUSINESS_PROFILE_SCOPE =
   'https://www.googleapis.com/auth/business.manage';
 const STATE_MAX_AGE_MS = 10 * 60 * 1000;
+const SYNC_CLAIM_LEASE_MS = 5 * 60 * 1000;
+const SYNC_COOLDOWN_MS = 60 * 1000;
+// Fields used by ROBIA's extended location-details view. Deliberately
+// excludes relationshipData (chain/parent relationships), serviceItems (a
+// large structured service catalogue only meaningful for a handful of
+// business types) and adWordsLocationExtensions (Google-deprecated) — see
+// docs/RC38_GOOGLE_BUSINESS_PROFILE_READONLY.md for the full rationale.
 const LOCATION_READ_MASK = [
   'name',
+  'languageCode',
   'title',
   'storeCode',
   'storefrontAddress',
   'phoneNumbers',
   'websiteUri',
   'categories',
+  'regularHours',
+  'specialHours',
+  'moreHours',
+  'serviceArea',
+  'labels',
+  'latlng',
+  'openInfo',
   'metadata',
+  'profile',
 ].join(',');
 
 interface OAuthState {
@@ -45,6 +65,11 @@ interface GoogleTokenResponse {
   scope?: string;
 }
 
+interface GoogleUserInfo {
+  sub?: string;
+  email?: string;
+}
+
 interface GoogleAccount {
   name: string;
   accountName?: string;
@@ -55,15 +80,31 @@ interface GoogleAccountsResponse {
   nextPageToken?: string;
 }
 
+interface GoogleCategory {
+  displayName?: string;
+}
+
 interface GoogleLocation {
   name: string;
+  languageCode?: string;
   title?: string;
   storeCode?: string;
   storefrontAddress?: Record<string, unknown>;
-  phoneNumbers?: { primaryPhone?: string };
+  phoneNumbers?: { primaryPhone?: string; additionalPhones?: string[] };
   websiteUri?: string;
-  categories?: { primaryCategory?: { displayName?: string } };
+  categories?: {
+    primaryCategory?: GoogleCategory;
+    additionalCategories?: GoogleCategory[];
+  };
+  regularHours?: Record<string, unknown>;
+  specialHours?: Record<string, unknown>;
+  moreHours?: Record<string, unknown>[];
+  serviceArea?: Record<string, unknown>;
+  labels?: string[];
+  latlng?: { latitude?: number; longitude?: number };
+  openInfo?: { status?: string; canReopen?: boolean; openingDate?: unknown };
   metadata?: Record<string, unknown>;
+  profile?: { description?: string };
 }
 
 interface GoogleLocationsResponse {
@@ -126,37 +167,62 @@ export class GoogleBusinessProfileService {
         "L'autorisation Google Business Profile est absente.",
       );
     }
+    const userInfo = await this.googleGet<GoogleUserInfo>(
+      'https://openidconnect.googleapis.com/v1/userinfo',
+      tokens.access_token,
+    );
+    if (!userInfo.sub) {
+      throw new BadGatewayException(
+        "Google n'a pas fourni l'identité stable du compte.",
+      );
+    }
     const existing =
       await this.prisma.googleBusinessProfileConnection.findUnique({
         where: { organizationId: organization.id },
       });
-    const encryptedRefreshToken = tokens.refresh_token
-      ? this.encrypt(tokens.refresh_token)
-      : existing?.encryptedRefreshToken;
-    if (!encryptedRefreshToken) {
+    const sameAccount = existing?.googleAccountSubject === userInfo.sub;
+    if (!tokens.refresh_token && (!existing || !sameAccount)) {
       throw new BadGatewayException(
-        "Google n'a pas fourni de jeton de renouvellement.",
+        "Google n'a pas fourni de jeton de renouvellement pour ce compte. Recommencez la connexion.",
       );
     }
+    const encryptedRefreshToken = tokens.refresh_token
+      ? this.encrypt(tokens.refresh_token)
+      : existing!.encryptedRefreshToken;
+    const accountChanged = Boolean(existing && !sameAccount);
 
-    const userInfo = await this.googleGet<{ email?: string }>(
-      'https://openidconnect.googleapis.com/v1/userinfo',
-      tokens.access_token,
-    );
-    await this.prisma.googleBusinessProfileConnection.upsert({
-      where: { organizationId: organization.id },
-      create: {
-        organizationId: organization.id,
-        googleAccountEmail: userInfo.email ?? null,
-        encryptedRefreshToken,
-        grantedScopes: tokens.scope ?? null,
-      },
-      update: {
-        googleAccountEmail: userInfo.email ?? null,
-        encryptedRefreshToken,
-        grantedScopes: tokens.scope ?? null,
-        connectedAt: new Date(),
-      },
+    await this.prisma.$transaction(async (tx) => {
+      const connection = await tx.googleBusinessProfileConnection.upsert({
+        where: { organizationId: organization.id },
+        create: {
+          organizationId: organization.id,
+          googleAccountSubject: userInfo.sub,
+          googleAccountEmail: userInfo.email ?? null,
+          encryptedRefreshToken,
+          grantedScopes: tokens.scope ?? null,
+        },
+        update: {
+          googleAccountSubject: userInfo.sub,
+          googleAccountEmail: userInfo.email ?? null,
+          encryptedRefreshToken,
+          grantedScopes: tokens.scope ?? null,
+          connectedAt: new Date(),
+          ...(accountChanged
+            ? {
+                lastSyncedAt: null,
+                lastSyncAttemptAt: null,
+                lastSyncStatus: 'never',
+                syncClaimedAt: null,
+                syncClaimToken: null,
+              }
+            : {}),
+        },
+      });
+      if (accountChanged) {
+        await tx.googleBusinessProfileLocation.deleteMany({
+          where: { connectionId: connection.id },
+        });
+      }
     });
     return { connected: true };
   }
@@ -169,6 +235,8 @@ export class GoogleBusinessProfileService {
           googleAccountEmail: true,
           connectedAt: true,
           lastSyncedAt: true,
+          lastSyncAttemptAt: true,
+          lastSyncStatus: true,
           _count: { select: { locations: true } },
         },
       });
@@ -178,6 +246,8 @@ export class GoogleBusinessProfileService {
           googleAccountEmail: connection.googleAccountEmail,
           connectedAt: connection.connectedAt,
           lastSyncedAt: connection.lastSyncedAt,
+          lastSyncAttemptAt: connection.lastSyncAttemptAt,
+          lastSyncStatus: connection.lastSyncStatus,
           locationCount: connection._count.locations,
         }
       : {
@@ -185,6 +255,8 @@ export class GoogleBusinessProfileService {
           googleAccountEmail: null,
           connectedAt: null,
           lastSyncedAt: null,
+          lastSyncAttemptAt: null,
+          lastSyncStatus: 'never',
           locationCount: 0,
         };
   }
@@ -217,49 +289,184 @@ export class GoogleBusinessProfileService {
         "Google Business Profile n'est pas connecté.",
       );
     }
-    const accessToken = await this.refreshAccessToken(
-      this.decrypt(connection.encryptedRefreshToken),
-    );
-    const accounts = await this.fetchAccounts(accessToken);
-    const syncedAt = new Date();
-    const observedNames: string[] = [];
-
-    for (const account of accounts) {
-      const locations = await this.fetchLocations(accessToken, account.name);
-      for (const location of locations) {
-        if (!location.name) continue;
-        observedNames.push(location.name);
-        await this.prisma.googleBusinessProfileLocation.upsert({
-          where: {
-            connectionId_googleLocationName: {
-              connectionId: connection.id,
-              googleLocationName: location.name,
+    const now = new Date();
+    const claimToken = randomUUID();
+    const claim = await this.prisma.googleBusinessProfileConnection.updateMany({
+      where: {
+        id: connection.id,
+        OR: [
+          { syncClaimedAt: null },
+          {
+            syncClaimedAt: {
+              lt: new Date(now.getTime() - SYNC_CLAIM_LEASE_MS),
             },
           },
-          create: this.locationData(
-            organizationId,
-            connection.id,
-            account,
-            location,
-            syncedAt,
-          ),
-          update: this.locationUpdate(account, location, syncedAt),
-        });
-      }
-    }
-    await this.prisma.googleBusinessProfileLocation.deleteMany({
-      where: {
-        connectionId: connection.id,
-        ...(observedNames.length
-          ? { googleLocationName: { notIn: observedNames } }
-          : {}),
+        ],
+        AND: [
+          {
+            OR: [
+              { lastSyncAttemptAt: null },
+              {
+                lastSyncAttemptAt: {
+                  lte: new Date(now.getTime() - SYNC_COOLDOWN_MS),
+                },
+              },
+            ],
+          },
+        ],
+      },
+      data: {
+        syncClaimedAt: now,
+        syncClaimToken: claimToken,
+        lastSyncAttemptAt: now,
+        lastSyncStatus: 'running',
       },
     });
-    await this.prisma.googleBusinessProfileConnection.update({
-      where: { id: connection.id },
-      data: { lastSyncedAt: syncedAt },
+    if (claim.count !== 1) {
+      const fresh =
+        await this.prisma.googleBusinessProfileConnection.findUnique({
+          where: { id: connection.id },
+          select: { syncClaimedAt: true, lastSyncAttemptAt: true },
+        });
+      if (
+        fresh?.syncClaimedAt &&
+        fresh.syncClaimedAt.getTime() > now.getTime() - SYNC_CLAIM_LEASE_MS
+      ) {
+        throw new ConflictException(
+          'Une synchronisation Google Business Profile est déjà en cours.',
+        );
+      }
+      throw new HttpException(
+        'Une synchronisation Google Business Profile vient déjà d’être demandée. Réessayez dans une minute.',
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
+    let finalized = false;
+    try {
+      const accessToken = await this.refreshAccessToken(
+        this.decrypt(connection.encryptedRefreshToken),
+      );
+      const accounts = await this.fetchAccounts(accessToken);
+      if (accounts.length === 0) {
+        const locationCount =
+          await this.prisma.googleBusinessProfileLocation.count({
+            where: { connectionId: connection.id },
+          });
+        await this.releaseSyncClaim(connection.id, claimToken, 'partial');
+        finalized = true;
+        this.logger.warn(
+          `GBP : aucun compte observé (organization=${organizationId}) — données précédentes conservées et dernière synchronisation réussie inchangée.`,
+        );
+        return {
+          synced: false,
+          status: 'partial' as const,
+          locationCount,
+          syncedAt: connection.lastSyncedAt,
+        };
+      }
+
+      // Fetch every page from every account before starting any database
+      // reconciliation. A failure halfway through Google pagination leaves
+      // the existing mirror and ROBIA mappings untouched.
+      const observed: Array<{
+        account: GoogleAccount;
+        location: GoogleLocation;
+      }> = [];
+      for (const account of accounts) {
+        const locations = await this.fetchLocations(accessToken, account.name);
+        for (const location of locations) {
+          if (location.name) observed.push({ account, location });
+        }
+      }
+
+      const syncedAt = new Date();
+      const observedNames = [
+        ...new Set(observed.map(({ location }) => location.name)),
+      ];
+      const committed = await this.prisma.$transaction(async (tx) => {
+        // This conditional update both proves ownership and locks the
+        // connection row until commit. A stale worker cannot interleave its
+        // mirror writes with a newer claimant.
+        const owned = await tx.googleBusinessProfileConnection.updateMany({
+          where: { id: connection.id, syncClaimToken: claimToken },
+          data: { syncClaimedAt: syncedAt },
+        });
+        if (owned.count !== 1) return false;
+        for (const { account, location } of observed) {
+          await tx.googleBusinessProfileLocation.upsert({
+            where: {
+              connectionId_googleLocationName: {
+                connectionId: connection.id,
+                googleLocationName: location.name,
+              },
+            },
+            create: this.locationData(
+              organizationId,
+              connection.id,
+              account,
+              location,
+              syncedAt,
+            ),
+            update: this.locationUpdate(account, location, syncedAt),
+          });
+        }
+        await tx.googleBusinessProfileLocation.deleteMany({
+          where: {
+            connectionId: connection.id,
+            ...(observedNames.length
+              ? { googleLocationName: { notIn: observedNames } }
+              : {}),
+          },
+        });
+        const released = await tx.googleBusinessProfileConnection.updateMany({
+          where: { id: connection.id, syncClaimToken: claimToken },
+          data: {
+            lastSyncedAt: syncedAt,
+            lastSyncStatus: 'success',
+            syncClaimedAt: null,
+            syncClaimToken: null,
+          },
+        });
+        return released.count === 1;
+      });
+      if (!committed) {
+        throw new ConflictException(
+          'La synchronisation a perdu son bail et son résultat a été ignoré.',
+        );
+      }
+      finalized = true;
+      return {
+        synced: true,
+        status: 'success' as const,
+        locationCount: observedNames.length,
+        syncedAt,
+      };
+    } finally {
+      if (!finalized) {
+        await this.releaseSyncClaim(connection.id, claimToken, 'failed').catch(
+          () =>
+            this.logger.warn(
+              `GBP : impossible de libérer le bail de synchronisation (organization=${organizationId})`,
+            ),
+        );
+      }
+    }
+  }
+
+  private async releaseSyncClaim(
+    connectionId: string,
+    claimToken: string,
+    status: 'partial' | 'failed',
+  ) {
+    await this.prisma.googleBusinessProfileConnection.updateMany({
+      where: { id: connectionId, syncClaimToken: claimToken },
+      data: {
+        syncClaimedAt: null,
+        syncClaimToken: null,
+        lastSyncStatus: status,
+      },
     });
-    return { synced: true, locationCount: observedNames.length, syncedAt };
   }
 
   async linkLocation(
@@ -304,22 +511,35 @@ export class GoogleBusinessProfileService {
         where: { organizationId },
       });
     if (!connection) return { disconnected: true };
+    const token = this.decrypt(connection.encryptedRefreshToken);
+    let response: Response;
     try {
-      const token = this.decrypt(connection.encryptedRefreshToken);
-      await fetch(
-        `https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(token)}`,
-        {
-          method: 'POST',
-          signal: AbortSignal.timeout(this.timeoutMs()),
-        },
-      );
+      response = await fetch('https://oauth2.googleapis.com/revoke', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ token }),
+        signal: AbortSignal.timeout(this.timeoutMs()),
+      });
     } catch {
-      this.logger.warn('GBP : révocation Google indisponible');
+      this.logger.warn(
+        `GBP : révocation Google indisponible (organization=${organizationId})`,
+      );
+      throw new ServiceUnavailableException(
+        'Google n’a pas confirmé la révocation. La connexion ROBIA a été conservée afin de pouvoir réessayer.',
+      );
+    }
+    if (!response.ok) {
+      this.logger.warn(
+        `GBP : révocation Google refusée avec le statut ${response.status} (organization=${organizationId})`,
+      );
+      throw new ServiceUnavailableException(
+        'Google n’a pas confirmé la révocation. La connexion ROBIA a été conservée afin de pouvoir réessayer.',
+      );
     }
     await this.prisma.googleBusinessProfileConnection.delete({
       where: { id: connection.id },
     });
-    return { disconnected: true };
+    return { disconnected: true, revokedByGoogle: true };
   }
 
   getDashboardRedirect(status: 'connected' | 'denied' | 'error') {
@@ -338,6 +558,13 @@ export class GoogleBusinessProfileService {
         status: 'not_configured' as const,
         observedAt: null,
         data: null,
+      };
+    }
+    if (status.lastSyncStatus !== 'success') {
+      return {
+        status: 'partial' as const,
+        observedAt: status.lastSyncedAt,
+        data: { locationCount: status.locationCount },
       };
     }
     return {
@@ -415,18 +642,39 @@ export class GoogleBusinessProfileService {
     location: GoogleLocation,
     syncedAt: Date,
   ) {
+    const additionalCategories = (
+      location.categories?.additionalCategories ?? []
+    )
+      .map((category) => category.displayName)
+      .filter((name): name is string => Boolean(name));
     return {
       accountDisplayName: account.accountName ?? null,
       googleLocationName: location.name,
+      languageCode: location.languageCode ?? null,
       title: location.title?.trim() || 'Établissement sans nom',
       storeCode: location.storeCode ?? null,
       address:
         (location.storefrontAddress as Prisma.InputJsonValue) ??
         Prisma.JsonNull,
       primaryPhone: location.phoneNumbers?.primaryPhone ?? null,
+      additionalPhones: location.phoneNumbers?.additionalPhones ?? [],
       websiteUri: location.websiteUri ?? null,
       primaryCategory:
         location.categories?.primaryCategory?.displayName ?? null,
+      additionalCategories,
+      description: location.profile?.description ?? null,
+      regularHours:
+        (location.regularHours as Prisma.InputJsonValue) ?? Prisma.JsonNull,
+      specialHours:
+        (location.specialHours as Prisma.InputJsonValue) ?? Prisma.JsonNull,
+      moreHours:
+        (location.moreHours as Prisma.InputJsonValue) ?? Prisma.JsonNull,
+      serviceArea:
+        (location.serviceArea as Prisma.InputJsonValue) ?? Prisma.JsonNull,
+      labels: location.labels ?? [],
+      latitude: location.latlng?.latitude ?? null,
+      longitude: location.latlng?.longitude ?? null,
+      openStatus: location.openInfo?.status ?? null,
       metadata: (location.metadata as Prisma.InputJsonValue) ?? Prisma.JsonNull,
       lastSyncedAt: syncedAt,
     };

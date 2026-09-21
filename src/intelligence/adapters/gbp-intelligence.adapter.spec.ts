@@ -53,4 +53,20 @@ describe('GbpIntelligenceAdapter', () => {
     });
     expect(service.getIntelligenceSignal).toHaveBeenCalledWith(organizationId);
   });
+
+  it('does not report ok when the latest synchronization attempt was partial', async () => {
+    const partial = new GbpIntelligenceAdapter({
+      getIntelligenceSignal: jest.fn().mockResolvedValue({
+        status: 'partial',
+        observedAt: new Date('2026-09-20T10:00:00Z'),
+        data: { locationCount: 2 },
+      }),
+    } as unknown as GoogleBusinessProfileService);
+
+    expect(await partial.collectSignal(organizationId)).toMatchObject({
+      status: 'partial',
+      unavailableReason: 'temporarily_unavailable',
+      data: { locationCount: 2 },
+    });
+  });
 });

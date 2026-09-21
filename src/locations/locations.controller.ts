@@ -12,6 +12,7 @@ import {
 import { LocationsService } from './locations.service';
 import { CreateLocationDto } from './dto/create-location.dto';
 import { SearchPlacesDto } from './dto/search-places.dto';
+import { ImportLegacyLocationsDto } from './dto/import-legacy-locations.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { OrgScopeGuard } from '../common/guards/org-scope.guard';
 
@@ -33,6 +34,17 @@ export class LocationsController {
   @Post()
   create(@Req() req: ScopedRequest, @Body() dto: CreateLocationDto) {
     return this.locationsService.create(req.organizationId, dto);
+  }
+
+  @Post('legacy-import')
+  importLegacy(
+    @Req() req: ScopedRequest,
+    @Body() dto: ImportLegacyLocationsDto,
+  ) {
+    return this.locationsService.importLegacy(
+      req.organizationId,
+      dto.locations,
+    );
   }
 
   @Get()
