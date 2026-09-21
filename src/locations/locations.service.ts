@@ -45,6 +45,7 @@ export class LocationsService {
         address,
         city: dto.city,
         country: dto.country,
+        phone: dto.phone,
         latitude,
         longitude,
         openingHours: openingHours ?? undefined,
@@ -82,5 +83,15 @@ export class LocationsService {
       location.latitude,
       location.longitude,
     );
+  }
+
+  async remove(organizationId: string, id: string) {
+    const location = await this.prisma.location.findFirst({
+      where: { id, organizationId },
+      select: { id: true },
+    });
+    if (!location) throw new NotFoundException('Lieu non trouvé');
+    await this.prisma.location.delete({ where: { id: location.id } });
+    return { deleted: true };
   }
 }
