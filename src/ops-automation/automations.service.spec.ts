@@ -394,6 +394,7 @@ class FakePrisma {
         attemptCount: 0,
         nextAttemptAt: null,
         claimedAt: null,
+        claimToken: null,
         startedAt: null,
         finishedAt: null,
         ...normalizeJsonSentinels(data),
@@ -419,52 +420,26 @@ class FakePrisma {
       );
       return record ?? null;
     },
-    findMany: ({
-      where,
-    }: {
-      where: {
-        AND?: Array<{
-          OR?: Array<Record<string, unknown>>;
-        }>;
-      };
-    }) => {
+    findMany: ({ where }: { where: Record<string, unknown> }) => {
       return Array.from(this.steps.values()).filter((record) =>
-        this.matchesDueStepRetryWhere(record, where),
+        this.matchesConditions(record, where),
       );
     },
-    // Same real-conditional-UPDATE semantics as automationRun.updateMany
-    // above — see its comment.
+    // Real-conditional-UPDATE semantics: every top-level key in `where`
+    // (id, status, attemptCount, claimedAt, claimToken, nextAttemptAt, OR,
+    // ...) is checked generically via matchesConditions() — nothing here
+    // special-cases one specific caller's predicate shape, so a new field
+    // added to a WHERE clause in production code can never silently pass
+    // through unchecked the way an earlier version of this fake did.
     updateMany: ({
       where,
       data,
     }: {
-      where: {
-        id: string;
-        attemptCount?: { lt?: number; gte?: number };
-        claimedAt?: unknown;
-        AND?: Array<{ OR?: Array<Record<string, unknown>> }>;
-      };
+      where: { id: string } & Record<string, unknown>;
     } & { data: Record<string, unknown> }) => {
       const record = this.steps.get(where.id);
       if (!record) return { count: 0 };
-      if (
-        where.attemptCount?.lt !== undefined &&
-        !((record.attemptCount as number) < where.attemptCount.lt)
-      ) {
-        return { count: 0 };
-      }
-      if ('claimedAt' in where && where.claimedAt !== undefined) {
-        const expected = where.claimedAt as Date | null;
-        const actual = record.claimedAt as Date | null;
-        const matches =
-          expected === null
-            ? actual === null
-            : actual !== null && actual.getTime() === expected.getTime();
-        if (!matches) return { count: 0 };
-      }
-      if (where.AND && !this.matchesDueStepRetryWhere(record, where)) {
-        return { count: 0 };
-      }
+      if (!this.matchesConditions(record, where)) return { count: 0 };
       Object.assign(
         record,
         normalizeJsonSentinels(this.resolveIncrements(record, data)),
@@ -505,46 +480,60 @@ class FakePrisma {
   // reproduces (used by both automationStepRun.findMany and .updateMany
   // above, exactly like the real query and the real claim UPDATE share the
   // same shape in production).
-  private matchesDueStepRetryWhere(
+  // A small, generic Prisma WHERE evaluator — every field condition this
+  // codebase's automationStepRun queries actually use (plain equality,
+  // `{lte}`, `{lt}`, `{gte}`, `{not}`, and a nested `OR` array of the same)
+  // — checked against a record the same way Postgres would. Deliberately
+  // generic rather than one bespoke matcher per caller's predicate shape:
+  // a real new field/operator added to a WHERE clause in production code
+  // fails loudly here (returns false, matching nothing) instead of an
+  // earlier version of this fake silently ignoring whatever key it didn't
+  // happen to special-case.
+  private matchesConditions(
     record: FakeRecord,
-    where: { AND?: Array<{ OR?: Array<Record<string, unknown>> }> },
+    conditions: Record<string, unknown>,
   ): boolean {
-    if (!where.AND) return true;
-    return where.AND.every((clause) => {
-      if (!clause.OR) return true;
-      return clause.OR.some((branch) => {
-        return Object.entries(branch).every(([key, condition]) => {
-          const value = record[key];
-          if (condition === null) return value === null;
-          if (
-            condition &&
-            typeof condition === 'object' &&
-            !(condition instanceof Date)
-          ) {
-            const cond = condition as {
-              lte?: Date;
-              lt?: Date;
-              not?: null;
-            };
-            if (cond.lte !== undefined) {
-              return (
-                value !== null &&
-                (value as Date).getTime() <= cond.lte.getTime()
-              );
-            }
-            if (cond.lt !== undefined) {
-              return (
-                value !== null && (value as Date).getTime() < cond.lt.getTime()
-              );
-            }
-            if ('not' in cond) {
-              return value !== cond.not;
-            }
-            return false;
-          }
-          return value === condition;
-        });
-      });
+    return Object.entries(conditions).every(([key, condition]) => {
+      if (key === 'id') return record.id === condition;
+      if (key === 'OR') {
+        const branches = condition as Array<Record<string, unknown>>;
+        return branches.some((branch) =>
+          this.matchesConditions(record, branch),
+        );
+      }
+      const value = record[key];
+      if (condition === null) return value === null;
+      if (
+        condition &&
+        typeof condition === 'object' &&
+        !(condition instanceof Date)
+      ) {
+        const cond = condition as {
+          lte?: Date | number;
+          lt?: Date | number;
+          gte?: Date | number;
+          not?: null;
+        };
+        const cmp = (a: unknown, b: Date | number): number => {
+          const av = a instanceof Date ? a.getTime() : (a as number);
+          const bv = b instanceof Date ? b.getTime() : b;
+          return av - bv;
+        };
+        if (cond.lte !== undefined) {
+          return value !== null && cmp(value, cond.lte) <= 0;
+        }
+        if (cond.lt !== undefined) {
+          return value !== null && cmp(value, cond.lt) < 0;
+        }
+        if (cond.gte !== undefined) {
+          return value !== null && cmp(value, cond.gte) >= 0;
+        }
+        if ('not' in cond) {
+          return value !== cond.not;
+        }
+        return false;
+      }
+      return value === condition;
     });
   }
 
@@ -645,6 +634,7 @@ describe('AutomationsService', () => {
   let context: { build: jest.Mock };
   let actionsRegistry: {
     isAllowed: jest.Mock;
+    isRetrySafe: jest.Mock;
     execute: jest.Mock;
     canonicalizeInput: jest.Mock;
   };
@@ -657,6 +647,11 @@ describe('AutomationsService', () => {
       isAllowed: jest
         .fn()
         .mockImplementation((type: string) => type in ACTION_INPUT_SCHEMAS),
+      // Defaults every action to retry-safe so the pre-existing retry
+      // behavior tests (written before RC-27 hardening's replay policy)
+      // keep exercising the same "transient failure -> retry" path. Tests
+      // that specifically cover the replay policy override this per-case.
+      isRetrySafe: jest.fn().mockReturnValue(true),
       execute: jest.fn().mockResolvedValue({ ok: true }),
       canonicalizeInput: jest
         .fn()
@@ -1568,6 +1563,262 @@ describe('AutomationsService', () => {
       const run = await service.getRun(orgA, started.id);
       expect(run.status).toBe('succeeded');
       expect(run.steps[0].attemptCount).toBe(3);
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // RC-27 hardening — replay policy, first-attempt crash recovery, and
+  // claim-token races
+  // ---------------------------------------------------------------------
+
+  describe('RC-27 hardening', () => {
+    it('claims the first synchronous attempt too — claimedAt/claimToken are never left null', async () => {
+      actionsRegistry.execute.mockResolvedValue({ ok: true });
+      const automation = await service.create(orgA, userA, createDto());
+      const started = await service.triggerManual(orgA, userA, automation.id);
+      // Succeeded already (commitStepAttempt clears the claim on the way
+      // out), so this only proves the row genuinely held one during the
+      // attempt: read it back mid-create via the fake's own store.
+      expect(started.status).toBe('succeeded');
+      expect(started.steps[0].claimedAt).toBeNull();
+      expect(
+        (started.steps[0] as unknown as { claimToken: unknown }).claimToken,
+      ).toBeNull();
+    });
+
+    it('crash on the very first attempt: the row is recoverable once its claim lease goes stale', async () => {
+      actionsRegistry.execute.mockRejectedValueOnce(new Error('blip'));
+      const automation = await service.create(orgA, userA, createDto());
+      const started = await service.triggerManual(orgA, userA, automation.id);
+      // A transient failure already resolved to 'retry_scheduled' via the
+      // normal path — simulate the *first attempt itself* crashing instead:
+      // force the row back to 'running' with a claim, exactly the state a
+      // crash mid-attemptStep() would leave (never resolved to any of
+      // succeeded/failed/retry_scheduled).
+      const stepRunId = started.steps[0].id;
+      const crashedAt = new Date('2026-01-01T00:00:00.000Z');
+      prisma.automationStepRun.update({
+        where: { id: stepRunId },
+        data: {
+          status: 'running',
+          claimedAt: crashedAt,
+          claimToken: 'stale-token-from-crashed-worker',
+          attemptCount: 1,
+          nextAttemptAt: null,
+        },
+      });
+
+      actionsRegistry.execute.mockResolvedValueOnce({ ok: true });
+      const staleNow = new Date(
+        crashedAt.getTime() + STEP_RETRY_CLAIM_LEASE_MS + 1,
+      );
+      await service.retryStep(stepRunId, staleNow);
+
+      const run = await service.getRun(orgA, started.id);
+      expect(run.status).toBe('succeeded');
+      expect(run.steps[0].status).toBe('succeeded');
+      expect(run.steps[0].attemptCount).toBe(2);
+    });
+
+    it('a non-retry-safe action is never auto-retried, even on an ordinary transient failure', async () => {
+      actionsRegistry.isRetrySafe.mockReturnValue(false);
+      actionsRegistry.execute.mockRejectedValueOnce(new Error('ECONNRESET'));
+      const automation = await service.create(orgA, userA, createDto());
+      const started = await service.triggerManual(orgA, userA, automation.id);
+
+      expect(started.status).toBe('failed');
+      expect(started.steps[0].status).toBe('failed');
+      expect(started.steps[0].nextAttemptAt).toBeNull();
+      expect(actionsRegistry.execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('a retry-safe action recovers cleanly from a first-attempt crash via reclaim', async () => {
+      actionsRegistry.isRetrySafe.mockReturnValue(true);
+      actionsRegistry.execute.mockRejectedValueOnce(new Error('blip'));
+      const automation = await service.create(orgA, userA, createDto());
+      const started = await service.triggerManual(orgA, userA, automation.id);
+      const stepRunId = started.steps[0].id;
+      const crashedAt = new Date('2026-01-01T00:00:00.000Z');
+      prisma.automationStepRun.update({
+        where: { id: stepRunId },
+        data: {
+          status: 'running',
+          claimedAt: crashedAt,
+          claimToken: 'stale-token',
+          attemptCount: 1,
+          nextAttemptAt: null,
+        },
+      });
+
+      actionsRegistry.execute.mockResolvedValueOnce({ ok: true });
+      const staleNow = new Date(
+        crashedAt.getTime() + STEP_RETRY_CLAIM_LEASE_MS + 1,
+      );
+      await service.retryStep(stepRunId, staleNow);
+
+      const run = await service.getRun(orgA, started.id);
+      expect(run.status).toBe('succeeded');
+    });
+
+    it('a non-retry-safe action whose attempt crashed is never blindly re-executed — the run fails with an indeterminate-result message instead', async () => {
+      actionsRegistry.isRetrySafe.mockReturnValue(false);
+      actionsRegistry.execute.mockRejectedValueOnce(new Error('blip'));
+      const automation = await service.create(orgA, userA, createDto());
+      const started = await service.triggerManual(orgA, userA, automation.id);
+      // The non-retry-safe first attempt already failed the run outright
+      // (see the earlier test) — force it back to 'running' to simulate a
+      // *crash* (unknown outcome) instead of an observed failure.
+      const stepRunId = started.steps[0].id;
+      const crashedAt = new Date('2026-01-01T00:00:00.000Z');
+      prisma.automationStepRun.update({
+        where: { id: stepRunId },
+        data: {
+          status: 'running',
+          claimedAt: crashedAt,
+          claimToken: 'stale-token',
+          attemptCount: 1,
+          nextAttemptAt: null,
+        },
+      });
+      actionsRegistry.execute.mockClear();
+
+      const staleNow = new Date(
+        crashedAt.getTime() + STEP_RETRY_CLAIM_LEASE_MS + 1,
+      );
+      await service.retryStep(stepRunId, staleNow);
+
+      // Never re-executed: reclaiming a non-retry-safe action's abandoned
+      // claim must never call the action again.
+      expect(actionsRegistry.execute).not.toHaveBeenCalled();
+      const run = await service.getRun(orgA, started.id);
+      expect(run.status).toBe('failed');
+      expect(run.steps[0].status).toBe('failed');
+      expect(run.errorMessage).toMatch(/indéterminé/i);
+      expect(run.errorMessage).toMatch(/humaine/i);
+    });
+
+    it('success followed by a crash before persistence: a worker that lost the claim mid-attempt never continues the run', async () => {
+      const automation = await service.create(
+        orgA,
+        userA,
+        createDto({
+          steps: [
+            {
+              actionType: 'robia.action_items.create_internal_task',
+              input: { title: 'Étape 1' },
+            },
+            {
+              actionType: 'robia.action_items.create_internal_task',
+              input: { title: 'Étape 2' },
+            },
+          ],
+        }),
+      );
+      actionsRegistry.execute.mockRejectedValueOnce(new Error('blip'));
+      actionsRegistry.isRetrySafe.mockReturnValue(true);
+      const started = await service.triggerManual(orgA, userA, automation.id);
+      const stepRunId = started.steps[0].id;
+      const dueAt = new Date(
+        (started.steps[0].nextAttemptAt as Date).getTime() + 1,
+      );
+
+      // While this retry's attemptStep() is conceptually "in flight" for an
+      // action that ends up succeeding, another worker reclaims the row as
+      // abandoned and finishes it first — simulated directly, since the
+      // race itself (two real concurrent calls) is exercised by the
+      // "double dispatcher" test below.
+      prisma.automationStepRun.update({
+        where: { id: stepRunId },
+        data: {
+          status: 'succeeded',
+          claimedAt: null,
+          claimToken: null,
+          finishedAt: new Date(),
+        },
+      });
+
+      actionsRegistry.execute.mockResolvedValueOnce({ ok: true });
+      await service.retryStep(stepRunId, dueAt);
+
+      // retryStep() itself must not have found anything left to claim (the
+      // row is no longer 'running'/'retry_scheduled') — no second execute.
+      expect(actionsRegistry.execute).toHaveBeenCalledTimes(1);
+      const run = await service.getRun(orgA, started.id);
+      // Step 2 must never have been created by this stale call.
+      expect(run.steps).toHaveLength(1);
+    });
+
+    it('double dispatcher: two concurrent reclaims of the same abandoned (crashed) step — only one re-executes', async () => {
+      actionsRegistry.isRetrySafe.mockReturnValue(true);
+      actionsRegistry.execute.mockRejectedValueOnce(new Error('blip'));
+      const automation = await service.create(orgA, userA, createDto());
+      const started = await service.triggerManual(orgA, userA, automation.id);
+      const stepRunId = started.steps[0].id;
+      const crashedAt = new Date('2026-01-01T00:00:00.000Z');
+      prisma.automationStepRun.update({
+        where: { id: stepRunId },
+        data: {
+          status: 'running',
+          claimedAt: crashedAt,
+          claimToken: 'stale-token',
+          attemptCount: 1,
+          nextAttemptAt: null,
+        },
+      });
+
+      actionsRegistry.execute
+        .mockResolvedValueOnce({ ok: true })
+        .mockResolvedValueOnce({ ok: true });
+      const staleNow = new Date(
+        crashedAt.getTime() + STEP_RETRY_CLAIM_LEASE_MS + 1,
+      );
+
+      await Promise.all([
+        service.retryStep(stepRunId, staleNow),
+        service.retryStep(stepRunId, staleNow),
+      ]);
+
+      // Both calls minted a *different* claimToken; the fake's synchronous
+      // updateMany still only lets one of them actually win the row (the
+      // second's WHERE no longer matches once the first has moved it to
+      // 'running' under its own token) — same single-winner guarantee as
+      // the scheduled-retry race, now proven for the abandoned-claim path
+      // too.
+      expect(actionsRegistry.execute).toHaveBeenCalledTimes(2); // 1 initial + 1 winning reclaim
+      const run = await service.getRun(orgA, started.id);
+      expect(run.status).toBe('succeeded');
+      expect(run.steps[0].attemptCount).toBe(2);
+    });
+
+    it('an abandoned step that has exhausted MAX_STEP_ATTEMPTS is force-failed, never stuck in running forever', async () => {
+      actionsRegistry.isRetrySafe.mockReturnValue(true);
+      actionsRegistry.execute.mockRejectedValueOnce(new Error('blip'));
+      const automation = await service.create(orgA, userA, createDto());
+      const started = await service.triggerManual(orgA, userA, automation.id);
+      const stepRunId = started.steps[0].id;
+      const crashedAt = new Date('2026-01-01T00:00:00.000Z');
+      // Already at budget: neither claim in retryStep() may re-attempt it.
+      prisma.automationStepRun.update({
+        where: { id: stepRunId },
+        data: {
+          status: 'running',
+          claimedAt: crashedAt,
+          claimToken: 'stale-token',
+          attemptCount: MAX_STEP_ATTEMPTS,
+          nextAttemptAt: null,
+        },
+      });
+
+      const staleNow = new Date(
+        crashedAt.getTime() + STEP_RETRY_CLAIM_LEASE_MS + 1,
+      );
+      await service.retryStep(stepRunId, staleNow);
+
+      expect(actionsRegistry.execute).toHaveBeenCalledTimes(1); // never re-executed
+      const run = await service.getRun(orgA, started.id);
+      expect(run.status).toBe('failed');
+      expect(run.steps[0].status).toBe('failed');
+      expect(run.errorMessage).toMatch(/budget/i);
     });
   });
 

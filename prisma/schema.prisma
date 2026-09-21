@@ -597,12 +597,21 @@ model AutomationStepRun {
   // When status='retry_scheduled', the instant AutomationStepRetryDispatcherService
   // may next attempt this step again. Null otherwise.
   nextAttemptAt DateTime? @map("next_attempt_at")
-  // A lease on an in-flight retry claim — mirrors Automation.scheduledClaimedAt
-  // (RC-25) and NotificationDelivery.claimedAt (RC-26). Never set for the
-  // initial synchronous attempt (only a real concurrency hazard — two
-  // dispatcher instances/ticks racing on the same due retry — needs a
-  // claim); null once no retry attempt is in flight.
+  // A lease on an in-flight attempt — mirrors Automation.scheduledClaimedAt
+  // (RC-25) and NotificationDelivery.claimedAt (RC-26). RC-27 hardening: now
+  // set on *every* attempt, including the first synchronous one (see
+  // AutomationsService.runStepsFrom()) — a crash mid-attempt must always be
+  // recoverable, not only a crash mid-retry. Null once no attempt is in
+  // flight.
   claimedAt  DateTime? @map("claimed_at")
+  // RC-27 hardening — an opaque token minted fresh for each individual
+  // attempt (first or retried), set together with claimedAt. Every
+  // conditional "did I still hold the claim when this attempt finished"
+  // check gates on `claimToken` matching, never on a specific `claimedAt`
+  // timestamp — a timestamp can coincidentally collide or (if a lease were
+  // ever extended by a heartbeat) drift, an opaque per-attempt token
+  // cannot. Null once no attempt is in flight.
+  claimToken String? @map("claim_token")
   startedAt  DateTime? @map("started_at")
   finishedAt DateTime? @map("finished_at")
   createdAt  DateTime @default(now()) @map("created_at")
