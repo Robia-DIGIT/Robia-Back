@@ -39,9 +39,31 @@ import {
 const TERMINAL_STATUSES = ['accepted', 'rejected', 'withdrawn'];
 const DECIDABLE_STATUSES = ['in_review', 'waitlisted'];
 
+// RC-33 hardening — storageKey deliberately excluded: it is an internal
+// filesystem-key implementation detail, never something a frontend or API
+// caller needs to render a document list, and never safe to hand back to a
+// client (see docs/RC33_ODC_STORAGE_HARDENING.md). Every application
+// response — getApplication, listByProgram, addDocument, addUploadedDocument
+// — shares this exact select, so a document row can never leak its
+// storageKey through any of them. A real download only ever goes through
+// GET /documents/:documentId/file, which resolves the key itself,
+// server-side, from OdcApplicationsService.findDocument() (a separate,
+// narrower query that still selects storageKey for that one purpose).
+const ODC_DOCUMENT_PUBLIC_SELECT = {
+  id: true,
+  organizationId: true,
+  applicationId: true,
+  documentTypeId: true,
+  originalName: true,
+  mimeType: true,
+  sizeBytes: true,
+  status: true,
+  createdAt: true,
+} satisfies Prisma.OdcDocumentSelect;
+
 export type OdcApplicationWithRelations = Prisma.OdcApplicationGetPayload<{
   include: {
-    documents: true;
+    documents: { select: typeof ODC_DOCUMENT_PUBLIC_SELECT };
     scoreLines: true;
     events: true;
     applicant: true;
@@ -142,7 +164,7 @@ export class OdcApplicationsService {
     const application = await this.prisma.odcApplication.findFirst({
       where: { id, organizationId },
       include: {
-        documents: true,
+        documents: { select: ODC_DOCUMENT_PUBLIC_SELECT },
         scoreLines: true,
         events: { orderBy: { createdAt: 'asc' } },
         applicant: true,
@@ -166,7 +188,7 @@ export class OdcApplicationsService {
       where: { organizationId, programId },
       include: {
         applicant: true,
-        documents: true,
+        documents: { select: ODC_DOCUMENT_PUBLIC_SELECT },
         scoreLines: true,
       },
       orderBy: { updatedAt: 'desc' },
@@ -207,12 +229,20 @@ export class OdcApplicationsService {
     return this.getApplication(organizationId, id);
   }
 
-  // Metadata-only path — no file ever passes through here. Kept exactly as
-  // RC-29 shipped it (staff/seed can still record a document by hand, e.g.
-  // RC-32's demo seed) even though RC-33 added a real upload path
-  // (addUploadedDocument() below, via POST .../documents/upload): this one
-  // still accepts a caller-supplied storageKey and never touches
-  // OdcStorage.
+  // Metadata-only path — no file ever passes through here and no
+  // storageKey is ever accepted (see CreateOdcDocumentDto's own doc
+  // comment): this only ever registers a 'pending_upload' placeholder slot
+  // for a document type. The real upload path (addUploadedDocument() below,
+  // via POST .../documents/upload) is the only way a document ever reaches
+  // 'received'.
+  //
+  // RC-33 hardening — multiple-documents policy: at most one document per
+  // (application, documentType) slot (see OdcDocument's own @@unique). This
+  // metadata-only route never silently discards an occupied slot — unlike
+  // addUploadedDocument(), it never touches OdcStorage, so it has no way to
+  // clean up a real file a 'received' occupant might already point at.
+  // Only a real upload (which does own that cleanup) may replace a slot;
+  // this route simply refuses when one is already taken.
   async addDocument(
     organizationId: string,
     id: string,
@@ -223,12 +253,9 @@ export class OdcApplicationsService {
       application,
       dto.documentTypeId,
     );
+    await this.assertSlotFree(id, docType.id);
 
-    // storageKey is optional here (no file backs this path): its presence
-    // alone decides whether this document already counts toward
-    // completeness.
-    const status = dto.storageKey ? 'received' : 'pending_upload';
-    const document = await this.prisma.odcDocument.create({
+    await this.prisma.odcDocument.create({
       data: {
         organizationId,
         applicationId: id,
@@ -236,20 +263,10 @@ export class OdcApplicationsService {
         originalName: dto.originalName,
         mimeType: dto.mimeType,
         sizeBytes: dto.sizeBytes,
-        storageKey: dto.storageKey ?? null,
-        status,
+        storageKey: null,
+        status: 'pending_upload',
       },
     });
-
-    if (status === 'received') {
-      const payload: OdcDocumentReceivedEvent = {
-        organizationId,
-        applicationId: id,
-        documentId: document.id,
-        documentTypeId: docType.id,
-      };
-      this.events.emit(ODC_DOCUMENT_RECEIVED_EVENT, payload);
-    }
 
     return this.getApplication(organizationId, id);
   }
@@ -262,6 +279,16 @@ export class OdcApplicationsService {
   // (buildOdcStorageKey's {documentId} segment), passed through so the
   // OdcDocument row's own id always matches the key that was actually
   // written — never a second, independently generated id.
+  //
+  // RC-33 hardening — multiple-documents policy: atomic replacement. If a
+  // document already occupies this (application, documentType) slot
+  // (received or still pending_upload), it is deleted in the same
+  // transaction that creates the new row — there is never a moment with
+  // zero or two rows for a slot, and a caller can never need to pick among
+  // several documents of the same type. The previous occupant's own
+  // storageKey (if it had one) is returned so the caller — the only layer
+  // that owns OdcStorage — can delete that now-orphaned file once this
+  // transaction has actually committed, never before.
   async addUploadedDocument(
     organizationId: string,
     id: string,
@@ -273,36 +300,68 @@ export class OdcApplicationsService {
       sizeBytes: number;
       storageKey: string;
     },
-  ): Promise<OdcApplicationWithRelations> {
+  ): Promise<{
+    application: OdcApplicationWithRelations;
+    replacedStorageKey: string | null;
+  }> {
     const application = await this.getApplication(organizationId, id);
     const docType = this.resolveAddableDocumentType(
       application,
       input.documentTypeId,
     );
 
-    const document = await this.prisma.odcDocument.create({
-      data: {
-        id: input.id,
-        organizationId,
-        applicationId: id,
-        documentTypeId: docType.id,
-        originalName: input.originalName,
-        mimeType: input.mimeType,
-        sizeBytes: input.sizeBytes,
-        storageKey: input.storageKey,
-        status: 'received',
-      },
+    const replaced = await this.prisma.$transaction(async (tx) => {
+      const existing = await tx.odcDocument.findFirst({
+        where: { applicationId: id, documentTypeId: docType.id },
+      });
+      if (existing) {
+        await tx.odcDocument.delete({ where: { id: existing.id } });
+      }
+      await tx.odcDocument.create({
+        data: {
+          id: input.id,
+          organizationId,
+          applicationId: id,
+          documentTypeId: docType.id,
+          originalName: input.originalName,
+          mimeType: input.mimeType,
+          sizeBytes: input.sizeBytes,
+          storageKey: input.storageKey,
+          status: 'received',
+        },
+      });
+      return existing?.storageKey ?? null;
     });
 
     const payload: OdcDocumentReceivedEvent = {
       organizationId,
       applicationId: id,
-      documentId: document.id,
+      documentId: input.id,
       documentTypeId: docType.id,
     };
     this.events.emit(ODC_DOCUMENT_RECEIVED_EVENT, payload);
 
-    return this.getApplication(organizationId, id);
+    return {
+      application: await this.getApplication(organizationId, id),
+      replacedStorageKey: replaced,
+    };
+  }
+
+  // Shared guard for addDocument()'s own slot-occupied check — a plain
+  // findFirst + throw, never relying on the DB's unique constraint alone
+  // to surface a clean ConflictException instead of a raw P2002.
+  private async assertSlotFree(
+    applicationId: string,
+    documentTypeId: string,
+  ): Promise<void> {
+    const existing = await this.prisma.odcDocument.findFirst({
+      where: { applicationId, documentTypeId },
+    });
+    if (existing) {
+      throw new ConflictException(
+        'A document already exists for this document type — only a real upload can replace it.',
+      );
+    }
   }
 
   // Called only by OdcDocumentsService.upload(), *before* it writes

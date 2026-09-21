@@ -166,36 +166,62 @@ describe('OdcApplicationsService', () => {
   // Documents
   // ---------------------------------------------------------------------
 
-  it('creates a document as pending_upload when no storageKey is given, and received when one is', async () => {
+  // RC-33 hardening — addDocument() (the public metadata-only JSON route)
+  // can no longer accept a storageKey at all: CreateOdcDocumentDto has no
+  // such field, so every document it creates is 'pending_upload', never
+  // 'received'. See addUploadedDocument()'s own tests below for the only
+  // path that ever reaches 'received'.
+  it('addDocument() always creates a pending_upload document and never emits the received event', async () => {
     const program = createProgram(orgA);
     const application = await createDraftApplication(orgA, program.id);
     const docTypeId = program.docTypes[0].id as string;
 
-    const withoutKey = await service.addDocument(orgA, application.id, {
+    const result = await service.addDocument(orgA, application.id, {
       documentTypeId: docTypeId,
       originalName: 'id.pdf',
       mimeType: 'application/pdf',
       sizeBytes: 100,
     });
-    expect(withoutKey.documents[0].status).toBe('pending_upload');
+
+    expect(result.documents[0].status).toBe('pending_upload');
     expect(events.emit).not.toHaveBeenCalledWith(
       ODC_DOCUMENT_RECEIVED_EVENT,
       expect.anything(),
     );
+  });
 
-    const withKey = await service.addDocument(orgA, application.id, {
-      documentTypeId: docTypeId,
-      originalName: 'id2.pdf',
-      mimeType: 'application/pdf',
-      sizeBytes: 200,
-      storageKey: 's3://bucket/id2.pdf',
-    });
-    const received = withKey.documents.find((d: FakeRecord) => d.storageKey);
-    expect(received?.status).toBe('received');
-    expect(events.emit).toHaveBeenCalledWith(
-      ODC_DOCUMENT_RECEIVED_EVENT,
-      expect.objectContaining({ applicationId: application.id }),
+  // RC-33 hardening — a document row's storageKey must never be part of
+  // any application response: it is an internal filesystem-key detail, not
+  // something a caller needs (or should be able to use to probe another
+  // organization's files). See ODC_DOCUMENT_PUBLIC_SELECT.
+  it('never exposes storageKey on a document returned as part of an application', async () => {
+    const program = createProgram(orgA);
+    const application = await createDraftApplication(orgA, program.id);
+    const docTypeId = program.docTypes[0].id as string;
+
+    const { application: result } = await service.addUploadedDocument(
+      orgA,
+      application.id,
+      {
+        id: 'doc-no-leak',
+        documentTypeId: docTypeId,
+        originalName: 'cv.pdf',
+        mimeType: 'application/pdf',
+        sizeBytes: 100,
+        storageKey: `${orgA}/${application.id}/doc-no-leak/uuid.pdf`,
+      },
     );
+
+    const document = result.documents.find(
+      (d: FakeRecord) => d.id === 'doc-no-leak',
+    );
+    expect(document).toBeDefined();
+    expect(document).not.toHaveProperty('storageKey');
+
+    const fetched = await service.getApplication(orgA, application.id);
+    expect(
+      fetched.documents.find((d: FakeRecord) => d.id === 'doc-no-leak'),
+    ).not.toHaveProperty('storageKey');
   });
 
   it("rejects a document whose type does not belong to the application's program", async () => {
@@ -220,21 +246,27 @@ describe('OdcApplicationsService', () => {
     const application = await createDraftApplication(orgA, program.id);
     const docTypeId = program.docTypes[0].id as string;
 
-    const result = await service.addUploadedDocument(orgA, application.id, {
-      id: 'doc-fixed-id',
-      documentTypeId: docTypeId,
-      originalName: 'cv.pdf',
-      mimeType: 'application/pdf',
-      sizeBytes: 12_345,
-      storageKey: `${orgA}/${application.id}/doc-fixed-id/uuid.pdf`,
-    });
+    const { application: result, replacedStorageKey } =
+      await service.addUploadedDocument(orgA, application.id, {
+        id: 'doc-fixed-id',
+        documentTypeId: docTypeId,
+        originalName: 'cv.pdf',
+        mimeType: 'application/pdf',
+        sizeBytes: 12_345,
+        storageKey: `${orgA}/${application.id}/doc-fixed-id/uuid.pdf`,
+      });
 
+    expect(replacedStorageKey).toBeNull();
     const document = result.documents.find(
       (d: FakeRecord) => d.id === 'doc-fixed-id',
     );
     expect(document).toBeDefined();
     expect(document?.status).toBe('received');
-    expect(document?.storageKey).toBe(
+    // storageKey itself is never exposed on the application response (see
+    // ODC_DOCUMENT_PUBLIC_SELECT) — findDocument() is the one internal,
+    // narrower query that still returns it, for getFile()'s own use.
+    const raw = await service.findDocument(orgA, 'doc-fixed-id');
+    expect(raw?.storageKey).toBe(
       `${orgA}/${application.id}/doc-fixed-id/uuid.pdf`,
     );
     expect(events.emit).toHaveBeenCalledWith(
@@ -244,6 +276,112 @@ describe('OdcApplicationsService', () => {
         documentId: 'doc-fixed-id',
       }),
     );
+  });
+
+  // ---------------------------------------------------------------------
+  // Multiple-documents policy (RC-33 hardening) — atomic replacement
+  // ---------------------------------------------------------------------
+
+  it('addUploadedDocument() atomically replaces an existing document for the same slot, keeping exactly one row', async () => {
+    const program = createProgram(orgA);
+    const application = await createDraftApplication(orgA, program.id);
+    const docTypeId = program.docTypes[0].id as string;
+
+    const { application: first } = await service.addUploadedDocument(
+      orgA,
+      application.id,
+      {
+        id: 'doc-v1',
+        documentTypeId: docTypeId,
+        originalName: 'cv-v1.pdf',
+        mimeType: 'application/pdf',
+        sizeBytes: 100,
+        storageKey: `${orgA}/${application.id}/doc-v1/uuid.pdf`,
+      },
+    );
+    expect(first.documents).toHaveLength(1);
+    expect(first.documents[0].id).toBe('doc-v1');
+
+    const { application: second, replacedStorageKey } =
+      await service.addUploadedDocument(orgA, application.id, {
+        id: 'doc-v2',
+        documentTypeId: docTypeId,
+        originalName: 'cv-v2.pdf',
+        mimeType: 'application/pdf',
+        sizeBytes: 200,
+        storageKey: `${orgA}/${application.id}/doc-v2/uuid.pdf`,
+      });
+
+    // Exactly one document for this slot — never two, never zero — and it
+    // is deterministically the new one, never ambiguous.
+    expect(second.documents).toHaveLength(1);
+    expect(second.documents[0].id).toBe('doc-v2');
+    expect(second.documents[0].originalName).toBe('cv-v2.pdf');
+    expect(replacedStorageKey).toBe(
+      `${orgA}/${application.id}/doc-v1/uuid.pdf`,
+    );
+  });
+
+  it('addUploadedDocument() replacing a slot never disturbs a different document type', async () => {
+    const program = createProgram(orgA, {
+      docTypes: [
+        { key: 'cv', label: 'CV', required: true },
+        { key: 'id_card', label: "Pièce d'identité", required: true },
+      ],
+    });
+    const application = await createDraftApplication(orgA, program.id);
+    const cvTypeId = program.docTypes[0].id as string;
+    const idTypeId = program.docTypes[1].id as string;
+
+    await service.addUploadedDocument(orgA, application.id, {
+      id: 'doc-cv',
+      documentTypeId: cvTypeId,
+      originalName: 'cv.pdf',
+      mimeType: 'application/pdf',
+      sizeBytes: 100,
+      storageKey: `${orgA}/${application.id}/doc-cv/uuid.pdf`,
+    });
+    const { application: result } = await service.addUploadedDocument(
+      orgA,
+      application.id,
+      {
+        id: 'doc-id',
+        documentTypeId: idTypeId,
+        originalName: 'id.pdf',
+        mimeType: 'application/pdf',
+        sizeBytes: 50,
+        storageKey: `${orgA}/${application.id}/doc-id/uuid.pdf`,
+      },
+    );
+
+    expect(result.documents).toHaveLength(2);
+    expect(result.documents.map((d: FakeRecord) => d.id).sort()).toEqual([
+      'doc-cv',
+      'doc-id',
+    ]);
+  });
+
+  it('addDocument() refuses to create a placeholder for a slot that is already occupied', async () => {
+    const program = createProgram(orgA);
+    const application = await createDraftApplication(orgA, program.id);
+    const docTypeId = program.docTypes[0].id as string;
+    await service.addUploadedDocument(orgA, application.id, {
+      id: 'doc-existing',
+      documentTypeId: docTypeId,
+      originalName: 'cv.pdf',
+      mimeType: 'application/pdf',
+      sizeBytes: 100,
+      storageKey: `${orgA}/${application.id}/doc-existing/uuid.pdf`,
+    });
+
+    await expect(
+      service.addDocument(orgA, application.id, {
+        documentTypeId: docTypeId,
+        originalName: 'another.pdf',
+        mimeType: 'application/pdf',
+        sizeBytes: 1,
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
   });
 
   it('addUploadedDocument() enforces the same status/docType rules as addDocument()', async () => {
@@ -314,12 +452,13 @@ describe('OdcApplicationsService', () => {
     await service.updateAnswers(orgA, application.id, {
       answers: { motivation: 'yes' },
     });
-    await service.addDocument(orgA, application.id, {
+    await service.addUploadedDocument(orgA, application.id, {
+      id: 'doc-submit-complete',
       documentTypeId: program.docTypes[0].id as string,
       originalName: 'id.pdf',
       mimeType: 'application/pdf',
       sizeBytes: 100,
-      storageKey: 's3://bucket/id.pdf',
+      storageKey: `${orgA}/${application.id}/doc-submit-complete/uuid.pdf`,
     });
 
     const result = await service.submit(orgA, userA, application.id);
@@ -383,12 +522,13 @@ describe('OdcApplicationsService', () => {
     expect(submitted.status).toBe('incomplete');
 
     events.emit.mockClear();
-    await service.addDocument(orgA, application.id, {
+    await service.addUploadedDocument(orgA, application.id, {
+      id: 'doc-recompute-complete',
       documentTypeId: program.docTypes[0].id as string,
       originalName: 'id.pdf',
       mimeType: 'application/pdf',
       sizeBytes: 100,
-      storageKey: 's3://bucket/id.pdf',
+      storageKey: `${orgA}/${application.id}/doc-recompute-complete/uuid.pdf`,
     });
     const result = await service.recomputeMissingDocuments(
       orgA,

@@ -62,6 +62,37 @@ Testez FastAPI depuis son conteneur :
 
 `docker compose --env-file .env.production -f docker-compose.production.yml exec ai-engine python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health').read().decode())"`
 
+## Stockage persistant des documents ODC
+
+Les fichiers uploadés par les candidatures ODC (RC-33) sont écrits par le
+conteneur `backend` sous `/data/odc-uploads` (variable `ODC_UPLOAD_DIR`,
+définie directement dans `docker-compose.production.yml`), monté depuis le
+volume Docker nommé `robia_odc_uploads`. Ce volume reste inscriptible même
+si `backend` tourne avec `read_only: true` sur le reste de son système de
+fichiers, et il survit à `docker compose up -d --build` (recréation du
+conteneur) — seule la suppression explicite du volume (`docker volume rm`)
+ou de la machine VPS elle-même le détruit.
+
+**Permissions** : le volume est initialisé au premier montage avec le
+contenu et les permissions du répertoire `/data/odc-uploads` de l'image
+(créé `chown node:node` dans le `Dockerfile`, avant `USER node`) — aucune
+intervention manuelle n'est nécessaire au premier déploiement.
+
+**Sauvegarde** : ce volume n'est *pas* couvert par
+`/srv/robia/scripts/backup-supabase.sh` (qui ne sauvegarde que PostgreSQL).
+Sauvegardez-le séparément, par exemple :
+
+`docker run --rm -v robia-backend_robia_odc_uploads:/data -v /srv/robia/backups:/backup alpine tar czf /backup/odc-uploads-$(date +%Y%m%d).tar.gz -C /data .`
+
+**Restauration** : arrêtez `backend`, videz le volume cible puis
+restaurez l'archive, avant de redémarrer :
+
+`docker compose --env-file .env.production -f docker-compose.production.yml stop backend`
+
+`docker run --rm -v robia-backend_robia_odc_uploads:/data -v /srv/robia/backups:/backup alpine sh -c "rm -rf /data/* && tar xzf /backup/odc-uploads-<date>.tar.gz -C /data"`
+
+`docker compose --env-file .env.production -f docker-compose.production.yml start backend`
+
 ## Caddy
 
 Ajoutez le bloc de `deploy/Caddyfile.api.example` au Caddy déjà fourni par Supabase, puis rechargez uniquement Caddy. Le conteneur Caddy doit rester connecté à `supabase_default`, où l'alias `robia-api` est disponible.

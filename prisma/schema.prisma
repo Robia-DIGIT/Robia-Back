@@ -840,6 +840,16 @@ model OdcApplication {
 // backend wired up yet); `status` starts at `received` only when the
 // service is given a `storageKey` at creation time, `pending_upload`
 // otherwise — see OdcApplicationsService.addDocument().
+// RC-33 hardening — multiple-documents policy: atomic replacement, enforced
+// by @@unique([applicationId, documentTypeId]) below. At most one document
+// row can ever exist per (application, document type) — a new upload
+// (OdcApplicationsService.addUploadedDocument()) atomically deletes
+// whatever occupied that slot before creating its own row, in the same
+// transaction, so there is never a moment with zero or two rows for that
+// slot. This also removes any "which one is current" ambiguity at the
+// source: a caller (frontend included) can never need to pick among
+// several documents of the same type by createdAt or any other order,
+// because there is structurally only ever one.
 model OdcDocument {
   id             String @id @default(cuid())
   organizationId String @map("organization_id")
@@ -854,6 +864,7 @@ model OdcDocument {
   status         String @default("received") // pending_upload | received | rejected
   createdAt      DateTime @default(now()) @map("created_at")
 
+  @@unique([applicationId, documentTypeId])
   @@index([organizationId, applicationId])
   @@map("odc_documents")
 }

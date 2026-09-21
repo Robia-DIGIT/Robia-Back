@@ -62,4 +62,27 @@ describe('LocalOdcStorage', () => {
       storage.put('../../etc/passwd', Buffer.from('x')),
     ).rejects.toThrow(/outside the upload root/);
   });
+
+  it('delete() removes a written file', async () => {
+    const key = 'org-1/app-1/doc-1/file.pdf';
+    await storage.put(key, Buffer.from('x'));
+
+    await storage.delete(key);
+
+    expect(await storage.exists(key)).toBe(false);
+  });
+
+  it('delete() is a safe no-op for a key that was never written', async () => {
+    await expect(
+      storage.delete('org-1/app-1/doc-404/missing.pdf'),
+    ).resolves.toBeUndefined();
+  });
+
+  it('delete() called twice on the same key is still a safe no-op', async () => {
+    const key = 'org-1/app-1/doc-1/file.pdf';
+    await storage.put(key, Buffer.from('x'));
+
+    await storage.delete(key);
+    await expect(storage.delete(key)).resolves.toBeUndefined();
+  });
 });

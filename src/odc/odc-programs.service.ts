@@ -92,6 +92,35 @@ export class OdcProgramsService {
       throw new ConflictException('An archived program cannot be edited.');
     }
 
+    // RC-33 hardening — criteria/docTypes are referenced by FK from
+    // OdcScoreLine.criterionId and OdcDocument.documentTypeId respectively.
+    // Before this guard, a PATCH touching either array would
+    // deleteMany()+createMany() them wholesale even once a candidature
+    // already referenced the old rows — at best a raw, unhandled FK
+    // constraint violation (Restrict is Prisma's default, no onDelete was
+    // ever declared for either relation), at worst — for a program with no
+    // candidatures yet, so no constraint to trip — a silent redefinition
+    // that would corrupt any candidature created *afterwards* but scored
+    // against IDs that no longer resolve to the same criteria. Once any
+    // application exists for this program, criteria/docTypes are frozen:
+    // the simpler of the two options the spec allows (refuse modification)
+    // over introducing stable versioned identifiers, since nothing in this
+    // RC's routes needs to *edit* a definition retroactively, only to stop
+    // silently breaking one that's already in use. `fields` has no FK from
+    // any other model (only its `key` is read out of the free-form
+    // `answers` JSON) and is deliberately not covered by this guard.
+    if (dto.criteria !== undefined || dto.docTypes !== undefined) {
+      const hasApplications = await this.prisma.odcApplication.findFirst({
+        where: { programId: id },
+        select: { id: true },
+      });
+      if (hasApplications) {
+        throw new ConflictException(
+          'This program already has at least one candidature — criteria and document types can no longer be modified. Create a new program instead.',
+        );
+      }
+    }
+
     // fields/criteria/docTypes are wholesale-replaced, never merged — see
     // UpdateOdcProgramDto's own doc comment. Only touched when the caller
     // actually sends that array, so a PATCH that only edits `name` never

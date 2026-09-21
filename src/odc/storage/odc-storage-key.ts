@@ -44,6 +44,25 @@ export function buildOdcStorageKey(
   return `${organizationId}/${applicationId}/${documentId}/${randomUUID()}${extensionForMimeType(mimeType)}`;
 }
 
+// RC-33 hardening — the download path's own independent guard: even though
+// a storageKey can no longer be client-supplied (see CreateOdcDocumentDto),
+// a pre-hardening row may still carry one that was — this never trusts a
+// storageKey to actually belong to the document/application/organization
+// triplet its own DB row claims, it re-derives the expected prefix from
+// that row (never from the key itself) and requires an exact match. A key
+// that fails this can never be read, whatever OdcStorage.get() would
+// otherwise return for it.
+export function storageKeyBelongsTo(
+  storageKey: string,
+  organizationId: string,
+  applicationId: string,
+  documentId: string,
+): boolean {
+  return storageKey.startsWith(
+    `${organizationId}/${applicationId}/${documentId}/`,
+  );
+}
+
 // A Content-Disposition filename is attacker-influenced (it round-trips the
 // candidate's own uploaded originalName) and sits inside an HTTP header, so
 // CR/LF (header injection), the quote that closes the filename="..." value,

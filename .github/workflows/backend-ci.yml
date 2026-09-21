@@ -78,7 +78,12 @@ jobs:
 
   deployment-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # RC-33 hardening — was 5: test_odc_storage_integration.py now builds
+    # the real runtime image and runs containers against it (a live Docker
+    # daemon, always present on this runner) to prove the ODC upload volume
+    # actually persists across container recreation, not just that the
+    # compose file parses.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - run: sh -n deploy/github-deploy.sh

@@ -117,6 +117,129 @@ describe('OdcProgramsService', () => {
     expect(updated.fields[0].key).toBe('new_field');
   });
 
+  // ---------------------------------------------------------------------
+  // Program definition protection (RC-33 hardening)
+  // ---------------------------------------------------------------------
+
+  function createApplicationFor(programId: string): { id: string } {
+    const applicant = prisma.odcApplicant.create({
+      data: { organizationId: orgA, displayName: 'Jane Doe' },
+    }) as { id: string };
+    return prisma.odcApplication.create({
+      data: { organizationId: orgA, programId, applicantId: applicant.id },
+    }) as { id: string };
+  }
+
+  it('update() still wholesale-replaces criteria/docTypes while no candidature exists yet', async () => {
+    const program = await service.create(orgA, userA, createDto());
+    const updated = await service.update(orgA, program.id, {
+      criteria: [{ key: 'new_criterion', label: 'Nouveau critère' }],
+      docTypes: [{ key: 'new_doc', label: 'Nouveau document' }],
+    });
+    expect(updated.criteria).toHaveLength(1);
+    expect(updated.criteria[0].key).toBe('new_criterion');
+    expect(updated.docTypes).toHaveLength(1);
+    expect(updated.docTypes[0].key).toBe('new_doc');
+  });
+
+  it('update() refuses to modify criteria once the program has at least one candidature', async () => {
+    const program = await service.create(orgA, userA, createDto());
+    createApplicationFor(program.id);
+
+    await expect(
+      service.update(orgA, program.id, {
+        criteria: [{ key: 'new_criterion', label: 'Nouveau critère' }],
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    // Never wholesale-replaced — the original criterion must still be there.
+    const unchanged = await service.findOne(orgA, program.id);
+    expect(unchanged.criteria[0].key).toBe('c1');
+  });
+
+  it('update() refuses to modify docTypes once the program has at least one candidature', async () => {
+    const program = await service.create(orgA, userA, createDto());
+    createApplicationFor(program.id);
+
+    await expect(
+      service.update(orgA, program.id, {
+        docTypes: [{ key: 'new_doc', label: 'Nouveau document' }],
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    const unchanged = await service.findOne(orgA, program.id);
+    expect(unchanged.docTypes[0].key).toBe('id_card');
+  });
+
+  it('update() still allows editing top-level fields (e.g. name) once the program has at least one candidature', async () => {
+    const program = await service.create(orgA, userA, createDto());
+    createApplicationFor(program.id);
+
+    const updated = await service.update(orgA, program.id, {
+      name: 'Nouveau nom',
+    });
+    expect(updated.name).toBe('Nouveau nom');
+  });
+
+  it('update() still allows editing fields (unprotected) once the program has at least one candidature', async () => {
+    const program = await service.create(orgA, userA, createDto());
+    createApplicationFor(program.id);
+
+    const updated = await service.update(orgA, program.id, {
+      fields: [{ key: 'new_field', label: 'Nouveau champ', fieldType: 'text' }],
+    });
+    expect(updated.fields[0].key).toBe('new_field');
+  });
+
+  // Integration scenario #7 from the PR2 spec: a program with a real
+  // document and a real scoreLine already referencing its criteria/docTypes
+  // — not just a bare application row — is exactly the case the FK
+  // (@@unique + Restrict-by-default relations) would otherwise blow up on
+  // with a raw, unhandled constraint error if criteria/docTypes were ever
+  // deleteMany()'d out from under them.
+  it('update() refuses criteria/docTypes changes when the program has real documents and scoreLines attached', async () => {
+    const program = await service.create(orgA, userA, createDto());
+    const application = createApplicationFor(program.id);
+    prisma.odcDocument.create({
+      data: {
+        organizationId: orgA,
+        applicationId: application.id,
+        documentTypeId: program.docTypes[0].id,
+        originalName: 'cv.pdf',
+        mimeType: 'application/pdf',
+        sizeBytes: 100,
+        storageKey: `${orgA}/${application.id}/doc-1/uuid.pdf`,
+        status: 'received',
+      },
+    });
+    prisma.odcScoreLine.upsert({
+      where: {
+        applicationId_criterionId: {
+          applicationId: application.id,
+          criterionId: program.criteria[0].id,
+        },
+      },
+      create: {
+        organizationId: orgA,
+        applicationId: application.id,
+        criterionId: program.criteria[0].id,
+        proposedPoints: 3,
+      },
+      update: {},
+    });
+
+    await expect(
+      service.update(orgA, program.id, {
+        criteria: [{ key: 'new_criterion', label: 'Nouveau critère' }],
+        docTypes: [{ key: 'new_doc', label: 'Nouveau document' }],
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+
+    // The document and scoreLine still resolve to the original,
+    // untouched criterion/docType ids — never dangling.
+    const unchanged = await service.findOne(orgA, program.id);
+    expect(unchanged.criteria[0].id).toBe(program.criteria[0].id);
+    expect(unchanged.docTypes[0].id).toBe(program.docTypes[0].id);
+  });
+
   it('rejects editing an archived program', async () => {
     const program = await service.create(orgA, userA, createDto());
     // No route reaches 'archived' in this RC — simulate it directly to

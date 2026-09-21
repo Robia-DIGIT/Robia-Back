@@ -48,6 +48,7 @@ services:
     environment:
       AI_ENGINE_URL: http://ai-engine:8000
       PORT: "3001"
+      ODC_UPLOAD_DIR: /data/odc-uploads
     expose:
       - "3001"
     networks:
@@ -69,6 +70,14 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
+    # RC-33 hardening — a real ODC upload previously had nowhere durable to
+    # land: no volume existed, and the container's read_only root filesystem
+    # made even a fallback default (var/odc-uploads under the app's own,
+    # read-only WORKDIR) silently fail on write. A named volume stays
+    # writable regardless of read_only: true, and survives container
+    # recreation (`docker compose up -d --build`) unlike the tmpfs above.
+    volumes:
+      - robia_odc_uploads:/data/odc-uploads
     deploy:
       resources:
         limits:
@@ -83,3 +92,6 @@ networks:
   supabase:
     external: true
     name: supabase_default
+
+volumes:
+  robia_odc_uploads:
