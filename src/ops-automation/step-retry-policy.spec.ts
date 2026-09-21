@@ -8,7 +8,13 @@ import {
   InvalidOpsActionInputError,
   UnknownOpsActionError,
 } from './actions/ops-actions-registry.service';
-import { dueStepRetryWhere, isPermanentStepError } from './step-retry-policy';
+import {
+  abandonedRunningClaimWhere,
+  dueScheduledRetryWhere,
+  dueStepRetryWhere,
+  isPermanentStepError,
+  legacyUnclaimedRunningWhere,
+} from './step-retry-policy';
 
 describe('isPermanentStepError', () => {
   it('treats InvalidOpsActionInputError as permanent', () => {
@@ -54,31 +60,44 @@ describe('isPermanentStepError', () => {
   });
 });
 
-describe('dueStepRetryWhere', () => {
+describe('dueStepRetryWhere (scan predicate)', () => {
   const now = new Date('2026-09-17T12:00:00.000Z');
   const stale = new Date('2026-09-17T11:55:00.000Z');
 
-  function matches(record: Record<string, unknown>): boolean {
+  function matches(record: {
+    status: string;
+    nextAttemptAt: Date | null;
+    claimedAt: Date | null;
+    claimToken?: string | null;
+    startedAt?: Date | null;
+  }): boolean {
     const where = dueStepRetryWhere(now, stale);
-    return where.AND.every((clause) => {
-      if (!('OR' in clause)) return true;
-      return clause.OR.some((branch: Record<string, unknown>) =>
-        Object.entries(branch).every(([key, condition]) => {
-          const value = record[key];
-          if (condition === null) return value === null;
-          if (condition && typeof condition === 'object') {
-            const cond = condition as { lte?: Date; lt?: Date; not?: null };
-            if (cond.lte) return !!value && (value as Date) <= cond.lte;
-            if (cond.lt) return !!value && (value as Date) < cond.lt;
-            if ('not' in cond) return value !== cond.not;
-          }
-          return value === condition;
-        }),
+    return where.OR.some((branch) => {
+      if (branch.status === 'retry_scheduled') {
+        return (
+          record.status === 'retry_scheduled' &&
+          !!record.nextAttemptAt &&
+          record.nextAttemptAt <= now
+        );
+      }
+      if ('startedAt' in branch) {
+        return (
+          record.status === 'running' &&
+          record.claimedAt === null &&
+          (record.claimToken ?? null) === null &&
+          !!record.startedAt &&
+          record.startedAt < stale
+        );
+      }
+      return (
+        record.status === 'running' &&
+        !!record.claimedAt &&
+        record.claimedAt < stale
       );
     });
   }
 
-  it('matches a due, unclaimed retry_scheduled step', () => {
+  it('matches a due retry_scheduled step', () => {
     expect(
       matches({
         status: 'retry_scheduled',
@@ -98,17 +117,7 @@ describe('dueStepRetryWhere', () => {
     ).toBe(false);
   });
 
-  it('does not match a retry_scheduled step whose lease is actively held', () => {
-    expect(
-      matches({
-        status: 'retry_scheduled',
-        nextAttemptAt: new Date('2026-09-17T11:59:00.000Z'),
-        claimedAt: new Date('2026-09-17T11:58:00.000Z'), // fresh, not stale
-      }),
-    ).toBe(false);
-  });
-
-  it('matches a running step whose claim has gone stale (a crash mid-retry)', () => {
+  it('matches a running step whose claim has gone stale — first attempt or retry, crashed either way', () => {
     expect(
       matches({
         status: 'running',
@@ -118,7 +127,7 @@ describe('dueStepRetryWhere', () => {
     ).toBe(true);
   });
 
-  it('never matches a running step whose claim is fresh (a retry actively in flight)', () => {
+  it('never matches a running step whose claim is still fresh (an attempt actively in flight)', () => {
     expect(
       matches({
         status: 'running',
@@ -128,17 +137,82 @@ describe('dueStepRetryWhere', () => {
     ).toBe(false);
   });
 
-  it('never matches a running step with no claim at all — the initial synchronous attempt, not an abandoned retry', () => {
-    expect(
-      matches({ status: 'running', nextAttemptAt: null, claimedAt: null }),
-    ).toBe(false);
-  });
-
   it('never matches a succeeded/failed/queued step', () => {
     for (const status of ['succeeded', 'failed', 'queued', 'skipped']) {
       expect(matches({ status, nextAttemptAt: null, claimedAt: null })).toBe(
         false,
       );
     }
+  });
+
+  it('matches a legacy pre-RC27 running step with no claim at all, past the lease', () => {
+    expect(
+      matches({
+        status: 'running',
+        nextAttemptAt: null,
+        claimedAt: null,
+        claimToken: null,
+        startedAt: new Date('2026-09-17T11:50:00.000Z'), // older than `stale`
+      }),
+    ).toBe(true);
+  });
+
+  it('never matches a recent legacy-shaped running step (startedAt still within the lease)', () => {
+    expect(
+      matches({
+        status: 'running',
+        nextAttemptAt: null,
+        claimedAt: null,
+        claimToken: null,
+        startedAt: new Date('2026-09-17T11:59:00.000Z'),
+      }),
+    ).toBe(false);
+  });
+
+  it('never matches a running step that already holds a claim, via the legacy branch', () => {
+    expect(
+      matches({
+        status: 'running',
+        nextAttemptAt: null,
+        claimedAt: new Date('2026-09-17T11:59:00.000Z'), // fresh claim
+        claimToken: 'token',
+        startedAt: new Date('2026-09-17T11:00:00.000Z'), // long past, irrelevant
+      }),
+    ).toBe(false);
+  });
+});
+
+describe('legacyUnclaimedRunningWhere (pre-RC27 first attempts with no claim at all)', () => {
+  const stale = new Date('2026-09-17T11:55:00.000Z');
+
+  it('is exactly status=running, claimedAt=null, claimToken=null, with a stale startedAt', () => {
+    expect(legacyUnclaimedRunningWhere(stale)).toEqual({
+      status: 'running',
+      claimedAt: null,
+      claimToken: null,
+      startedAt: { lt: stale },
+    });
+  });
+});
+
+describe('dueScheduledRetryWhere (claim #1 — always known retry-safe)', () => {
+  const now = new Date('2026-09-17T12:00:00.000Z');
+
+  it('is exactly status=retry_scheduled with nextAttemptAt due — no claimedAt condition', () => {
+    expect(dueScheduledRetryWhere(now)).toEqual({
+      status: 'retry_scheduled',
+      nextAttemptAt: { lte: now },
+    });
+  });
+});
+
+describe('abandonedRunningClaimWhere (claim #2 — retry-safety re-checked by the caller)', () => {
+  const stale = new Date('2026-09-17T11:55:00.000Z');
+
+  it('is exactly status=running with a stale claimedAt', () => {
+    expect(abandonedRunningClaimWhere(stale)).toEqual({
+      status: 'running',
+      claimedAt: { lt: stale },
+    });
   });
 });

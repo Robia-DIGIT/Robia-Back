@@ -13,10 +13,16 @@ interface DueStepRow {
   runId: string;
 }
 
+interface FindManyOptions {
+  where: unknown;
+  orderBy: unknown;
+  take: number;
+}
+
 describe('AutomationStepRetryDispatcherService', () => {
   function build(dueRows: DueStepRow[]) {
     const findMany = jest
-      .fn<Promise<DueStepRow[]>, [{ where: unknown }]>()
+      .fn<Promise<DueStepRow[]>, [FindManyOptions]>()
       .mockResolvedValue(dueRows);
     const prisma = { automationStepRun: { findMany } };
     const retryStep = jest
@@ -52,7 +58,48 @@ describe('AutomationStepRetryDispatcherService', () => {
 
     expect(prisma.automationStepRun.findMany).toHaveBeenCalledTimes(1);
     const [{ where }] = prisma.automationStepRun.findMany.mock.calls[0];
-    expect(Array.isArray((where as { AND: unknown }).AND)).toBe(true);
+    expect(Array.isArray((where as { OR: unknown }).OR)).toBe(true);
+  });
+
+  // RC-27 hardening — the scan itself must never be unbounded: orderBy is
+  // part of the query (Postgres decides the order, never an in-memory
+  // sort after an unbounded findMany()), and take caps how many rows a
+  // single tick can ever pull, however large the due-set has grown.
+  it('bounds the due-set query with a deterministic orderBy and a take limit', async () => {
+    const { service, prisma } = build([]);
+
+    await service.runDueRetries(new Date());
+
+    const [call] = prisma.automationStepRun.findMany.mock.calls[0];
+    expect(Array.isArray(call.orderBy)).toBe(true);
+    expect(typeof call.take).toBe('number');
+    expect(call.take).toBeGreaterThan(0);
+  });
+
+  // RC-27 hardening — processing itself must never launch every due row at
+  // once (an unbounded Promise.allSettled): only STEP_RETRY_MAX_CONCURRENCY
+  // calls to retryStep() are ever in flight simultaneously.
+  it('never has more than STEP_RETRY_MAX_CONCURRENCY retryStep calls in flight at once', async () => {
+    const rows = Array.from({ length: 12 }, (_, i) => ({
+      id: `step-${i}`,
+      runId: `run-${i}`,
+    }));
+    const { service, automations } = build(rows);
+    let inFlight = 0;
+    let maxInFlight = 0;
+    automations.retryStep.mockImplementation(async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await Promise.resolve();
+      await Promise.resolve();
+      inFlight -= 1;
+    });
+
+    await service.runDueRetries(new Date());
+
+    expect(automations.retryStep).toHaveBeenCalledTimes(12);
+    expect(maxInFlight).toBeLessThanOrEqual(5);
+    expect(maxInFlight).toBeGreaterThan(1); // actually exercises concurrency
   });
 
   it("one row's retryStep failure never stops the rest of the tick", async () => {

@@ -57,6 +57,20 @@ interface OpsActionDescriptor {
   // `token`/`apiKey`, or any other extraneous field — is never persisted or
   // executed: see canonicalizeInput().
   inputSchema: string[];
+  // RC-27 hardening — never defaulted, so registering a new action forces an
+  // explicit choice. `true` only when replaying this action (the same
+  // organizationId/input, executed again after the first attempt's outcome
+  // is unknown — a crash, a stale claim) is provably harmless: either
+  // read-only (no write at all), or idempotent by construction (a repeat
+  // call converges to the same state rather than duplicating a side
+  // effect). `false` is the safe default posture for everything else —
+  // AutomationsService never auto-retries a step whose action is `false`
+  // here, on any failure, transient-looking or not (see
+  // step-retry-policy.ts's isPermanentStepError() vs. this: they answer
+  // different questions — "was the error itself worth retrying" and "is
+  // this action even safe to run twice" — and a step only actually retries
+  // when both say yes).
+  retrySafe: boolean;
   // Like inputSchema, but each field is only validated (as a non-empty
   // string) *if present* — never required. E.g. send_email's `auditId`,
   // which only some templates need.
@@ -111,6 +125,13 @@ export class OpsActionsRegistryService {
 
   isAllowed(actionType: string): actionType is OpsActionType {
     return this.actions.has(actionType as OpsActionType);
+  }
+
+  // RC-27 hardening — see OpsActionDescriptor.retrySafe's own doc comment.
+  // An unknown actionType is never retry-safe by definition (nothing here
+  // ever executes it in the first place).
+  isRetrySafe(actionType: string): boolean {
+    return this.actions.get(actionType as OpsActionType)?.retrySafe ?? false;
   }
 
   /**
@@ -213,6 +234,12 @@ export class OpsActionsRegistryService {
       type: 'robia.audit.run_diagnostic',
       description:
         "Lance un nouveau diagnostic (audit) sur un site déjà connecté à l'organisation.",
+      // RC-27 hardening — AuditsService.run() creates a brand-new Audit row
+      // on every call, with no dedup key of its own. Replaying this after a
+      // crash of unknown outcome would risk a second, duplicate diagnostic
+      // for the same trigger. Not retry-safe until it has its own
+      // idempotency key (task explicitly names this one).
+      retrySafe: false,
       inputSchema: ['websiteId'],
       execute: async (organizationId, input) => {
         const websiteId = this.requireStringInput(input, 'websiteId');
@@ -236,6 +263,12 @@ export class OpsActionsRegistryService {
       type: 'robia.opportunities.regenerate',
       description:
         'Génère ou complète les opportunités ROBIA (SEO + Meta) pour un audit déjà terminé.',
+      // RC-27 hardening — OpportunitiesService.generateFromAudit() already
+      // has its own idempotency (RC-19, see the doc comment just above this
+      // descriptor): re-running it on an audit that already has
+      // opportunities never duplicates or deletes them. Provably safe to
+      // replay.
+      retrySafe: true,
       inputSchema: ['auditId'],
       execute: async (organizationId, input) => {
         const auditId = this.requireStringInput(input, 'auditId');
@@ -261,6 +294,10 @@ export class OpsActionsRegistryService {
       type: 'robia.report.prepare_organization_summary',
       description:
         "Prépare un résumé en lecture seule de l'organisation (sites, dernier audit, opportunités ouvertes, tâches en attente).",
+      // RC-27 hardening — purely read-only (see the doc comment just above
+      // this descriptor): no write at all, so replaying it can never
+      // duplicate or corrupt anything.
+      retrySafe: true,
       inputSchema: [],
       execute: async (organizationId) => {
         const [
@@ -316,6 +353,10 @@ export class OpsActionsRegistryService {
       type: 'robia.action_items.create_internal_task',
       description:
         'Crée une tâche ROBIA interne (ActionItem) en brouillon — jamais approuvée ni exécutée automatiquement.',
+      // RC-27 hardening — creates a brand-new ActionItem row on every call,
+      // no dedup key. Not retry-safe until it has its own idempotency key
+      // (task explicitly names this one).
+      retrySafe: false,
       inputSchema: ['title'],
       execute: async (organizationId, input) => {
         const title = this.requireStringInput(input, 'title');
@@ -358,6 +399,15 @@ export class OpsActionsRegistryService {
       type: 'robia.notification.send_email',
       description:
         "Crée une notification email (en attente d'envoi) à partir d'un template allowlisté, adressée exclusivement au créateur de l'automatisation.",
+      // RC-27 hardening — safe to replay *only* because
+      // NotificationsService.createEmailDelivery() dedups on a stable key
+      // derived from automationStepRunId (see NotificationDelivery's own
+      // `@@unique([organizationId, idempotencyKey])` and RC-26's doc
+      // comment): a second call for the same step run always resolves to
+      // the same NotificationDelivery row instead of creating a second
+      // email. If that dedup key ever stopped being derived from
+      // stepRunId, this would need to flip back to `false`.
+      retrySafe: true,
       inputSchema: ['templateKey'],
       // `auditId` — required only by the `audit_completed` template (see
       // NotificationsService.resolveTemplateData()), which resolves its
@@ -419,6 +469,12 @@ export class OpsActionsRegistryService {
       type: 'robia.odc.prepare_application_summary',
       description:
         'Prépare un résumé (brouillon) pour une candidature ODC — ne change jamais son statut.',
+      // RC-27 hardening — a pure, deterministic function of already-
+      // persisted application data (see the doc comment just above this
+      // descriptor): every call overwrites summaryDraft with the same
+      // computed value given the same underlying state. Replaying it
+      // converges, never duplicates or accumulates.
+      retrySafe: true,
       inputSchema: ['applicationId'],
       execute: async (organizationId, input) => {
         const applicationId = this.requireStringInput(input, 'applicationId');
@@ -443,6 +499,15 @@ export class OpsActionsRegistryService {
       type: 'robia.odc.flag_missing_documents',
       description:
         "Recalcule les pièces/champs manquants d'une candidature ODC en attente — peut passer 'incomplete' à 'in_review', jamais à une décision.",
+      // RC-27 hardening — NOT idempotent despite converging to the same
+      // status/missing state: OdcApplicationsService.recomputeMissingDocuments()
+      // -> runScreening() unconditionally appends a new, append-only
+      // OdcHistoryEvent (screening_passed/screening_failed) and re-emits a
+      // domain event on *every* call, even when the recompute changes
+      // nothing (still 'incomplete', same missing list). A replay after a
+      // crash of unknown outcome would duplicate that history row and
+      // could re-trigger whatever listens for the event a second time.
+      retrySafe: false,
       inputSchema: ['applicationId'],
       execute: async (organizationId, input) => {
         const applicationId = this.requireStringInput(input, 'applicationId');
@@ -474,6 +539,14 @@ export class OpsActionsRegistryService {
       type: 'robia.odc.create_review_task',
       description:
         'Crée une tâche ROBIA interne de revue pour une candidature ODC — en brouillon, jamais approuvée automatiquement.',
+      // RC-27 hardening — creates a brand-new ActionItem row on every call,
+      // no dedup key, same class of bug as
+      // robia.action_items.create_internal_task above. Not named
+      // explicitly by the hardening spec, but the same "creates a fresh
+      // row, no idempotency key" reasoning applies identically — the task's
+      // stated policy ("only prove-idempotent or read-only actions may
+      // replay") covers it regardless of whether it was named.
+      retrySafe: false,
       inputSchema: ['applicationId'],
       execute: async (organizationId, input) => {
         const applicationId = this.requireStringInput(input, 'applicationId');

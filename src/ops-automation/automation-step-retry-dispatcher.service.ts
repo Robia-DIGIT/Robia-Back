@@ -1,10 +1,13 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
+import type { AutomationStepRun } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { redactSensitive } from '../common/logging/redact';
 import { AutomationsService } from './automations.service';
 import {
   STEP_RETRY_CLAIM_LEASE_MS,
+  STEP_RETRY_MAX_BATCH_SIZE,
+  STEP_RETRY_MAX_CONCURRENCY,
   dueStepRetryWhere,
 } from './step-retry-policy';
 
@@ -40,25 +43,66 @@ export class AutomationStepRetryDispatcherService {
 
   // Split from handleTick() so tests can drive it directly with a
   // controlled `now` instead of waiting on a real clock.
+  //
+  // RC-27 hardening — orderBy + take are part of the query itself, not
+  // applied afterwards in Node: however large the due-set has grown,
+  // Postgres never returns more than STEP_RETRY_MAX_BATCH_SIZE rows,
+  // oldest createdAt first (id as a deterministic tie-breaker for equal
+  // timestamps — the same shape as RC-25's AutomationSchedulerService).
+  // Whatever doesn't fit in this tick's `take` is simply picked up by the
+  // next tick's own query a minute later — nothing is lost, only delayed.
+  // Processing itself is bounded to STEP_RETRY_MAX_CONCURRENCY steps in
+  // flight at once (never one unbounded `Promise.allSettled` over the
+  // whole batch), and one step's own retry failing — a bad input, a
+  // transient DB error — is caught and logged per-row, never allowed to
+  // stop its concurrent siblings or the rest of this tick.
   async runDueRetries(now: Date): Promise<void> {
     const staleThreshold = new Date(now.getTime() - STEP_RETRY_CLAIM_LEASE_MS);
     const due = await this.prisma.automationStepRun.findMany({
       where: dueStepRetryWhere(now, staleThreshold),
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      take: STEP_RETRY_MAX_BATCH_SIZE,
     });
 
-    for (const stepRun of due) {
-      try {
-        await this.automations.retryStep(stepRun.id, now);
-      } catch (error) {
-        // One step's retry failing must never stop the rest of this tick.
-        this.logger.warn(
-          `Automation step retry dispatcher : échec du traitement du step ${stepRun.id} (run=${stepRun.runId}) : ${
-            redactSensitive(
-              error instanceof Error ? error.message : 'erreur inconnue',
-            ) as string
-          }`,
-        );
+    await this.runWithBoundedConcurrency(
+      due,
+      STEP_RETRY_MAX_CONCURRENCY,
+      async (stepRun) => {
+        try {
+          await this.automations.retryStep(stepRun.id, now);
+        } catch (error) {
+          this.logger.warn(
+            `Automation step retry dispatcher : échec du traitement du step ${stepRun.id} (run=${stepRun.runId}) : ${
+              redactSensitive(
+                error instanceof Error ? error.message : 'erreur inconnue',
+              ) as string
+            }`,
+          );
+        }
+      },
+    );
+  }
+
+  // A minimal worker-pool: up to `concurrency` calls to `worker` in flight
+  // at any time, each pulling the next item off `items` as soon as it's
+  // free. Identical in shape to AutomationSchedulerService's own copy (see
+  // that class's doc comment) — small enough, and specific enough to each
+  // caller's own item type, that a shared cross-cutting abstraction isn't
+  // worth it yet.
+  private async runWithBoundedConcurrency(
+    items: AutomationStepRun[],
+    concurrency: number,
+    worker: (item: AutomationStepRun) => Promise<void>,
+  ): Promise<void> {
+    let cursor = 0;
+    const workerCount = Math.min(concurrency, items.length);
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (cursor < items.length) {
+        const index = cursor;
+        cursor += 1;
+        await worker(items[index]);
       }
-    }
+    });
+    await Promise.all(workers);
   }
 }
