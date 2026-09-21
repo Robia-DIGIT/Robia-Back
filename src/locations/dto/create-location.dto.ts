@@ -23,6 +23,10 @@ export class CreateLocationDto {
   country?: string;
 
   @IsOptional()
+  @IsString()
+  phone?: string;
+
+  @IsOptional()
   @IsBoolean()
   isPrimary?: boolean;
 }

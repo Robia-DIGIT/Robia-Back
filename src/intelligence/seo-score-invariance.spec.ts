@@ -12,6 +12,7 @@ import { SearchConsoleIntelligenceAdapter } from './adapters/search-console-inte
 import { Ga4IntelligenceAdapter } from './adapters/ga4-intelligence.adapter';
 import { MetaIntelligenceAdapter } from './adapters/meta-intelligence.adapter';
 import { GbpIntelligenceAdapter } from './adapters/gbp-intelligence.adapter';
+import { GoogleBusinessProfileService } from '../integrations/google-business-profile.service';
 
 /**
  * RC-21's headline correctness requirement, tested end to end rather than
@@ -83,7 +84,13 @@ describe('seo_score_v2 invariance through the real Unified Intelligence Core (RC
       new SearchConsoleIntelligenceAdapter(googleSearchConsole),
       new Ga4IntelligenceAdapter(googleSearchConsole),
       new MetaIntelligenceAdapter(meta),
-      new GbpIntelligenceAdapter(),
+      new GbpIntelligenceAdapter({
+        getIntelligenceSignal: jest.fn().mockResolvedValue({
+          status: 'not_connected',
+          observedAt: null,
+          data: null,
+        }),
+      } as unknown as GoogleBusinessProfileService),
     );
     const generator = {
       generate: jest.fn().mockResolvedValue([
