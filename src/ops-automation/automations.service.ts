@@ -30,8 +30,10 @@ import {
   MAX_STEP_ATTEMPTS,
   STEP_RETRY_BACKOFF_MS,
   STEP_RETRY_CLAIM_LEASE_MS,
-  dueStepRetryWhere,
+  abandonedRunningClaimWhere,
+  dueScheduledRetryWhere,
   isPermanentStepError,
+  legacyUnclaimedRunningWhere,
 } from './step-retry-policy';
 import {
   AutomationLoopError,
@@ -770,6 +772,17 @@ export class AutomationsService {
   // on a waiting_approval run IS the value that executes. This is the final,
   // already-canonical, already-resolved input, used verbatim on every
   // attempt, initial or retried.
+  //
+  // RC-27 hardening — every attempt (this first synchronous one included)
+  // is now claimed: claimedAt + a fresh opaque claimToken are set at
+  // creation time, never left null. This is what makes a crash *during*
+  // this very call recoverable at all — see step-retry-policy.ts's
+  // abandonedRunningClaimWhere() and retryStep() below. After the attempt,
+  // every write back to this row is gated on `claimToken` still matching
+  // (commitStepAttempt()); if it doesn't, another worker already reclaimed
+  // this step as abandoned (this attempt ran past the claim lease) and this
+  // call must stop here — never append another step on top of a claim it
+  // no longer holds.
   private async runStepsFrom(
     run: AutomationRunWithSteps,
     steps: StoredAutomationStep[],
@@ -799,6 +812,8 @@ export class AutomationsService {
         );
       }
 
+      const claimToken = randomUUID();
+      const attemptStartedAt = new Date();
       const stepRun = await this.prisma.automationStepRun.create({
         data: {
           runId: run.id,
@@ -806,54 +821,79 @@ export class AutomationsService {
           actionType: step.actionType,
           input: (step.input ?? Prisma.JsonNull) as Prisma.InputJsonValue,
           status: 'running',
-          startedAt: new Date(),
+          startedAt: attemptStartedAt,
           attemptCount: 1,
+          claimedAt: attemptStartedAt,
+          claimToken,
         },
       });
 
       const result = await this.attemptStep(run, stepRun.id, step);
+
       if (result.ok) {
-        await this.prisma.automationStepRun.update({
-          where: { id: stepRun.id },
-          data: {
-            status: 'succeeded',
-            evidence: redactSensitive(result.evidence) as Prisma.InputJsonValue,
-            finishedAt: new Date(),
-          },
+        const owned = await this.commitStepAttempt(stepRun.id, claimToken, {
+          status: 'succeeded',
+          evidence: redactSensitive(result.evidence) as Prisma.InputJsonValue,
+          finishedAt: new Date(),
         });
+        if (!owned) {
+          // Lost the claim while this attempt was in flight (reclaimed as
+          // abandoned once the lease went stale). Whoever holds it now
+          // owns continuing the run — this worker must not.
+          return this.refetchRun(run.id);
+        }
         continue;
       }
 
-      if (result.permanent || 1 >= MAX_STEP_ATTEMPTS) {
-        await this.prisma.automationStepRun.update({
-          where: { id: stepRun.id },
-          data: {
-            status: 'failed',
-            error: result.message,
-            finishedAt: new Date(),
-          },
+      const retrySafe = this.actionsRegistry.isRetrySafe(step.actionType);
+      if (result.permanent || !retrySafe || 1 >= MAX_STEP_ATTEMPTS) {
+        const owned = await this.commitStepAttempt(stepRun.id, claimToken, {
+          status: 'failed',
+          error: result.message,
+          finishedAt: new Date(),
         });
+        if (!owned) {
+          return this.refetchRun(run.id);
+        }
         return this.finishRun(run.id, 'failed', result.message);
       }
 
-      // Transient failure, retries remain: schedule this step's first retry
-      // instead of failing the whole run. AutomationStepRetryDispatcherService
-      // picks it up once due; execution then resumes right here — via
-      // retryStep() calling this same method — never re-creating this
-      // AutomationStepRun row and never re-attempting an already-succeeded
-      // earlier step.
-      await this.prisma.automationStepRun.update({
-        where: { id: stepRun.id },
-        data: {
-          status: 'retry_scheduled',
-          error: result.message,
-          nextAttemptAt: new Date(Date.now() + STEP_RETRY_BACKOFF_MS[0]),
-        },
+      // Transient failure, action is retry-safe, retries remain: schedule
+      // this step's first retry instead of failing the whole run.
+      // AutomationStepRetryDispatcherService picks it up once due;
+      // execution then resumes right here — via retryStep() calling this
+      // same method — never re-creating this AutomationStepRun row and
+      // never re-attempting an already-succeeded earlier step.
+      await this.commitStepAttempt(stepRun.id, claimToken, {
+        status: 'retry_scheduled',
+        error: result.message,
+        nextAttemptAt: new Date(Date.now() + STEP_RETRY_BACKOFF_MS[0]),
       });
       return this.refetchRun(run.id);
     }
 
     return this.finishRun(run.id, 'succeeded');
+  }
+
+  // RC-27 hardening — the single choke point every attempt (first or
+  // retried) uses to record its outcome: a conditional UPDATE gated on
+  // `claimToken` still matching the one this exact attempt minted, always
+  // clearing claimedAt/claimToken on the way out. Returns whether the
+  // caller still owned the claim at commit time — `false` means another
+  // worker already reclaimed this row as abandoned while the attempt was
+  // running, and the caller must treat this outcome as moot (never
+  // continue the run, never fail it) since a different worker is now
+  // responsible for it.
+  private async commitStepAttempt(
+    stepRunId: string,
+    claimToken: string,
+    data: Prisma.AutomationStepRunUpdateManyMutationInput,
+  ): Promise<boolean> {
+    const result = await this.prisma.automationStepRun.updateMany({
+      where: { id: stepRunId, claimToken },
+      data: { ...data, claimedAt: null, claimToken: null },
+    });
+    return result.count === 1;
   }
 
   // Runs one step's action, never throwing — every outcome (success,
@@ -902,24 +942,38 @@ export class AutomationsService {
     return run;
   }
 
-  // RC-27 — called by AutomationStepRetryDispatcherService for one due
-  // AutomationStepRun at a time. Two-phase claim, mirroring RC-25's
-  // AutomationSchedulerService and RC-26's NotificationDispatcherService:
+  // RC-27, hardened — called by AutomationStepRetryDispatcherService for one
+  // due AutomationStepRun at a time. Two *separate* claim attempts, tried in
+  // order, never merged into one predicate — see step-retry-policy.ts's
+  // dueScheduledRetryWhere()/abandonedRunningClaimWhere() for why the
+  // distinction matters:
   //
-  // 1. Claim: a conditional UPDATE moves the row to 'running' and sets
-  //    claimedAt = now, gated on dueStepRetryWhere() (lease free/stale) and
-  //    attemptCount still under budget. Picks a single winner among
-  //    concurrent dispatcher instances/ticks the same way Postgres
-  //    serializes two concurrent UPDATEs on the same row. attemptCount is
-  //    incremented right here, not at finalize time, so a crash mid-attempt
-  //    still counts as spent (same discipline as RC-26).
-  // 2. Re-fetch: confirms this call actually holds the claim it just won.
-  // 3. Attempt: via the same attemptStep() every other step uses. On
-  //    success, execution resumes with runStepsFrom() for whatever steps
-  //    remain — this is the only place a run continues past a step that
-  //    once failed. On failure, either reschedules another retry (with the
-  //    next backoff tier) or — permanent error, or attempts exhausted —
-  //    fails the run outright, exactly like the very first attempt would.
+  // 1. dueScheduledRetryWhere: a normal, due 'retry_scheduled' row. A row
+  //    created by *this* RC27's own runStepsFrom()/retryStep() already
+  //    passed isRetrySafe() once before ever reaching that status — but a
+  //    row created *before* RC27 shipped could not have: the pre-hardening
+  //    code scheduled a retry on any transient failure, with no retrySafe
+  //    concept at all. isRetrySafe() is therefore re-checked below
+  //    regardless of which claim won, defense-in-depth against exactly
+  //    that legacy data (Codex review) rather than trusting the status
+  //    alone to prove safety.
+  // 2. abandonedRunningClaimWhere (tried only if #1 claimed nothing): a
+  //    'running' row whose claim lease has gone stale — the previous
+  //    claimant (first attempt or a retry) crashed with an unknown outcome.
+  //
+  // Either way, a non-retry-safe action is never re-executed: it fails the
+  // run outright with a redacted "not automatically replayable, human
+  // intervention needed" error, never guessing by re-executing a
+  // non-idempotent action blind.
+  //
+  // Every write back to the claimed row (success, failure, or scheduling
+  // another retry) goes through commitStepAttempt(), gated on the
+  // claimToken this call minted — never on `claimedAt`, which is not
+  // stable enough on its own to prove exclusive ownership. A commit that
+  // reports it no longer owns the row (another worker already reclaimed it
+  // as abandoned while this attempt was in flight — a long-running action
+  // that outlived the lease) stops here: it must never continue the run
+  // (runStepsFrom) or fail it (finishRun) on behalf of a claim it lost.
   //
   // Never throws: one step's retry failing to even claim (lost the race, or
   // no longer due) is not an error, it's simply "nothing to do this tick" —
@@ -927,21 +981,57 @@ export class AutomationsService {
   // error as its own, separate, per-row failure to catch and log.
   async retryStep(stepRunId: string, now: Date): Promise<void> {
     const staleThreshold = new Date(now.getTime() - STEP_RETRY_CLAIM_LEASE_MS);
-    const claim = await this.prisma.automationStepRun.updateMany({
+    const claimToken = randomUUID();
+
+    let claim = await this.prisma.automationStepRun.updateMany({
       where: {
         id: stepRunId,
-        ...dueStepRetryWhere(now, staleThreshold),
+        ...dueScheduledRetryWhere(now),
         attemptCount: { lt: MAX_STEP_ATTEMPTS },
       },
       data: {
         status: 'running',
         claimedAt: now,
+        claimToken,
         startedAt: now,
         nextAttemptAt: null,
         attemptCount: { increment: 1 },
       },
     });
+
+    let recoveringAbandonedClaim = false;
     if (claim.count === 0) {
+      claim = await this.prisma.automationStepRun.updateMany({
+        where: {
+          id: stepRunId,
+          ...abandonedRunningClaimWhere(staleThreshold),
+          attemptCount: { lt: MAX_STEP_ATTEMPTS },
+        },
+        data: { claimedAt: now, claimToken, attemptCount: { increment: 1 } },
+      });
+      recoveringAbandonedClaim = true;
+    }
+
+    if (claim.count === 0) {
+      // Neither claim matched. Two distinct shapes neither claim above can
+      // ever reach, each needing its own direct fail — never a retry,
+      // since both mean "this step's true result is permanently unknown":
+      //
+      // 1. A legacy pre-RC27 first attempt: 'running', claimedAt=null,
+      //    claimToken=null, startedAt past the lease. Checked first since
+      //    it's the narrower, more specific shape.
+      // 2. An abandoned 'running' row whose attempts are already
+      //    exhausted — both claims above gate on attemptCount under
+      //    budget, so nothing else will ever move it out of 'running'.
+      const reconciledLegacy = await this.reconcileLegacyUnclaimedRunningStep(
+        stepRunId,
+        staleThreshold,
+        now,
+      );
+      if (reconciledLegacy) {
+        return;
+      }
+      await this.failExhaustedAbandonedStep(stepRunId, staleThreshold, now);
       return;
     }
 
@@ -951,7 +1041,7 @@ export class AutomationsService {
     if (
       !fresh ||
       fresh.status !== 'running' ||
-      fresh.claimedAt?.getTime() !== now.getTime()
+      fresh.claimToken !== claimToken
     ) {
       return;
     }
@@ -968,47 +1058,151 @@ export class AutomationsService {
     if (!step) {
       return;
     }
+    const retrySafe = this.actionsRegistry.isRetrySafe(step.actionType);
+
+    // Never gated on `recoveringAbandonedClaim` alone (see this method's
+    // own doc comment) — a due 'retry_scheduled' row can predate RC27's
+    // own isRetrySafe() gate just as much as an abandoned 'running' row
+    // can, so both claim origins are checked here, identically, before
+    // attemptStep() is ever called.
+    if (!retrySafe) {
+      const message = redactSensitive(
+        recoveringAbandonedClaim
+          ? "Résultat indéterminé après une interruption (bail de reprise dépassé) — cette action n'est pas rejouable automatiquement : intervention humaine nécessaire."
+          : "Cette action n'est pas rejouable automatiquement — reprise programmée annulée, intervention humaine nécessaire.",
+      ) as string;
+      const owned = await this.commitStepAttempt(fresh.id, claimToken, {
+        status: 'failed',
+        error: message,
+        finishedAt: now,
+      });
+      if (owned) {
+        await this.finishRun(run.id, 'failed', message);
+      }
+      return;
+    }
 
     const result = await this.attemptStep(run, fresh.id, step);
     if (result.ok) {
-      await this.prisma.automationStepRun.updateMany({
-        where: { id: fresh.id, claimedAt: now },
-        data: {
-          status: 'succeeded',
-          evidence: redactSensitive(result.evidence) as Prisma.InputJsonValue,
-          finishedAt: now,
-          claimedAt: null,
-        },
+      const owned = await this.commitStepAttempt(fresh.id, claimToken, {
+        status: 'succeeded',
+        evidence: redactSensitive(result.evidence) as Prisma.InputJsonValue,
+        finishedAt: now,
       });
+      if (!owned) {
+        return;
+      }
       await this.runStepsFrom(run, steps, fresh.sequence);
       return;
     }
 
-    if (result.permanent || fresh.attemptCount >= MAX_STEP_ATTEMPTS) {
-      await this.prisma.automationStepRun.updateMany({
-        where: { id: fresh.id, claimedAt: now },
-        data: {
-          status: 'failed',
-          error: result.message,
-          finishedAt: now,
-          claimedAt: null,
-        },
+    if (
+      result.permanent ||
+      !retrySafe ||
+      fresh.attemptCount >= MAX_STEP_ATTEMPTS
+    ) {
+      const owned = await this.commitStepAttempt(fresh.id, claimToken, {
+        status: 'failed',
+        error: result.message,
+        finishedAt: now,
       });
+      if (!owned) {
+        return;
+      }
       await this.finishRun(run.id, 'failed', result.message);
       return;
     }
 
-    await this.prisma.automationStepRun.updateMany({
-      where: { id: fresh.id, claimedAt: now },
+    await this.commitStepAttempt(fresh.id, claimToken, {
+      status: 'retry_scheduled',
+      error: result.message,
+      nextAttemptAt: new Date(
+        now.getTime() + STEP_RETRY_BACKOFF_MS[fresh.attemptCount - 1],
+      ),
+    });
+  }
+
+  // Codex review — a first attempt created before RC27 shipped never had
+  // claimedAt/claimToken at all, so a worker killed mid-attempt (a deploy
+  // interrupting it) can leave it at status='running' with both claim
+  // columns null, forever invisible to the normal claim mechanism (see
+  // legacyUnclaimedRunningWhere()'s own doc comment for why). Reached only
+  // when neither of retryStep()'s two normal claims matched anything —
+  // this query is what actually finds this exact shape and force-fails it
+  // atomically. Its true outcome is unknowable (no claim metadata survives
+  // to even tell "first attempt" from "interrupted retry"), so it is never
+  // re-executed, exactly like an abandoned claim with an unsafe action.
+  // Silently a no-op (via the count check) whenever the row isn't in this
+  // exact state — including the common case where it simply isn't
+  // legacy/unclaimed at all, or a claim mechanism already deals with it,
+  // or it's too recent to be considered stale yet.
+  private async reconcileLegacyUnclaimedRunningStep(
+    stepRunId: string,
+    staleThreshold: Date,
+    now: Date,
+  ): Promise<boolean> {
+    const message = redactSensitive(
+      "Résultat indéterminé — cette tentative a été créée avant le suivi de claim et n'a jamais enregistré d'issue (déploiement ayant probablement interrompu le worker) : intervention humaine nécessaire.",
+    ) as string;
+    const failed = await this.prisma.automationStepRun.updateMany({
+      where: {
+        id: stepRunId,
+        ...legacyUnclaimedRunningWhere(staleThreshold),
+      },
       data: {
-        status: 'retry_scheduled',
-        error: result.message,
-        nextAttemptAt: new Date(
-          now.getTime() + STEP_RETRY_BACKOFF_MS[fresh.attemptCount - 1],
-        ),
-        claimedAt: null,
+        status: 'failed',
+        error: message,
+        finishedAt: now,
       },
     });
+    if (failed.count !== 1) {
+      return false;
+    }
+    const stepRun = await this.prisma.automationStepRun.findFirst({
+      where: { id: stepRunId },
+    });
+    if (stepRun) {
+      await this.finishRun(stepRun.runId, 'failed', message);
+    }
+    return true;
+  }
+
+  // Only reached when neither claim in retryStep() matched anything — the
+  // one case that needs its own query, since an abandoned + budget-
+  // exhausted row would otherwise never leave 'running'. Silently a no-op
+  // (via count checks) whenever the row isn't actually in that exact state,
+  // including the common case where it simply isn't due at all.
+  private async failExhaustedAbandonedStep(
+    stepRunId: string,
+    staleThreshold: Date,
+    now: Date,
+  ): Promise<void> {
+    const message = redactSensitive(
+      'Résultat indéterminé après une interruption — budget de tentatives épuisé, intervention humaine nécessaire.',
+    ) as string;
+    const failed = await this.prisma.automationStepRun.updateMany({
+      where: {
+        id: stepRunId,
+        ...abandonedRunningClaimWhere(staleThreshold),
+        attemptCount: { gte: MAX_STEP_ATTEMPTS },
+      },
+      data: {
+        status: 'failed',
+        error: message,
+        finishedAt: now,
+        claimedAt: null,
+        claimToken: null,
+      },
+    });
+    if (failed.count !== 1) {
+      return;
+    }
+    const stepRun = await this.prisma.automationStepRun.findFirst({
+      where: { id: stepRunId },
+    });
+    if (stepRun) {
+      await this.finishRun(stepRun.runId, 'failed', message);
+    }
   }
 
   private async finishRun(

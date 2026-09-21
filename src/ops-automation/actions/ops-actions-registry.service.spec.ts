@@ -542,4 +542,33 @@ describe('OpsActionsRegistryService', () => {
       });
     });
   });
+
+  // RC-27 hardening — the replay policy every step-level retry decision in
+  // AutomationsService reads via isRetrySafe(). "Never rejouable by
+  // default": the only 4 actions marked retry-safe are the ones with a
+  // provable reason (read-only, or an already-idempotent underlying
+  // service call) — everything else defaults to false, including two
+  // actions the hardening spec never had to name explicitly
+  // (robia.odc.create_review_task creates a fresh row exactly like
+  // robia.action_items.create_internal_task does; robia.odc.
+  // flag_missing_documents appends an append-only history row on every
+  // call, even a no-op recompute).
+  describe('isRetrySafe (RC-27)', () => {
+    it.each<[string, boolean]>([
+      ['robia.audit.run_diagnostic', false],
+      ['robia.opportunities.regenerate', true],
+      ['robia.report.prepare_organization_summary', true],
+      ['robia.action_items.create_internal_task', false],
+      ['robia.notification.send_email', true],
+      ['robia.odc.prepare_application_summary', true],
+      ['robia.odc.flag_missing_documents', false],
+      ['robia.odc.create_review_task', false],
+    ])('%s -> retrySafe=%s', (actionType, expected) => {
+      expect(registry.isRetrySafe(actionType)).toBe(expected);
+    });
+
+    it('is false for an unknown/unallowed action type', () => {
+      expect(registry.isRetrySafe('robia.not.a.real.action')).toBe(false);
+    });
+  });
 });

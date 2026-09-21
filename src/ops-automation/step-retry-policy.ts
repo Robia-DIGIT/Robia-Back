@@ -29,6 +29,12 @@ export const STEP_RETRY_BACKOFF_MS = [
 // NotificationDispatcherService.
 export const STEP_RETRY_CLAIM_LEASE_MS = 5 * 60 * 1000;
 
+// RC-27 hardening — same "bound the query itself, not just processing after
+// an unbounded findMany()" fix RC-25's AutomationSchedulerService already
+// applies to its own due-set scan (see that class's own doc comment).
+export const STEP_RETRY_MAX_BATCH_SIZE = 50;
+export const STEP_RETRY_MAX_CONCURRENCY = 5;
+
 // Classifies a step execution failure. Two disjoint outcomes:
 //
 // - Permanent (never worth retrying, because the *input itself* — frozen in
@@ -66,32 +72,81 @@ export function isPermanentStepError(error: unknown): boolean {
   return false;
 }
 
-// Matches a 'retry_scheduled' AutomationStepRun whose nextAttemptAt is due,
-// or a 'running' one whose retry claim lease has gone stale (some instance
-// claimed a retry and crashed before finishing it) — in both cases only
-// while the claim lease is free or stale. `claimedAt: { not: null }` on the
-// 'running' branch is deliberate and required: unlike RC-26's
-// NotificationDelivery (where every attempt, including the first, goes
-// through the claim mechanism), an AutomationStepRun's very first attempt
-// runs synchronously inside AutomationsService.runStepsFrom() and is never
-// claimed (claimedAt stays null) — without this, a step legitimately
-// executing its first attempt right now would look identical to an
-// abandoned retry and could be "reclaimed" out from under it.
+// RC-27 hardening — every AutomationStepRun attempt is now claimed,
+// including the first (see AutomationsService.runStepsFrom(): claimedAt +
+// claimToken are set at creation time, never left null). That first
+// attempt runs synchronously, so a crash mid-attempt leaves a 'running' row
+// whose claim lease eventually goes stale exactly like an abandoned retry
+// claim would — this is deliberate: it is the mechanism that lets a first
+// attempt's crash be recovered at all (see abandonedRunningClaimWhere()
+// below), closing the gap the previous design's comment on this file
+// documented as a known limitation ("never set for the initial synchronous
+// attempt").
 //
-// Shared between AutomationStepRetryDispatcherService's own due-set scan and
-// AutomationsService.retryStep()'s claim UPDATE, so both always agree on
-// exactly what counts as due — see NotificationDispatcherService.dueSetWhere()
-// for the identical rationale.
+// Matches anything AutomationStepRetryDispatcherService's scan should hand
+// to AutomationsService.retryStep() — either a 'retry_scheduled' row that's
+// due, or a 'running' row whose claim lease has gone stale (first attempt
+// or retry attempt, crashed either way — retryStep() itself tells the two
+// apart, see dueScheduledRetryWhere()/abandonedRunningClaimWhere() below).
+// Only a *scan* predicate: it decides what to look at, never what to claim
+// — the two-phase split below is what's actually used for the atomic claim
+// UPDATE, so a row can never be treated as "due" by one check and "claimed"
+// under a different, disagreeing condition.
 export function dueStepRetryWhere(now: Date, staleThreshold: Date) {
   return {
-    AND: [
-      {
-        OR: [
-          { status: 'retry_scheduled', nextAttemptAt: { lte: now } },
-          { status: 'running', claimedAt: { not: null } },
-        ],
-      },
-      { OR: [{ claimedAt: null }, { claimedAt: { lt: staleThreshold } }] },
+    OR: [
+      { status: 'retry_scheduled' as const, nextAttemptAt: { lte: now } },
+      { status: 'running' as const, claimedAt: { lt: staleThreshold } },
+      legacyUnclaimedRunningWhere(staleThreshold),
     ],
+  };
+}
+
+// A 'retry_scheduled' row whose nextAttemptAt is due. Reaching this status
+// at all already required passing OpsActionsRegistryService.isRetrySafe()
+// once (see AutomationsService.runStepsFrom()/retryStep() — a non-retry-safe
+// action's transient failure fails the run outright instead of ever
+// scheduling a retry), so a claim won under this predicate is always safe
+// to actually re-attempt, no further check needed.
+export function dueScheduledRetryWhere(now: Date) {
+  return { status: 'retry_scheduled' as const, nextAttemptAt: { lte: now } };
+}
+
+// A 'running' row whose claim lease has gone stale — the previous
+// claimant (a first attempt or a retry attempt) crashed or was killed
+// before recording any outcome, so its true result is unknown. Reclaiming
+// this is NOT automatically safe to re-attempt: the caller must check
+// OpsActionsRegistryService.isRetrySafe() for this step's own actionType
+// *after* winning the claim (only then is the actionType known) and refuse
+// to re-execute a non-retry-safe action — see AutomationsService.retryStep().
+export function abandonedRunningClaimWhere(staleThreshold: Date) {
+  return { status: 'running' as const, claimedAt: { lt: staleThreshold } };
+}
+
+// Codex review — a first attempt created *before* RC27 shipped never had
+// claimedAt/claimToken set at all (those columns did not exist as a
+// concept yet), so a worker killed mid-attempt (e.g. a deploy) can leave
+// such a row stuck at status='running' with claimedAt=null AND
+// claimToken=null forever: abandonedRunningClaimWhere()'s own
+// `claimedAt: { lt: staleThreshold }` can never match a null claimedAt
+// (SQL NULL comparisons are never true), so neither the dispatcher's scan
+// nor retryStep()'s own claim ever saw these rows before this predicate
+// existed. `startedAt` — a column that *did* already exist pre-RC27 — is
+// the only reliable staleness signal available for this shape, so this
+// gates on it instead of claimedAt. Never matches a row with either claim
+// column set (that's abandonedRunningClaimWhere()'s and
+// dueScheduledRetryWhere()'s territory, handled by the normal — but
+// unsafe-to-blindly-retry — reclaim path) or a recent one (startedAt not
+// yet past the same lease duration everything else here uses). See
+// AutomationsService.reconcileLegacyUnclaimedRunningStep(): a row matching
+// this is never re-executed, only force-failed — its true outcome is
+// permanently unknown, exactly like an abandoned claim's, just without
+// the claim metadata to prove it via the usual mechanism.
+export function legacyUnclaimedRunningWhere(staleThreshold: Date) {
+  return {
+    status: 'running' as const,
+    claimedAt: null,
+    claimToken: null,
+    startedAt: { lt: staleThreshold },
   };
 }
