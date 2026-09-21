@@ -110,17 +110,43 @@ class OdcDocumentDedupMigrationTests(unittest.TestCase):
         subprocess.run(["docker", "rm", "-f", cls.container], capture_output=True)
 
     @classmethod
-    def _wait_until_ready(cls, timeout_seconds: int = 30):
+    def _wait_until_ready(cls, timeout_seconds: int = 60):
+        # The official postgres image's entrypoint runs initdb, starts a
+        # *temporary* instance to run init scripts (create the POSTGRES_DB
+        # database, etc.), stops it, then starts the real, final instance.
+        # pg_isready can report success against that temporary instance —
+        # a query issued in the narrow window while it is shutting down and
+        # the final one hasn't taken over yet fails with "the database
+        # system is shutting down", not a clean refused-connection. Only
+        # trust readiness once an actual query against DB_NAME succeeds,
+        # and keep retrying through that transient failure rather than
+        # treating it as fatal.
         deadline = time.monotonic() + timeout_seconds
+        last_error = ""
         while time.monotonic() < deadline:
-            result = subprocess.run(
-                ["docker", "exec", cls.container, "pg_isready", "-U", DB_USER],
+            probe = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    cls.container,
+                    "psql",
+                    "-U",
+                    DB_USER,
+                    "-d",
+                    DB_NAME,
+                    "-c",
+                    "SELECT 1;",
+                ],
                 capture_output=True,
+                text=True,
             )
-            if result.returncode == 0:
+            if probe.returncode == 0:
                 return
+            last_error = probe.stderr.strip()
             time.sleep(1)
-        raise TimeoutError("postgres container never became ready")
+        raise TimeoutError(
+            f"postgres container never became ready for real queries: {last_error}"
+        )
 
     @classmethod
     def _exec_sql(cls, sql: str, extra_args: list[str] | None = None) -> str:
