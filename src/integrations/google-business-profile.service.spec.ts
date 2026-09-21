@@ -199,6 +199,116 @@ describe('GoogleBusinessProfileService', () => {
     });
   });
 
+  // RC-38 "fiche complète" — every field Google returns for a location
+  // must actually reach the row, not just the handful the original
+  // integration extracted (title/category/address/phone).
+  it('extracts every field of a Google location into the mirror row', async () => {
+    const encrypted = (
+      service as unknown as { encrypt(value: string): string }
+    ).encrypt('refresh');
+    prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+      id: 'conn-1',
+      organizationId: 'org-1',
+      encryptedRefreshToken: encrypted,
+    });
+    let capturedCreate: Record<string, unknown> | undefined;
+    prisma.googleBusinessProfileLocation.upsert.mockImplementation(
+      (args: { create: Record<string, unknown> }) => {
+        capturedCreate = args.create;
+        return Promise.resolve({});
+      },
+    );
+    prisma.googleBusinessProfileLocation.deleteMany.mockResolvedValue({
+      count: 0,
+    });
+    prisma.googleBusinessProfileConnection.update.mockResolvedValue({});
+    jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: 'access' }), {
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            accounts: [{ name: 'accounts/123', accountName: 'ROBIA' }],
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            locations: [
+              {
+                name: 'locations/456',
+                languageCode: 'fr',
+                title: 'ROBIA Analakely',
+                storeCode: 'STORE-1',
+                storefrontAddress: { locality: 'Antananarivo' },
+                phoneNumbers: {
+                  primaryPhone: '+261 34 00 000 00',
+                  additionalPhones: ['+261 34 11 111 11'],
+                },
+                websiteUri: 'https://robia.example.com',
+                categories: {
+                  primaryCategory: { displayName: 'Agence marketing' },
+                  additionalCategories: [{ displayName: 'Consultant SEO' }],
+                },
+                regularHours: {
+                  periods: [
+                    {
+                      openDay: 'MONDAY',
+                      openTime: { hours: 9 },
+                      closeDay: 'MONDAY',
+                      closeTime: { hours: 18 },
+                    },
+                  ],
+                },
+                specialHours: { specialHourPeriods: [] },
+                moreHours: [{ hoursTypeId: 'DELIVERY', periods: [] }],
+                serviceArea: { businessType: 'CUSTOMER_LOCATION_ONLY' },
+                labels: ['VIP'],
+                latlng: { latitude: -18.9, longitude: 47.5 },
+                openInfo: { status: 'OPEN' },
+                metadata: { mapsUri: 'https://maps.google.com/?cid=1' },
+                profile: { description: 'Une agence marketing locale.' },
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      );
+
+    await service.syncLocations('org-1');
+
+    expect(capturedCreate).toMatchObject({
+      languageCode: 'fr',
+      storeCode: 'STORE-1',
+      additionalPhones: ['+261 34 11 111 11'],
+      additionalCategories: ['Consultant SEO'],
+      description: 'Une agence marketing locale.',
+      regularHours: {
+        periods: [
+          {
+            openDay: 'MONDAY',
+            openTime: { hours: 9 },
+            closeDay: 'MONDAY',
+            closeTime: { hours: 18 },
+          },
+        ],
+      },
+      specialHours: { specialHourPeriods: [] },
+      moreHours: [{ hoursTypeId: 'DELIVERY', periods: [] }],
+      serviceArea: { businessType: 'CUSTOMER_LOCATION_ONLY' },
+      labels: ['VIP'],
+      latitude: -18.9,
+      longitude: 47.5,
+      openStatus: 'OPEN',
+    });
+  });
+
   // A zero-account response is never distinguishable from "the accounts
   // endpoint had a blip" from inside this service — deleting on it would
   // wipe every previously synced mirror (and every ROBIA link riding on

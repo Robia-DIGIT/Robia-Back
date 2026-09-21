@@ -178,12 +178,29 @@ model GoogleBusinessProfileLocation {
   googleAccountName  String   @map("google_account_name")
   accountDisplayName String?  @map("account_display_name")
   googleLocationName String   @map("google_location_name")
+  languageCode       String?  @map("language_code")
   title              String
   storeCode          String?  @map("store_code")
   address            Json?
   primaryPhone       String?  @map("primary_phone")
+  additionalPhones   String[] @default([]) @map("additional_phones")
   websiteUri         String?  @map("website_uri")
   primaryCategory    String?  @map("primary_category")
+  additionalCategories String[] @default([]) @map("additional_categories")
+  description        String?
+  // RC-38 "fiche complète" — the rest of what Google's Business Information
+  // API returns for a location, kept as the API's own JSON shape rather
+  // than flattened into columns: regularHours/specialHours/moreHours are
+  // display-only (never computed against, never queried by field), so
+  // there is nothing to gain from normalizing their internal structure.
+  regularHours       Json?    @map("regular_hours")
+  specialHours       Json?    @map("special_hours")
+  moreHours          Json?    @map("more_hours")
+  serviceArea        Json?    @map("service_area")
+  labels             String[] @default([])
+  latitude           Float?
+  longitude          Float?
+  openStatus         String?  @map("open_status") // OPEN | CLOSED_PERMANENTLY | CLOSED_TEMPORARILY
   metadata           Json?
   robiaLocationId    String?  @map("robia_location_id")
   robiaLocation      Location? @relation(fields: [robiaLocationId], references: [id], onDelete: SetNull)

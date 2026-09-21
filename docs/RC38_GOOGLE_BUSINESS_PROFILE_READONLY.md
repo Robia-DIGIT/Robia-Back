@@ -49,6 +49,29 @@ Information API` doivent être activées. Le scope demandé est uniquement
 `https://www.googleapis.com/auth/business.manage`, accompagné de `openid email`
 pour identifier le compte affiché dans ROBIA.
 
+## Fiche complète (suivi de revue)
+
+Le lot initial ne lisait que `title`/`storeCode`/`storefrontAddress`/
+`phoneNumbers.primaryPhone`/`websiteUri`/`categories.primaryCategory`/
+`metadata`. Un retour utilisateur a montré qu'une fiche connectée
+n'affichait presque rien de ce que Google connaît réellement de
+l'établissement. Le `readMask` (et le miroir Prisma) couvre désormais aussi :
+`languageCode`, `phoneNumbers.additionalPhones`,
+`categories.additionalCategories`, `regularHours`, `specialHours`,
+`moreHours`, `serviceArea`, `labels`, `latlng`, `openInfo.status` et
+`profile.description`.
+
+Délibérément exclus : `relationshipData` (relations de chaîne/succursales),
+`serviceItems` (catalogue de services structuré, pertinent seulement pour
+certains types d'établissements) et `adWordsLocationExtensions` (marqué
+obsolète par Google). Toujours en lecture seule : aucun de ces champs
+supplémentaires n'est jamais renvoyé à Google, uniquement affiché dans
+ROBIA.
+
+Migration `20260921140000_gbp_full_profile_fields` — additive, colonnes
+nullables ou à défaut vide ; aucun backfill nécessaire, la synchronisation
+suivante les peuple.
+
 ## Stockage frontend historique
 
 La page `/business-profile` n'utilise plus `localStorage` comme source de

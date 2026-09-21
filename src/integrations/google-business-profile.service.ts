@@ -21,15 +21,30 @@ import { PrismaService } from '../prisma/prisma.service';
 const BUSINESS_PROFILE_SCOPE =
   'https://www.googleapis.com/auth/business.manage';
 const STATE_MAX_AGE_MS = 10 * 60 * 1000;
+// Every field the frontend's "fiche complète" needs to be an actually
+// complete read of the listing, not the earlier partial mask. Deliberately
+// excludes relationshipData (chain/parent relationships), serviceItems (a
+// large structured service catalogue only meaningful for a handful of
+// business types) and adWordsLocationExtensions (Google-deprecated) — see
+// docs/RC38_GOOGLE_BUSINESS_PROFILE_READONLY.md for the full rationale.
 const LOCATION_READ_MASK = [
   'name',
+  'languageCode',
   'title',
   'storeCode',
   'storefrontAddress',
   'phoneNumbers',
   'websiteUri',
   'categories',
+  'regularHours',
+  'specialHours',
+  'moreHours',
+  'serviceArea',
+  'labels',
+  'latlng',
+  'openInfo',
   'metadata',
+  'profile',
 ].join(',');
 
 interface OAuthState {
@@ -55,15 +70,31 @@ interface GoogleAccountsResponse {
   nextPageToken?: string;
 }
 
+interface GoogleCategory {
+  displayName?: string;
+}
+
 interface GoogleLocation {
   name: string;
+  languageCode?: string;
   title?: string;
   storeCode?: string;
   storefrontAddress?: Record<string, unknown>;
-  phoneNumbers?: { primaryPhone?: string };
+  phoneNumbers?: { primaryPhone?: string; additionalPhones?: string[] };
   websiteUri?: string;
-  categories?: { primaryCategory?: { displayName?: string } };
+  categories?: {
+    primaryCategory?: GoogleCategory;
+    additionalCategories?: GoogleCategory[];
+  };
+  regularHours?: Record<string, unknown>;
+  specialHours?: Record<string, unknown>;
+  moreHours?: Record<string, unknown>[];
+  serviceArea?: Record<string, unknown>;
+  labels?: string[];
+  latlng?: { latitude?: number; longitude?: number };
+  openInfo?: { status?: string; canReopen?: boolean; openingDate?: unknown };
   metadata?: Record<string, unknown>;
+  profile?: { description?: string };
 }
 
 interface GoogleLocationsResponse {
@@ -437,18 +468,39 @@ export class GoogleBusinessProfileService {
     location: GoogleLocation,
     syncedAt: Date,
   ) {
+    const additionalCategories = (
+      location.categories?.additionalCategories ?? []
+    )
+      .map((category) => category.displayName)
+      .filter((name): name is string => Boolean(name));
     return {
       accountDisplayName: account.accountName ?? null,
       googleLocationName: location.name,
+      languageCode: location.languageCode ?? null,
       title: location.title?.trim() || 'Établissement sans nom',
       storeCode: location.storeCode ?? null,
       address:
         (location.storefrontAddress as Prisma.InputJsonValue) ??
         Prisma.JsonNull,
       primaryPhone: location.phoneNumbers?.primaryPhone ?? null,
+      additionalPhones: location.phoneNumbers?.additionalPhones ?? [],
       websiteUri: location.websiteUri ?? null,
       primaryCategory:
         location.categories?.primaryCategory?.displayName ?? null,
+      additionalCategories,
+      description: location.profile?.description ?? null,
+      regularHours:
+        (location.regularHours as Prisma.InputJsonValue) ?? Prisma.JsonNull,
+      specialHours:
+        (location.specialHours as Prisma.InputJsonValue) ?? Prisma.JsonNull,
+      moreHours:
+        (location.moreHours as Prisma.InputJsonValue) ?? Prisma.JsonNull,
+      serviceArea:
+        (location.serviceArea as Prisma.InputJsonValue) ?? Prisma.JsonNull,
+      labels: location.labels ?? [],
+      latitude: location.latlng?.latitude ?? null,
+      longitude: location.latlng?.longitude ?? null,
+      openStatus: location.openInfo?.status ?? null,
       metadata: (location.metadata as Prisma.InputJsonValue) ?? Prisma.JsonNull,
       lastSyncedAt: syncedAt,
     };
