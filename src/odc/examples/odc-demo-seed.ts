@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { OdcProgramsService } from '../odc-programs.service';
 import type {
   OdcApplicationsService,
@@ -27,12 +28,18 @@ import type {
 
 export const ODC_DEMO_PROGRAM_SLUG = 'demo-odc-2026';
 
+// RC-33 hardening — no storageKey here: it can only be computed once the
+// real organizationId/applicationId/documentId triplet exists (see the seed
+// loop below, which builds a canonical key and calls
+// OdcApplicationsService.addUploadedDocument() directly — the same
+// server-side-only path a real upload uses, never the public
+// addDocument()/CreateOdcDocumentDto contract, which can no longer accept a
+// storageKey at all).
 interface OdcDemoDocumentSeed {
   documentTypeKey: 'cv' | 'pitch_deck';
   originalName: string;
   mimeType: string;
   sizeBytes: number;
-  storageKey: string;
 }
 
 interface OdcDemoApplicantSeed {
@@ -49,14 +56,12 @@ function cvAndPitchDeck(slug: string): OdcDemoDocumentSeed[] {
       originalName: `cv-${slug}.pdf`,
       mimeType: 'application/pdf',
       sizeBytes: 214_000,
-      storageKey: `demo/seed/odc/cv-${slug}.pdf`,
     },
     {
       documentTypeKey: 'pitch_deck',
       originalName: `pitch-deck-${slug}.pdf`,
       mimeType: 'application/pdf',
       sizeBytes: 1_450_000,
-      storageKey: `demo/seed/odc/pitch-deck-${slug}.pdf`,
     },
   ];
 }
@@ -183,13 +188,29 @@ export async function seedOdcDemo(
           `Demo seed's own program definition is missing docType "${document.documentTypeKey}".`,
         );
       }
-      await services.applications.addDocument(organizationId, created.id, {
-        documentTypeId,
-        originalName: document.originalName,
-        mimeType: document.mimeType,
-        sizeBytes: document.sizeBytes,
-        storageKey: document.storageKey,
-      });
+      // RC-33 hardening — metadata written directly through the same
+      // server-side-only path a real upload uses (never the public,
+      // client-facing addDocument() contract), with a canonical
+      // {organizationId}/{applicationId}/{documentId}/... key so
+      // storageKeyBelongsTo()'s download-time check accepts it exactly
+      // like a real upload's key — even though, like before, no actual
+      // file backs it in any OdcStorage implementation: a demo download
+      // 404s cleanly (see OdcDocumentsService.getFile()) rather than
+      // serving fabricated bytes.
+      const documentId = randomUUID();
+      const storageKey = `${organizationId}/${created.id}/${documentId}/${document.originalName}`;
+      await services.applications.addUploadedDocument(
+        organizationId,
+        created.id,
+        {
+          id: documentId,
+          documentTypeId,
+          originalName: document.originalName,
+          mimeType: document.mimeType,
+          sizeBytes: document.sizeBytes,
+          storageKey,
+        },
+      );
     }
     const submitted = await services.applications.submit(
       organizationId,

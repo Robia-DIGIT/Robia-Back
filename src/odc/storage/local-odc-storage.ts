@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { createReadStream } from 'node:fs';
-import { access, mkdir, writeFile } from 'node:fs/promises';
+import { access, mkdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, resolve, sep } from 'node:path';
 import type { OdcStorage } from './odc-storage';
 
@@ -41,6 +41,10 @@ export class LocalOdcStorage implements OdcStorage {
       return null;
     }
     return createReadStream(this.resolveWithinRoot(key));
+  }
+
+  async delete(key: string): Promise<void> {
+    await rm(this.resolveWithinRoot(key), { force: true });
   }
 
   private resolveWithinRoot(key: string): string {

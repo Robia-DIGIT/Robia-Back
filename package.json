@@ -19,7 +19,8 @@
     "test:cov": "jest --coverage",
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
     "test:e2e": "jest --config ./test/jest-e2e.json",
-    "seed:odc-demo": "ts-node -r tsconfig-paths/register scripts/seed-odc-demo.ts"
+    "seed:odc-demo": "ts-node -r tsconfig-paths/register scripts/seed-odc-demo.ts",
+    "cleanup:odc-orphan-files": "ts-node -r tsconfig-paths/register scripts/cleanup-odc-orphan-files.ts"
   },
   "dependencies": {
     "@nestjs/common": "^11.0.1",

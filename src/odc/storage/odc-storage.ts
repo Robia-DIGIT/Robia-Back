@@ -10,6 +10,13 @@ export interface OdcStorage {
   put(key: string, data: Buffer): Promise<void>;
   get(key: string): Promise<NodeJS.ReadableStream | null>;
   exists(key: string): Promise<boolean>;
+  // RC-33 hardening — the rollback half of upload(): a file can be written
+  // successfully and then the OdcDocument row's own DB write can still
+  // fail (constraint violation, connection drop, ...). Never a hard error
+  // if the key is already gone (deleting twice, or deleting a key that was
+  // never written, must both be safe no-ops) — the caller's own rollback
+  // path must never itself throw and mask the original DB failure.
+  delete(key: string): Promise<void>;
 }
 
 export const ODC_STORAGE = Symbol('ODC_STORAGE');

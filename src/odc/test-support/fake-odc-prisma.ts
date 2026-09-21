@@ -13,6 +13,21 @@ export interface FakeRecord {
   [key: string]: unknown;
 }
 
+// Mirrors Prisma's own `select` semantics closely enough for this fake's
+// purposes: only the keys with a truthy value in `select` end up on the
+// returned object — anything else (storageKey, in particular) is genuinely
+// absent, not just falsy, exactly like a real Prisma `select` response.
+function selectFields(
+  record: FakeRecord,
+  select: Record<string, boolean>,
+): FakeRecord {
+  const result: FakeRecord = {};
+  for (const [key, included] of Object.entries(select)) {
+    if (included) result[key] = record[key];
+  }
+  return result;
+}
+
 export function normalizeJsonSentinels(
   data: Record<string, unknown>,
 ): Record<string, unknown> {
@@ -80,9 +95,18 @@ export class FakeOdcPrisma {
   ): FakeRecord {
     const result: FakeRecord = { ...application };
     if (include?.documents) {
-      result.documents = Array.from(this.documents.values()).filter(
+      const documents = Array.from(this.documents.values()).filter(
         (d) => d.applicationId === application.id,
       );
+      const select =
+        typeof include.documents === 'object' &&
+        include.documents !== null &&
+        'select' in include.documents
+          ? (include.documents as { select?: Record<string, boolean> }).select
+          : undefined;
+      result.documents = select
+        ? documents.map((d) => selectFields(d, select))
+        : documents;
     }
     if (include?.scoreLines) {
       result.scoreLines = Array.from(this.scoreLines.values()).filter(
@@ -385,14 +409,15 @@ export class FakeOdcPrisma {
       where,
       include,
     }: {
-      where: { id?: string; organizationId?: string };
+      where: { id?: string; organizationId?: string; programId?: string };
       include?: Parameters<FakeOdcPrisma['applicationWithRelations']>[1];
     }) => {
       const record = Array.from(this.applications.values()).find(
         (a) =>
           (where.id === undefined || a.id === where.id) &&
           (where.organizationId === undefined ||
-            a.organizationId === where.organizationId),
+            a.organizationId === where.organizationId) &&
+          (where.programId === undefined || a.programId === where.programId),
       );
       return record ? this.applicationWithRelations(record, include) : null;
     },
@@ -471,16 +496,31 @@ export class FakeOdcPrisma {
     findFirst: ({
       where,
     }: {
-      where: { id?: string; organizationId?: string };
+      where: {
+        id?: string;
+        organizationId?: string;
+        applicationId?: string;
+        documentTypeId?: string;
+      };
     }) => {
       return (
         Array.from(this.documents.values()).find(
           (d) =>
             (where.id === undefined || d.id === where.id) &&
             (where.organizationId === undefined ||
-              d.organizationId === where.organizationId),
+              d.organizationId === where.organizationId) &&
+            (where.applicationId === undefined ||
+              d.applicationId === where.applicationId) &&
+            (where.documentTypeId === undefined ||
+              d.documentTypeId === where.documentTypeId),
         ) ?? null
       );
+    },
+    delete: ({ where }: { where: { id: string } }) => {
+      const record = this.documents.get(where.id);
+      if (!record) throw new Error('FakeOdcPrisma: document not found');
+      this.documents.delete(where.id);
+      return record;
     },
   };
 

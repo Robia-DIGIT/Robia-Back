@@ -16,7 +16,10 @@ import {
   ODC_STORAGE,
   type OdcStorage,
 } from './storage/odc-storage';
-import { buildOdcStorageKey } from './storage/odc-storage-key';
+import {
+  buildOdcStorageKey,
+  storageKeyBelongsTo,
+} from './storage/odc-storage-key';
 
 // A minimal, framework-agnostic shape — never Express.Multer.File directly,
 // so this service (and its tests) never depend on multer or an HTTP layer.
@@ -96,25 +99,59 @@ export class OdcDocumentsService {
       );
     }
 
-    return this.applications.addUploadedDocument(
-      organizationId,
-      applicationId,
-      {
-        id: documentId,
-        documentTypeId: docType.id,
-        originalName: file.originalname,
-        mimeType: file.mimetype,
-        sizeBytes: file.size,
-        storageKey,
-      },
-    );
+    // RC-33 hardening — the write above already landed; if persisting the
+    // OdcDocument row fails for any reason (constraint violation, DB
+    // connection drop, ...), the file must never survive as an orphan with
+    // no row pointing at it. The rollback itself is never allowed to mask
+    // the original failure — a delete() error is swallowed, not thrown,
+    // and the original error is always what the caller sees.
+    let outcome: {
+      application: OdcApplicationWithRelations;
+      replacedStorageKey: string | null;
+    };
+    try {
+      outcome = await this.applications.addUploadedDocument(
+        organizationId,
+        applicationId,
+        {
+          id: documentId,
+          documentTypeId: docType.id,
+          originalName: file.originalname,
+          mimeType: file.mimetype,
+          sizeBytes: file.size,
+          storageKey,
+        },
+      );
+    } catch (error) {
+      await this.storage.delete(storageKey).catch(() => undefined);
+      throw error;
+    }
+
+    // Multiple-documents policy: atomic replacement. The DB side already
+    // committed the swap; only now — after that commit, never before or
+    // instead of it — is the replaced slot's previous file removed. A
+    // failure here is a harmless leftover orphan file (the same class of
+    // drift scripts/cleanup-odc-orphan-files.ts exists to find), never an
+    // inconsistency: the new document is already correctly 'received'.
+    if (outcome.replacedStorageKey) {
+      await this.storage
+        .delete(outcome.replacedStorageKey)
+        .catch(() => undefined);
+    }
+
+    return outcome.application;
   }
 
   // Never 403 on a foreign document — always 404, so a caller can never
   // learn a document with that id exists in another organization. Also 404
-  // (not e.g. 409/425) for 'pending_upload', a missing storageKey, or a key
-  // OdcStorage can't actually read (RC-32's demo seed's own demo/seed/...
-  // keys, never written to any real backend, resolve here on purpose).
+  // (not e.g. 409/425) for 'pending_upload', a missing storageKey, a
+  // storageKey that doesn't canonically belong to this exact
+  // organization/application/document (RC-33 hardening — see
+  // storageKeyBelongsTo()'s own doc comment; this is what makes a
+  // pre-hardening row safe even though it may still carry an
+  // attacker-chosen or otherwise non-canonical key), or a key OdcStorage
+  // can't actually read (RC-32's demo seed's own canonical-but-unwritten
+  // keys resolve here on purpose).
   async getFile(
     organizationId: string,
     documentId: string,
@@ -123,7 +160,17 @@ export class OdcDocumentsService {
       organizationId,
       documentId,
     );
-    if (!document || document.status !== 'received' || !document.storageKey) {
+    if (
+      !document ||
+      document.status !== 'received' ||
+      !document.storageKey ||
+      !storageKeyBelongsTo(
+        document.storageKey,
+        organizationId,
+        document.applicationId,
+        document.id,
+      )
+    ) {
       throw new NotFoundException('Document non trouvé.');
     }
     const stream = await this.storage.get(document.storageKey);
