@@ -297,7 +297,7 @@ model Audit {
   websiteId      String    @map("website_id")
   website        Website   @relation(fields: [websiteId], references: [id])
   locationId     String?   @map("location_id")
-  location       Location? @relation(fields: [locationId], references: [id])
+  location       Location? @relation(fields: [locationId], references: [id], onDelete: SetNull)
   status         String    @default("pending") // pending | running | completed | failed
   opportunities Opportunity[]
   globalScore    Int?      @map("global_score")
@@ -343,7 +343,7 @@ model Opportunity {
   auditId          String   @map("audit_id")
   audit            Audit    @relation(fields: [auditId], references: [id])
   locationId       String?  @map("location_id")
-  location         Location? @relation(fields: [locationId], references: [id])
+  location         Location? @relation(fields: [locationId], references: [id], onDelete: SetNull)
   title            String
   description      String
   category         String?
@@ -461,6 +461,14 @@ model Location {
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @updatedAt @map("updated_at")
 
+  // Schema/migration drift fix (no DB change, no new migration): the FK
+  // constraints on audits.location_id and opportunities.location_id have
+  // always been ON DELETE SET NULL (see
+  // prisma/migrations/20260827144755_add_locations/migration.sql) — this
+  // schema never declared it, so `prisma migrate dev` would eventually
+  // propose reverting that constraint. DELETE /locations/:id was never
+  // actually unsafe: Postgres already detaches audits/opportunities
+  // instead of blocking the delete.
   audits         Audit[]
   opportunities  Opportunity[]
   googleBusinessProfileLocations GoogleBusinessProfileLocation[]

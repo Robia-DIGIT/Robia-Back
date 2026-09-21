@@ -247,19 +247,41 @@ export class GoogleBusinessProfileService {
         });
       }
     }
-    await this.prisma.googleBusinessProfileLocation.deleteMany({
-      where: {
-        connectionId: connection.id,
-        ...(observedNames.length
-          ? { googleLocationName: { notIn: observedNames } }
-          : {}),
-      },
-    });
+
+    // A zero-account response is never trusted as "this Google user really
+    // has nothing" — it's the one shape a transient/partial read and a
+    // genuine disconnection are indistinguishable from the outside, and a
+    // real read failure already threw out of fetchAccounts()/fetchLocations()
+    // before reaching this point (never silently returns []). Treating
+    // it as truth here would deleteMany() every previously synced mirror
+    // — and every ROBIA link riding on it — the moment Google's accounts
+    // endpoint has a blip. Skip the destructive cleanup in that one case;
+    // any account that *did* come back is still fully reconciled below.
+    const accountsObserved = accounts.length > 0;
+    if (accountsObserved) {
+      await this.prisma.googleBusinessProfileLocation.deleteMany({
+        where: {
+          connectionId: connection.id,
+          ...(observedNames.length
+            ? { googleLocationName: { notIn: observedNames } }
+            : {}),
+        },
+      });
+    } else {
+      this.logger.warn(
+        `GBP : synchronisation sans aucun compte observé (organization=${organizationId}) — nettoyage ignoré pour ne pas effacer les établissements déjà synchronisés.`,
+      );
+    }
     await this.prisma.googleBusinessProfileConnection.update({
       where: { id: connection.id },
       data: { lastSyncedAt: syncedAt },
     });
-    return { synced: true, locationCount: observedNames.length, syncedAt };
+    const locationCount = accountsObserved
+      ? observedNames.length
+      : await this.prisma.googleBusinessProfileLocation.count({
+          where: { connectionId: connection.id },
+        });
+    return { synced: true, locationCount, syncedAt };
   }
 
   async linkLocation(

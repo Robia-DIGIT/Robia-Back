@@ -28,6 +28,7 @@ describe('GoogleBusinessProfileService', () => {
       upsert: jest.Mock;
       update: jest.Mock;
       deleteMany: jest.Mock;
+      count: jest.Mock;
     };
   };
   let service: GoogleBusinessProfileService;
@@ -48,6 +49,7 @@ describe('GoogleBusinessProfileService', () => {
         upsert: jest.fn(),
         update: jest.fn(),
         deleteMany: jest.fn(),
+        count: jest.fn(),
       },
     };
     const config = {
@@ -195,6 +197,89 @@ describe('GoogleBusinessProfileService', () => {
         googleLocationName: { notIn: ['locations/456'] },
       },
     });
+  });
+
+  // A zero-account response is never distinguishable from "the accounts
+  // endpoint had a blip" from inside this service — deleting on it would
+  // wipe every previously synced mirror (and every ROBIA link riding on
+  // it) the moment that happens. It must be a safe no-op for existing
+  // data, not treated as "this Google user really has nothing".
+  it('never deletes previously synced locations when the accounts response comes back empty', async () => {
+    const encrypted = (
+      service as unknown as { encrypt(value: string): string }
+    ).encrypt('refresh');
+    prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+      id: 'conn-1',
+      organizationId: 'org-1',
+      encryptedRefreshToken: encrypted,
+    });
+    prisma.googleBusinessProfileConnection.update.mockResolvedValue({});
+    prisma.googleBusinessProfileLocation.count.mockResolvedValue(3);
+    jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: 'access' }), {
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ accounts: [] }), { status: 200 }),
+      );
+
+    await expect(service.syncLocations('org-1')).resolves.toMatchObject({
+      synced: true,
+      locationCount: 3,
+    });
+    expect(
+      prisma.googleBusinessProfileLocation.deleteMany,
+    ).not.toHaveBeenCalled();
+    expect(prisma.googleBusinessProfileLocation.count).toHaveBeenCalledWith({
+      where: { connectionId: 'conn-1' },
+    });
+    // lastSyncedAt is still recorded — the sync attempt genuinely happened
+    // and reached Google, it just observed nothing to reconcile.
+    expect(prisma.googleBusinessProfileConnection.update).toHaveBeenCalled();
+  });
+
+  it('still reconciles normally when at least one account is observed, even if that account has zero locations', async () => {
+    const encrypted = (
+      service as unknown as { encrypt(value: string): string }
+    ).encrypt('refresh');
+    prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+      id: 'conn-1',
+      organizationId: 'org-1',
+      encryptedRefreshToken: encrypted,
+    });
+    prisma.googleBusinessProfileConnection.update.mockResolvedValue({});
+    prisma.googleBusinessProfileLocation.deleteMany.mockResolvedValue({
+      count: 2,
+    });
+    jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: 'access' }), {
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ accounts: [{ name: 'accounts/123' }] }), {
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ locations: [] }), { status: 200 }),
+      );
+
+    await expect(service.syncLocations('org-1')).resolves.toMatchObject({
+      synced: true,
+      locationCount: 0,
+    });
+    // An observed (even if empty) account is trusted: every previously
+    // synced mirror for this connection is genuinely gone from Google.
+    expect(
+      prisma.googleBusinessProfileLocation.deleteMany,
+    ).toHaveBeenCalledWith({ where: { connectionId: 'conn-1' } });
+    expect(prisma.googleBusinessProfileLocation.count).not.toHaveBeenCalled();
   });
 
   it('never links a Google location to a ROBIA location from another organization', async () => {
