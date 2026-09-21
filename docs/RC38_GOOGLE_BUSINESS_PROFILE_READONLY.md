@@ -11,18 +11,26 @@ Business Profile.
    Google.
 2. Le callback vérifie à la fois le cookie HTTP-only et la signature/expiration
    de l'état avant d'échanger le code.
-3. Le refresh token est chiffré AES-256-GCM avant toute écriture en base.
+3. Le refresh token est chiffré AES-256-GCM avant toute écriture en base et
+   lié au `sub` Google stable. Un token existant n'est jamais réutilisé pour
+   un autre compte, même si Google omet un nouveau refresh token.
 4. `POST /integrations/google/business-profile/sync` lit les comptes via
    Account Management API puis leurs établissements via Business Information
    API. La pagination est suivie sur les deux APIs.
 5. Chaque établissement Google est stocké comme miroir read-only et peut être
    associé à une `Location` appartenant à la même organisation ROBIA.
-6. La déconnexion tente une révocation Google puis supprime la connexion et les
-   miroirs associés par cascade.
+6. Une synchronisation possède un bail durable et un cooldown : une seule
+   instance réconcilie un compte à la fois, et aucune suppression ne commence
+   avant la lecture complète de toutes les pages Google.
+7. La déconnexion supprime la connexion locale seulement après confirmation
+   HTTP de la révocation Google. Une erreur conserve le token chiffré afin que
+   l'utilisateur puisse réessayer.
 
 L'adaptateur Intelligence GBP expose désormais l'état réel : `not_connected`,
 `not_configured` tant qu'aucune synchronisation n'a abouti, puis `ok` avec le
-nombre d'établissements observés. Ces données restent hors score SEO.
+nombre d'établissements observés. Une tentative incomplète expose `partial`
+et conserve la date ainsi que les données de la dernière réussite ; le Command
+Center ne la présente jamais comme `ok`. Ces données restent hors score SEO.
 
 ## Configuration production
 
@@ -49,7 +57,7 @@ Information API` doivent être activées. Le scope demandé est uniquement
 `https://www.googleapis.com/auth/business.manage`, accompagné de `openid email`
 pour identifier le compte affiché dans ROBIA.
 
-## Fiche complète (suivi de revue)
+## Détails de la fiche synchronisés
 
 Le lot initial ne lisait que `title`/`storeCode`/`storefrontAddress`/
 `phoneNumbers.primaryPhone`/`websiteUri`/`categories.primaryCategory`/
@@ -68,16 +76,39 @@ obsolète par Google). Toujours en lecture seule : aucun de ces champs
 supplémentaires n'est jamais renvoyé à Google, uniquement affiché dans
 ROBIA.
 
+Il ne s'agit donc pas d'une copie exhaustive de tout Google Business Profile.
+Les attributs, avis, médias/photos et performances relèvent d'autres endpoints
+ou APIs et restent hors périmètre de RC38. L'interface parle volontairement de
+« détails de la fiche », jamais de « fiche complète ».
+
 Migration `20260921140000_gbp_full_profile_fields` — additive, colonnes
 nullables ou à défaut vide ; aucun backfill nécessaire, la synchronisation
 suivante les peuple.
 
+Migration de durcissement
+`20260921150000_rc38_oauth_sync_and_legacy_import` — additive : identité
+Google stable, tentative/statut/bail de synchronisation et clé idempotente de
+l'import legacy. Les connexions déjà synchronisées sont reclassées `success` ;
+les autres restent `never`.
+
 ## Stockage frontend historique
 
 La page `/business-profile` n'utilise plus `localStorage` comme source de
-vérité. Si la base ne contient encore aucun établissement mais que l'ancien
-cache `robia_business_locations` existe, la page le transfère une seule fois au
-backend et ne supprime le cache qu'après réussite complète.
+vérité. Si l'ancien cache `robia_business_locations` existe, elle l'envoie à
+`POST /locations/legacy-import`. L'import est transactionnel et idempotent par
+organisation/identifiant legacy : un échec ne laisse aucun lot partiel, une
+réponse réseau perdue peut être rejouée sans doublon, et une base déjà
+partiellement migrée est réconciliée. Le cache navigateur n'est supprimé
+qu'après réussite complète.
+
+## Publication OAuth
+
+L'approbation d'accès aux APIs Google Business Profile ne publie pas
+automatiquement l'application OAuth. Tant que Google Auth Platform reste en
+mode **Test**, seuls les utilisateurs tests configurés peuvent consentir et
+leurs autorisations/refresh tokens peuvent expirer après sept jours. Avant
+d'ouvrir ROBIA à des utilisateurs réels, publier l'application depuis l'écran
+Audience et terminer les validations de marque/scopes demandées par Google.
 
 ## Hors périmètre explicite
 
@@ -99,5 +130,8 @@ idempotence, journal de preuve et permissions Google revues.
    du compte.
 5. Associer une fiche Google à un établissement ROBIA, recharger la page et
    vérifier que l'association persiste.
-6. Déconnecter et vérifier que le statut revient à `Non connecté` sans aucune
-   modification de la fiche dans Google.
+6. Reconnecter le même compte sans mélanger les établissements, puis essayer
+   un autre compte et vérifier que les anciens miroirs ne sont pas présentés
+   comme appartenant au nouveau.
+7. Déconnecter et vérifier que le statut revient à `Non connecté` seulement
+   après confirmation de la révocation Google, sans modifier la fiche.

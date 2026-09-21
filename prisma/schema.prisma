@@ -117,6 +117,7 @@ model GoogleSearchConsoleConnection {
   organizationId        String   @unique @map("organization_id")
   organization          Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   googleAccountEmail    String?  @map("google_account_email")
+  googleAccountSubject  String?  @map("google_account_subject")
   encryptedRefreshToken String   @map("encrypted_refresh_token")
   grantedScopes         String?  @map("granted_scopes")
   selectedSiteUrl       String?  @map("selected_site_url")
@@ -125,6 +126,10 @@ model GoogleSearchConsoleConnection {
   selectedAnalyticsPropertyName String?  @map("selected_analytics_property_name")
   connectedAt           DateTime @default(now()) @map("connected_at")
   lastSyncedAt          DateTime? @map("last_synced_at")
+  lastSyncAttemptAt     DateTime? @map("last_sync_attempt_at")
+  lastSyncStatus        String   @default("never") @map("last_sync_status") // never | running | success | partial | failed
+  syncClaimedAt         DateTime? @map("sync_claimed_at")
+  syncClaimToken        String?  @map("sync_claim_token")
   lastAnalyticsSyncedAt DateTime? @map("last_analytics_synced_at")
   createdAt             DateTime @default(now()) @map("created_at")
   updatedAt             DateTime @updatedAt @map("updated_at")
@@ -465,6 +470,7 @@ model Location {
   city           String?
   country        String?
   phone          String?
+  legacyImportKey String? @map("legacy_import_key")
   latitude       Float?
   longitude      Float?
 
@@ -490,6 +496,7 @@ model Location {
   opportunities  Opportunity[]
   googleBusinessProfileLocations GoogleBusinessProfileLocation[]
 
+  @@unique([organizationId, legacyImportKey])
   @@map("locations")
 }
 

@@ -1,7 +1,17 @@
 import { ConfigService } from '@nestjs/config';
-import { NotFoundException, UnauthorizedException } from '@nestjs/common';
+import {
+  BadGatewayException,
+  ConflictException,
+  NotFoundException,
+  ServiceUnavailableException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { GoogleBusinessProfileService } from './google-business-profile.service';
+
+function callArgs<T>(mock: jest.Mock): T[] {
+  return (mock.mock.calls as unknown as Array<[T]>).map(([value]) => value);
+}
 
 describe('GoogleBusinessProfileService', () => {
   const env: Record<string, string> = {
@@ -14,12 +24,14 @@ describe('GoogleBusinessProfileService', () => {
     DASHBOARD_URL: 'https://app.robiacopilot.site',
   };
   let prisma: {
+    $transaction: jest.Mock;
     organization: { findFirst: jest.Mock };
     location: { findFirst: jest.Mock };
     googleBusinessProfileConnection: {
       findUnique: jest.Mock;
       upsert: jest.Mock;
       update: jest.Mock;
+      updateMany: jest.Mock;
       delete: jest.Mock;
     };
     googleBusinessProfileLocation: {
@@ -35,12 +47,14 @@ describe('GoogleBusinessProfileService', () => {
 
   beforeEach(() => {
     prisma = {
+      $transaction: jest.fn(),
       organization: { findFirst: jest.fn() },
       location: { findFirst: jest.fn() },
       googleBusinessProfileConnection: {
         findUnique: jest.fn(),
         upsert: jest.fn(),
         update: jest.fn(),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
         delete: jest.fn(),
       },
       googleBusinessProfileLocation: {
@@ -52,6 +66,9 @@ describe('GoogleBusinessProfileService', () => {
         count: jest.fn(),
       },
     };
+    prisma.$transaction.mockImplementation(
+      (callback: (tx: typeof prisma) => unknown) => callback(prisma),
+    );
     const config = {
       get: jest.fn((name: string, fallback?: string) => env[name] ?? fallback),
     };
@@ -118,9 +135,12 @@ describe('GoogleBusinessProfileService', () => {
         ),
       )
       .mockResolvedValueOnce(
-        new Response(JSON.stringify({ email: 'owner@example.com' }), {
-          status: 200,
-        }),
+        new Response(
+          JSON.stringify({ sub: 'google-sub-1', email: 'owner@example.com' }),
+          {
+            status: 200,
+          },
+        ),
       );
 
     await service.completeAuthorization('code', state);
@@ -131,6 +151,251 @@ describe('GoogleBusinessProfileService', () => {
     expect(capturedCreate?.googleAccountEmail).toBe('owner@example.com');
   });
 
+  it('reuses an existing refresh token only for the exact same Google subject', async () => {
+    const encrypted = (
+      service as unknown as { encrypt(value: string): string }
+    ).encrypt('existing-refresh');
+    const state = new URL(
+      service.getAuthorizationUrl('org-1', 'user-1'),
+    ).searchParams.get('state')!;
+    prisma.organization.findFirst.mockResolvedValue({ id: 'org-1' });
+    prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+      id: 'conn-1',
+      organizationId: 'org-1',
+      googleAccountSubject: 'subject-1',
+      encryptedRefreshToken: encrypted,
+    });
+    prisma.googleBusinessProfileConnection.upsert.mockResolvedValue({
+      id: 'conn-1',
+    });
+    jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            access_token: 'access',
+            scope: `openid email ${'https://www.googleapis.com/auth/business.manage'}`,
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ sub: 'subject-1', email: 'same@example.com' }),
+          { status: 200 },
+        ),
+      );
+
+    await service.completeAuthorization('code', state);
+
+    const [{ update }] = callArgs<{
+      update: { encryptedRefreshToken: string };
+    }>(prisma.googleBusinessProfileConnection.upsert);
+    expect(update.encryptedRefreshToken).toBe(encrypted);
+    expect(
+      prisma.googleBusinessProfileLocation.deleteMany,
+    ).not.toHaveBeenCalled();
+  });
+
+  it('rotates the refresh token without clearing mirrors when the Google subject is unchanged', async () => {
+    const state = new URL(
+      service.getAuthorizationUrl('org-1', 'user-1'),
+    ).searchParams.get('state')!;
+    prisma.organization.findFirst.mockResolvedValue({ id: 'org-1' });
+    prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+      id: 'conn-1',
+      googleAccountSubject: 'subject-1',
+      encryptedRefreshToken: 'encrypted-old',
+    });
+    prisma.googleBusinessProfileConnection.upsert.mockResolvedValue({
+      id: 'conn-1',
+    });
+    jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            access_token: 'access',
+            refresh_token: 'rotated-refresh',
+            scope:
+              'openid email https://www.googleapis.com/auth/business.manage',
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ sub: 'subject-1', email: 'same@example.com' }),
+          { status: 200 },
+        ),
+      );
+
+    await service.completeAuthorization('code', state);
+
+    const [{ update }] = callArgs<{
+      update: {
+        encryptedRefreshToken: string;
+        lastSyncedAt?: null;
+      };
+    }>(prisma.googleBusinessProfileConnection.upsert);
+    expect(update.encryptedRefreshToken).toMatch(/^v1\./);
+    expect(update.encryptedRefreshToken).not.toBe('encrypted-old');
+    expect(update.lastSyncedAt).toBeUndefined();
+    expect(
+      prisma.googleBusinessProfileLocation.deleteMany,
+    ).not.toHaveBeenCalled();
+  });
+
+  it('refuses a different Google subject when no new refresh token is returned', async () => {
+    const state = new URL(
+      service.getAuthorizationUrl('org-1', 'user-1'),
+    ).searchParams.get('state')!;
+    prisma.organization.findFirst.mockResolvedValue({ id: 'org-1' });
+    prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+      id: 'conn-1',
+      googleAccountSubject: 'old-subject',
+      encryptedRefreshToken: 'encrypted-old',
+    });
+    jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            access_token: 'access',
+            scope: `openid email ${'https://www.googleapis.com/auth/business.manage'}`,
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ sub: 'new-subject', email: 'new@example.com' }),
+          { status: 200 },
+        ),
+      );
+
+    await expect(
+      service.completeAuthorization('code', state),
+    ).rejects.toBeInstanceOf(BadGatewayException);
+    expect(
+      prisma.googleBusinessProfileConnection.upsert,
+    ).not.toHaveBeenCalled();
+  });
+
+  it('atomically clears old mirrors when a different Google subject supplies a new refresh token', async () => {
+    const state = new URL(
+      service.getAuthorizationUrl('org-1', 'user-1'),
+    ).searchParams.get('state')!;
+    prisma.organization.findFirst.mockResolvedValue({ id: 'org-1' });
+    prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+      id: 'conn-1',
+      googleAccountSubject: 'old-subject',
+      encryptedRefreshToken: 'encrypted-old',
+    });
+    prisma.googleBusinessProfileConnection.upsert.mockResolvedValue({
+      id: 'conn-1',
+    });
+    jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            access_token: 'access',
+            refresh_token: 'new-refresh',
+            scope: `openid email ${'https://www.googleapis.com/auth/business.manage'}`,
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ sub: 'new-subject', email: 'new@example.com' }),
+          { status: 200 },
+        ),
+      );
+
+    await service.completeAuthorization('code', state);
+
+    const [{ update }] = callArgs<{
+      update: { googleAccountSubject: string; lastSyncedAt: null };
+    }>(prisma.googleBusinessProfileConnection.upsert);
+    expect(update).toMatchObject({
+      googleAccountSubject: 'new-subject',
+      lastSyncedAt: null,
+    });
+    expect(
+      prisma.googleBusinessProfileLocation.deleteMany,
+    ).toHaveBeenCalledWith({
+      where: { connectionId: 'conn-1' },
+    });
+  });
+
+  it('never exposes old-account mirrors when the first synchronization of a new account fails', async () => {
+    const state = new URL(
+      service.getAuthorizationUrl('org-1', 'user-1'),
+    ).searchParams.get('state')!;
+    const encryptedNew = (
+      service as unknown as { encrypt(value: string): string }
+    ).encrypt('new-refresh');
+    prisma.organization.findFirst.mockResolvedValue({ id: 'org-1' });
+    prisma.googleBusinessProfileConnection.findUnique
+      .mockResolvedValueOnce({
+        id: 'conn-1',
+        googleAccountSubject: 'old-subject',
+        encryptedRefreshToken: 'encrypted-old',
+      })
+      .mockResolvedValueOnce({
+        id: 'conn-1',
+        organizationId: 'org-1',
+        googleAccountSubject: 'new-subject',
+        encryptedRefreshToken: encryptedNew,
+        lastSyncedAt: null,
+      });
+    prisma.googleBusinessProfileConnection.upsert.mockResolvedValue({
+      id: 'conn-1',
+    });
+    jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            access_token: 'oauth-access',
+            refresh_token: 'new-refresh',
+            scope:
+              'openid email https://www.googleapis.com/auth/business.manage',
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ sub: 'new-subject', email: 'new@example.com' }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: 'sync-access' }), {
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(new Response('{}', { status: 503 }));
+
+    await service.completeAuthorization('code', state);
+    await expect(service.syncLocations('org-1')).rejects.toBeInstanceOf(
+      BadGatewayException,
+    );
+
+    expect(
+      prisma.googleBusinessProfileLocation.deleteMany,
+    ).toHaveBeenCalledTimes(1);
+    expect(
+      prisma.googleBusinessProfileLocation.deleteMany,
+    ).toHaveBeenCalledWith({
+      where: { connectionId: 'conn-1' },
+    });
+    expect(prisma.googleBusinessProfileLocation.upsert).not.toHaveBeenCalled();
+  });
+
   it('synchronizes real account locations and removes stale mirrors only after successful reads', async () => {
     const encrypted = (
       service as unknown as { encrypt(value: string): string }
@@ -139,6 +404,7 @@ describe('GoogleBusinessProfileService', () => {
       id: 'conn-1',
       organizationId: 'org-1',
       encryptedRefreshToken: encrypted,
+      lastSyncedAt: null,
     });
     prisma.googleBusinessProfileLocation.upsert.mockResolvedValue({});
     prisma.googleBusinessProfileLocation.deleteMany.mockResolvedValue({
@@ -210,6 +476,7 @@ describe('GoogleBusinessProfileService', () => {
       id: 'conn-1',
       organizationId: 'org-1',
       encryptedRefreshToken: encrypted,
+      lastSyncedAt: null,
     });
     let capturedCreate: Record<string, unknown> | undefined;
     prisma.googleBusinessProfileLocation.upsert.mockImplementation(
@@ -322,6 +589,7 @@ describe('GoogleBusinessProfileService', () => {
       id: 'conn-1',
       organizationId: 'org-1',
       encryptedRefreshToken: encrypted,
+      lastSyncedAt: new Date('2026-09-20T10:00:00Z'),
     });
     prisma.googleBusinessProfileConnection.update.mockResolvedValue({});
     prisma.googleBusinessProfileLocation.count.mockResolvedValue(3);
@@ -337,7 +605,8 @@ describe('GoogleBusinessProfileService', () => {
       );
 
     await expect(service.syncLocations('org-1')).resolves.toMatchObject({
-      synced: true,
+      synced: false,
+      status: 'partial',
       locationCount: 3,
     });
     expect(
@@ -346,9 +615,44 @@ describe('GoogleBusinessProfileService', () => {
     expect(prisma.googleBusinessProfileLocation.count).toHaveBeenCalledWith({
       where: { connectionId: 'conn-1' },
     });
-    // lastSyncedAt is still recorded — the sync attempt genuinely happened
-    // and reached Google, it just observed nothing to reconcile.
-    expect(prisma.googleBusinessProfileConnection.update).toHaveBeenCalled();
+    expect(
+      callArgs<{ data: { lastSyncedAt?: Date } }>(
+        prisma.googleBusinessProfileConnection.updateMany,
+      ).some(({ data }) => data.lastSyncedAt !== undefined),
+    ).toBe(false);
+  });
+
+  it('reports a partial first attempt when Google returns no account and no mirror exists', async () => {
+    const encrypted = (
+      service as unknown as { encrypt(value: string): string }
+    ).encrypt('refresh');
+    prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+      id: 'conn-1',
+      organizationId: 'org-1',
+      encryptedRefreshToken: encrypted,
+      lastSyncedAt: null,
+    });
+    prisma.googleBusinessProfileLocation.count.mockResolvedValue(0);
+    jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: 'access' }), {
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ accounts: [] }), { status: 200 }),
+      );
+
+    await expect(service.syncLocations('org-1')).resolves.toEqual({
+      synced: false,
+      status: 'partial',
+      locationCount: 0,
+      syncedAt: null,
+    });
+    expect(
+      prisma.googleBusinessProfileLocation.deleteMany,
+    ).not.toHaveBeenCalled();
   });
 
   it('still reconciles normally when at least one account is observed, even if that account has zero locations', async () => {
@@ -359,6 +663,7 @@ describe('GoogleBusinessProfileService', () => {
       id: 'conn-1',
       organizationId: 'org-1',
       encryptedRefreshToken: encrypted,
+      lastSyncedAt: null,
     });
     prisma.googleBusinessProfileConnection.update.mockResolvedValue({});
     prisma.googleBusinessProfileLocation.deleteMany.mockResolvedValue({
@@ -390,6 +695,249 @@ describe('GoogleBusinessProfileService', () => {
       prisma.googleBusinessProfileLocation.deleteMany,
     ).toHaveBeenCalledWith({ where: { connectionId: 'conn-1' } });
     expect(prisma.googleBusinessProfileLocation.count).not.toHaveBeenCalled();
+  });
+
+  it('rejects a concurrent synchronization before making any Google request', async () => {
+    const encrypted = (
+      service as unknown as { encrypt(value: string): string }
+    ).encrypt('refresh');
+    prisma.googleBusinessProfileConnection.findUnique
+      .mockResolvedValueOnce({
+        id: 'conn-1',
+        organizationId: 'org-1',
+        encryptedRefreshToken: encrypted,
+      })
+      .mockResolvedValueOnce({
+        syncClaimedAt: new Date(),
+        lastSyncAttemptAt: new Date(),
+      });
+    prisma.googleBusinessProfileConnection.updateMany.mockResolvedValueOnce({
+      count: 0,
+    });
+    const fetchSpy = jest.spyOn(global, 'fetch');
+
+    await expect(service.syncLocations('org-1')).rejects.toBeInstanceOf(
+      ConflictException,
+    );
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('recovers a synchronization whose durable lease expired after a crash', async () => {
+    const encrypted = (
+      service as unknown as { encrypt(value: string): string }
+    ).encrypt('refresh');
+    prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+      id: 'conn-1',
+      organizationId: 'org-1',
+      encryptedRefreshToken: encrypted,
+      lastSyncedAt: null,
+      lastSyncAttemptAt: new Date(Date.now() - 10 * 60 * 1000),
+      syncClaimedAt: new Date(Date.now() - 10 * 60 * 1000),
+      syncClaimToken: 'crashed-worker',
+    });
+    prisma.googleBusinessProfileLocation.deleteMany.mockResolvedValue({
+      count: 0,
+    });
+    jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: 'access' }), {
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ accounts: [{ name: 'accounts/123' }] }), {
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ locations: [] }), { status: 200 }),
+      );
+
+    await expect(service.syncLocations('org-1')).resolves.toMatchObject({
+      synced: true,
+      status: 'success',
+    });
+    const [claimArgs] = callArgs<{
+      where: {
+        OR: [{ syncClaimedAt: null }, { syncClaimedAt: { lt: Date } }];
+      };
+    }>(prisma.googleBusinessProfileConnection.updateMany);
+    expect(claimArgs.where.OR[0]).toEqual({ syncClaimedAt: null });
+    expect(claimArgs.where.OR[1].syncClaimedAt.lt).toBeInstanceOf(Date);
+  });
+
+  it('does not reconcile or delete anything when Google pagination fails midway', async () => {
+    const encrypted = (
+      service as unknown as { encrypt(value: string): string }
+    ).encrypt('refresh');
+    prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+      id: 'conn-1',
+      organizationId: 'org-1',
+      encryptedRefreshToken: encrypted,
+      lastSyncedAt: null,
+    });
+    jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: 'access' }), {
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ accounts: [{ name: 'accounts/123' }] }), {
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            locations: [{ name: 'locations/first', title: 'First' }],
+            nextPageToken: 'next',
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(new Response('{}', { status: 503 }));
+
+    await expect(service.syncLocations('org-1')).rejects.toBeInstanceOf(
+      BadGatewayException,
+    );
+    expect(prisma.googleBusinessProfileLocation.upsert).not.toHaveBeenCalled();
+    expect(
+      prisma.googleBusinessProfileLocation.deleteMany,
+    ).not.toHaveBeenCalled();
+    const releaseArgs = callArgs<{
+      where: { id: string; syncClaimToken: string };
+      data: {
+        syncClaimedAt: null;
+        syncClaimToken: null;
+        lastSyncStatus: string;
+      };
+    }>(prisma.googleBusinessProfileConnection.updateMany).at(-1);
+    expect(releaseArgs).toMatchObject({
+      where: { id: 'conn-1' },
+      data: {
+        syncClaimedAt: null,
+        syncClaimToken: null,
+        lastSyncStatus: 'failed',
+      },
+    });
+    expect(typeof releaseArgs?.where.syncClaimToken).toBe('string');
+  });
+
+  it('ignores a fully fetched result when the worker lost its claim before commit', async () => {
+    const encrypted = (
+      service as unknown as { encrypt(value: string): string }
+    ).encrypt('refresh');
+    prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+      id: 'conn-1',
+      organizationId: 'org-1',
+      encryptedRefreshToken: encrypted,
+      lastSyncedAt: null,
+    });
+    prisma.googleBusinessProfileConnection.updateMany
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 0 })
+      .mockResolvedValueOnce({ count: 0 });
+    jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: 'access' }), {
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ accounts: [{ name: 'accounts/123' }] }), {
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ locations: [{ name: 'locations/1' }] }), {
+          status: 200,
+        }),
+      );
+
+    await expect(service.syncLocations('org-1')).rejects.toBeInstanceOf(
+      ConflictException,
+    );
+    expect(prisma.googleBusinessProfileLocation.upsert).not.toHaveBeenCalled();
+    expect(
+      prisma.googleBusinessProfileLocation.deleteMany,
+    ).not.toHaveBeenCalled();
+  });
+
+  it('deletes the local connection only after Google confirms revocation', async () => {
+    const encrypted = (
+      service as unknown as { encrypt(value: string): string }
+    ).encrypt('refresh-secret');
+    prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+      id: 'conn-1',
+      encryptedRefreshToken: encrypted,
+    });
+    prisma.googleBusinessProfileConnection.delete.mockResolvedValue({});
+    const fetchSpy = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce(new Response('', { status: 200 }));
+
+    await expect(service.disconnect('org-1')).resolves.toEqual({
+      disconnected: true,
+      revokedByGoogle: true,
+    });
+    expect(prisma.googleBusinessProfileConnection.delete).toHaveBeenCalled();
+    expect(fetchSpy.mock.calls[0][0]).toBe(
+      'https://oauth2.googleapis.com/revoke',
+    );
+  });
+
+  it.each([400, 500])(
+    'keeps the encrypted token when Google refuses revocation with %i so a retry remains possible',
+    async (status) => {
+      const encrypted = (
+        service as unknown as { encrypt(value: string): string }
+      ).encrypt('refresh-secret');
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        encryptedRefreshToken: encrypted,
+      });
+      const warn = jest.spyOn(
+        (
+          service as unknown as {
+            logger: { warn: (...args: unknown[]) => void };
+          }
+        ).logger,
+        'warn',
+      );
+      jest
+        .spyOn(global, 'fetch')
+        .mockResolvedValueOnce(new Response('', { status }));
+
+      await expect(service.disconnect('org-1')).rejects.toBeInstanceOf(
+        ServiceUnavailableException,
+      );
+      expect(
+        prisma.googleBusinessProfileConnection.delete,
+      ).not.toHaveBeenCalled();
+      expect(JSON.stringify(warn.mock.calls)).not.toContain('refresh-secret');
+    },
+  );
+
+  it('keeps the encrypted token when revocation times out so the user can retry', async () => {
+    const encrypted = (
+      service as unknown as { encrypt(value: string): string }
+    ).encrypt('refresh-secret');
+    prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+      id: 'conn-1',
+      encryptedRefreshToken: encrypted,
+    });
+    jest.spyOn(global, 'fetch').mockRejectedValueOnce(new Error('timeout'));
+
+    await expect(service.disconnect('org-1')).rejects.toBeInstanceOf(
+      ServiceUnavailableException,
+    );
+    expect(
+      prisma.googleBusinessProfileConnection.delete,
+    ).not.toHaveBeenCalled();
   });
 
   it('never links a Google location to a ROBIA location from another organization', async () => {
