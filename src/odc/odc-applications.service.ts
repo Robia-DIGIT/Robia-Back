@@ -2,11 +2,13 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { storageKeyBelongsTo } from './storage/odc-storage-key';
 import { CreateOdcApplicantDto } from './dto/create-odc-applicant.dto';
 import { CreateOdcApplicationDto } from './dto/create-odc-application.dto';
 import { UpdateOdcApplicationDto } from './dto/update-odc-application.dto';
@@ -84,6 +86,8 @@ export type OdcApplicationWithRelations = Prisma.OdcApplicationGetPayload<{
  */
 @Injectable()
 export class OdcApplicationsService {
+  private readonly logger = new Logger(OdcApplicationsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly events: EventEmitter2,
@@ -310,12 +314,12 @@ export class OdcApplicationsService {
       input.documentTypeId,
     );
 
-    const replaced = await this.prisma.$transaction(async (tx) => {
-      const existing = await tx.odcDocument.findFirst({
+    const replacedDocument = await this.prisma.$transaction(async (tx) => {
+      const occupant = await tx.odcDocument.findFirst({
         where: { applicationId: id, documentTypeId: docType.id },
       });
-      if (existing) {
-        await tx.odcDocument.delete({ where: { id: existing.id } });
+      if (occupant) {
+        await tx.odcDocument.delete({ where: { id: occupant.id } });
       }
       await tx.odcDocument.create({
         data: {
@@ -330,8 +334,37 @@ export class OdcApplicationsService {
           status: 'received',
         },
       });
-      return existing?.storageKey ?? null;
+      return occupant;
     });
+
+    // RC-33 hardening (Codex review) — the row just replaced may predate
+    // this RC's own hardening: its storageKey was never guaranteed to
+    // canonically belong to *that* row's own organization/application/id
+    // (a client could once supply an arbitrary one — see
+    // CreateOdcDocumentDto's own history). Deleting it unconditionally
+    // would let a stale, tampered row make this replacement delete a
+    // completely different organization's real file. The key is only
+    // ever handed back for deletion when it demonstrably belongs to the
+    // document it is actually being deleted for; a non-canonical key is
+    // never touched — left on disk, and logged so an operator can find
+    // and clean it up by hand.
+    let replacedStorageKey: string | null = null;
+    if (replacedDocument?.storageKey) {
+      if (
+        storageKeyBelongsTo(
+          replacedDocument.storageKey,
+          replacedDocument.organizationId,
+          replacedDocument.applicationId,
+          replacedDocument.id,
+        )
+      ) {
+        replacedStorageKey = replacedDocument.storageKey;
+      } else {
+        this.logger.warn(
+          `ODC : document remplacé (id=${replacedDocument.id}) dont le storageKey n'appartient pas canoniquement à cette ligne — fichier NON supprimé, à nettoyer manuellement.`,
+        );
+      }
+    }
 
     const payload: OdcDocumentReceivedEvent = {
       organizationId,
@@ -343,7 +376,7 @@ export class OdcApplicationsService {
 
     return {
       application: await this.getApplication(organizationId, id),
-      replacedStorageKey: replaced,
+      replacedStorageKey,
     };
   }
 

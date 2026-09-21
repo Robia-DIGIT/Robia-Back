@@ -296,7 +296,7 @@ describe('OdcApplicationsService', () => {
         originalName: 'cv-v1.pdf',
         mimeType: 'application/pdf',
         sizeBytes: 100,
-        storageKey: `${orgA}/${application.id}/doc-v1/uuid.pdf`,
+        storageKey: `${orgA}/${application.id}/doc-v1/11111111-1111-1111-1111-111111111111.pdf`,
       },
     );
     expect(first.documents).toHaveLength(1);
@@ -309,7 +309,7 @@ describe('OdcApplicationsService', () => {
         originalName: 'cv-v2.pdf',
         mimeType: 'application/pdf',
         sizeBytes: 200,
-        storageKey: `${orgA}/${application.id}/doc-v2/uuid.pdf`,
+        storageKey: `${orgA}/${application.id}/doc-v2/22222222-2222-2222-2222-222222222222.pdf`,
       });
 
     // Exactly one document for this slot — never two, never zero — and it
@@ -317,9 +317,60 @@ describe('OdcApplicationsService', () => {
     expect(second.documents).toHaveLength(1);
     expect(second.documents[0].id).toBe('doc-v2');
     expect(second.documents[0].originalName).toBe('cv-v2.pdf');
+    // The replaced document's own storageKey was canonical for its own
+    // identity (org-a/<application>/doc-v1/...), so it is handed back for
+    // deletion.
     expect(replacedStorageKey).toBe(
-      `${orgA}/${application.id}/doc-v1/uuid.pdf`,
+      `${orgA}/${application.id}/doc-v1/11111111-1111-1111-1111-111111111111.pdf`,
     );
+  });
+
+  // Codex review — the exact scenario flagged: a historical row (created
+  // before this RC's canonical-key enforcement existed) whose storageKey
+  // was never validated against its own identity and happens to point at
+  // a real file belonging to a *different* organization. Replacing it must
+  // never hand that key back for deletion.
+  it('addUploadedDocument() never returns a replaced storageKey that does not canonically belong to the document it came from', async () => {
+    const program = createProgram(orgA);
+    const application = await createDraftApplication(orgA, program.id);
+    const docTypeId = program.docTypes[0].id as string;
+    const orgBRealFileKey =
+      'org-b/some-other-app/some-other-doc/33333333-3333-3333-3333-333333333333.pdf';
+
+    // Simulate a pre-hardening row directly at the fake-DB layer — no
+    // current code path can create one like this any more (storageKey can
+    // no longer be client-supplied), which is exactly why this can only
+    // ever be a historical artifact.
+    prisma.odcDocument.create({
+      data: {
+        id: 'doc-historical',
+        organizationId: orgA,
+        applicationId: application.id,
+        documentTypeId: docTypeId,
+        originalName: 'old-cv.pdf',
+        mimeType: 'application/pdf',
+        sizeBytes: 1,
+        storageKey: orgBRealFileKey,
+        status: 'received',
+      },
+    });
+
+    const { application: replaced, replacedStorageKey } =
+      await service.addUploadedDocument(orgA, application.id, {
+        id: 'doc-new',
+        documentTypeId: docTypeId,
+        originalName: 'new-cv.pdf',
+        mimeType: 'application/pdf',
+        sizeBytes: 200,
+        storageKey: `${orgA}/${application.id}/doc-new/44444444-4444-4444-4444-444444444444.pdf`,
+      });
+
+    // The new document is saved normally — the slot itself is still
+    // atomically replaced (the historical row's own record is gone).
+    expect(replaced.documents).toHaveLength(1);
+    expect(replaced.documents[0].id).toBe('doc-new');
+    // But org B's real file's key is never handed back for deletion.
+    expect(replacedStorageKey).toBeNull();
   });
 
   it('addUploadedDocument() replacing a slot never disturbs a different document type', async () => {

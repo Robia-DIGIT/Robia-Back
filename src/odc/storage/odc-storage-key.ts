@@ -44,22 +44,73 @@ export function buildOdcStorageKey(
   return `${organizationId}/${applicationId}/${documentId}/${randomUUID()}${extensionForMimeType(mimeType)}`;
 }
 
-// RC-33 hardening — the download path's own independent guard: even though
-// a storageKey can no longer be client-supplied (see CreateOdcDocumentDto),
-// a pre-hardening row may still carry one that was — this never trusts a
-// storageKey to actually belong to the document/application/organization
-// triplet its own DB row claims, it re-derives the expected prefix from
-// that row (never from the key itself) and requires an exact match. A key
-// that fails this can never be read, whatever OdcStorage.get() would
-// otherwise return for it.
+// Exactly the filename shape buildOdcStorageKey() ever generates: a random
+// UUID (case-insensitive — randomUUID() is lowercase, but this is never
+// used to *generate* a key, only to validate one that may predate this
+// check), optionally followed by extensionForMimeType()'s own output — at
+// most 10 lowercase-alphanumeric characters after the dot, or no extension
+// at all for a mimeType whose subtype it couldn't derive one from. Anchored
+// on both ends: nothing else may follow, in particular no further `/`.
+const CANONICAL_STORAGE_KEY_FILENAME =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(\.[a-z0-9]{1,10})?$/i;
+
+// RC-33 hardening (Codex review) — the download path's own independent
+// guard: even though a storageKey can no longer be client-supplied (see
+// CreateOdcDocumentDto), a pre-hardening row may still carry one that was —
+// this never trusts a storageKey to actually belong to the
+// document/application/organization triplet its own DB row claims.
+//
+// A plain `startsWith(prefix)` is not that guard: a key like
+// `orgA/appA/docA/../../../orgB/appB/docB/secret.pdf` genuinely starts
+// with the expected prefix as a *string*, but `path.resolve()` (used by
+// LocalOdcStorage.resolveWithinRoot()) normalizes the embedded `..`
+// segments and walks straight back out to a completely different
+// organization/application/document, while never leaving the overall
+// storage root — so LocalOdcStorage's own independent root-boundary check
+// never catches it either. This performs structural, segment-by-segment
+// validation instead of a string prefix test:
+//   1. reject backslashes and NUL outright — never even segment a key that
+//      contains either;
+//   2. split strictly on `/` and reject any segment that is empty (a
+//      leading/trailing/doubled slash), `.`, or `..` — the only two
+//      segment values `path.resolve()` ever treats specially;
+//   3. require *exactly* four segments — organizationId, applicationId,
+//      documentId, filename — so there is structurally no room for an
+//      extra path component after the filename, traversal or otherwise;
+//   4. require the first three to equal this row's own identity exactly
+//      (never a prefix match on a longer string);
+//   5. require the filename segment to match the exact UUID(+extension)
+//      shape buildOdcStorageKey() itself generates — nothing else is ever
+//      a storage key this codebase could have written.
+// A key that fails any of these can never be read, whatever
+// OdcStorage.get() would otherwise return for it.
 export function storageKeyBelongsTo(
   storageKey: string,
   organizationId: string,
   applicationId: string,
   documentId: string,
 ): boolean {
-  return storageKey.startsWith(
-    `${organizationId}/${applicationId}/${documentId}/`,
+  if (storageKey.includes('\\') || storageKey.includes('\0')) {
+    return false;
+  }
+  const segments = storageKey.split('/');
+  if (
+    segments.some(
+      (segment) => segment === '' || segment === '.' || segment === '..',
+    )
+  ) {
+    return false;
+  }
+  if (segments.length !== 4) {
+    return false;
+  }
+  const [organizationSegment, applicationSegment, documentSegment, filename] =
+    segments;
+  return (
+    organizationSegment === organizationId &&
+    applicationSegment === applicationId &&
+    documentSegment === documentId &&
+    CANONICAL_STORAGE_KEY_FILENAME.test(filename)
   );
 }
 

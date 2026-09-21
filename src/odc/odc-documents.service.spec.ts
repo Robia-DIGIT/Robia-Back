@@ -348,7 +348,7 @@ describe('OdcDocumentsService', () => {
   // otherwise tampered row directly at the fake-DB layer, the only way such
   // a row could still exist, and proves getFile() refuses it rather than
   // trusting the DB's own storageKey column blindly.
-  it('getFile() 404s a received document whose storageKey does not canonically belong to it', async () => {
+  it('getFile() 404s a received document whose storageKey does not canonically belong to it, and never even reads storage', async () => {
     const program = createProgram(orgA);
     const application = await createDraftApplication(orgA, program.id);
     const docTypeId = program.docTypes[0].id as string;
@@ -368,10 +368,50 @@ describe('OdcDocumentsService', () => {
       storageKey: `${orgB}/other-app/other-doc/secret.pdf`,
       createdAt: new Date(),
     });
+    const getSpy = jest.spyOn(storage, 'get');
 
     await expect(
       service.getFile(orgA, 'doc-mismatched'),
     ).rejects.toBeInstanceOf(NotFoundException);
+    expect(getSpy).not.toHaveBeenCalled();
+  });
+
+  // Codex review — a plain `startsWith(prefix)` accepted this because the
+  // string literally starts with the expected prefix; path.resolve()
+  // (LocalOdcStorage.resolveWithinRoot()) would then normalize the
+  // embedded `..` segments and walk straight out to a different
+  // organization/application/document, never leaving the overall storage
+  // root — so the root-boundary check alone never caught it either. The
+  // canonical, segment-by-segment check in storageKeyBelongsTo() (see its
+  // own spec for the exhaustive unit coverage) must refuse this before
+  // storage is ever touched.
+  it('getFile() 404s a traversal storageKey that only superficially starts with the expected prefix, and never reads storage', async () => {
+    const program = createProgram(orgA);
+    const application = await createDraftApplication(orgA, program.id);
+    const docTypeId = program.docTypes[0].id as string;
+    const traversalKey = `${orgA}/${application.id}/doc-traversal/../../../${orgB}/other-app/other-doc/secret.pdf`;
+    await storage.put(
+      `${orgB}/other-app/other-doc/secret.pdf`,
+      Buffer.from('very secret'),
+    );
+    prisma.documents.set('doc-traversal', {
+      id: 'doc-traversal',
+      organizationId: orgA,
+      applicationId: application.id,
+      documentTypeId: docTypeId,
+      originalName: 'cv.pdf',
+      mimeType: 'application/pdf',
+      sizeBytes: 1,
+      status: 'received',
+      storageKey: traversalKey,
+      createdAt: new Date(),
+    });
+    const getSpy = jest.spyOn(storage, 'get');
+
+    await expect(service.getFile(orgA, 'doc-traversal')).rejects.toBeInstanceOf(
+      NotFoundException,
+    );
+    expect(getSpy).not.toHaveBeenCalled();
   });
 
   it('getFile() 404s for a document still pending_upload', async () => {
