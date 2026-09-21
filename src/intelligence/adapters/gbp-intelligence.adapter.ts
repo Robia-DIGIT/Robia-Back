@@ -35,7 +35,9 @@ export class GbpIntelligenceAdapter implements IntelligenceProviderAdapter {
           ? 'not_connected'
           : signal.status === 'not_configured'
             ? 'not_synced'
-            : null,
+            : signal.status === 'partial'
+              ? 'temporarily_unavailable'
+              : null,
     };
   }
 

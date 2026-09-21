@@ -4,6 +4,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { LocationPlacesService } from './location-places/location-places.service';
 import { CreateLocationDto } from './dto/create-location.dto';
 import { LocationWeatherService } from './location-weather/location-weather.service';
+import type { LegacyLocationDto } from './dto/import-legacy-locations.dto';
 
 @Injectable()
 export class LocationsService {
@@ -56,6 +57,56 @@ export class LocationsService {
 
   async findAll(organizationId: string) {
     return this.prisma.location.findMany({ where: { organizationId } });
+  }
+
+  async importLegacy(organizationId: string, items: LegacyLocationDto[]) {
+    return this.prisma.$transaction(async (tx) => {
+      for (const item of items) {
+        const legacyImportKey = item.legacyId.trim();
+        const exact = {
+          organizationId,
+          name: item.name.trim(),
+          address: item.address?.trim() || null,
+          city: item.city?.trim() || null,
+          country: item.country?.trim() || null,
+          phone: item.phone?.trim() || null,
+        };
+        const existing = await tx.location.findFirst({
+          where: {
+            organizationId,
+            OR: [{ legacyImportKey }, exact],
+          },
+          select: { id: true, legacyImportKey: true },
+        });
+        if (existing) {
+          if (!existing.legacyImportKey) {
+            await tx.location.update({
+              where: { id: existing.id },
+              data: { legacyImportKey },
+            });
+          }
+          continue;
+        }
+        await tx.location.upsert({
+          where: {
+            organizationId_legacyImportKey: {
+              organizationId,
+              legacyImportKey,
+            },
+          },
+          create: {
+            ...exact,
+            legacyImportKey,
+            isPrimary: item.isPrimary ?? false,
+          },
+          update: {},
+        });
+      }
+      return tx.location.findMany({
+        where: { organizationId },
+        orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+      });
+    });
   }
 
   async findOne(organizationId: string, id: string) {
