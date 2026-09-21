@@ -77,6 +77,8 @@ model Organization {
   actionExecutionEvents ActionExecutionEvent[]
   locations Location[]
   googleSearchConsoleConnection GoogleSearchConsoleConnection?
+  googleBusinessProfileConnection GoogleBusinessProfileConnection?
+  googleBusinessProfileLocations GoogleBusinessProfileLocation[]
   metaConnection MetaConnection?
   stripeSubscription StripeSubscription?
   automations       Automation[]
@@ -146,6 +148,53 @@ model GoogleSearchConsoleDailyMetric {
   @@unique([connectionId, date])
   @@index([connectionId, date])
   @@map("google_search_console_daily_metrics")
+}
+
+model GoogleBusinessProfileConnection {
+  id                    String   @id @default(cuid())
+  organizationId        String   @unique @map("organization_id")
+  organization          Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  googleAccountEmail    String?  @map("google_account_email")
+  encryptedRefreshToken String   @map("encrypted_refresh_token")
+  grantedScopes         String?  @map("granted_scopes")
+  connectedAt           DateTime @default(now()) @map("connected_at")
+  lastSyncedAt          DateTime? @map("last_synced_at")
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+  locations             GoogleBusinessProfileLocation[]
+
+  @@map("google_business_profile_connections")
+}
+
+// Read-only mirror of locations returned by the Business Profile APIs.
+// Google remains the source of truth; ROBIA only stores the fields required
+// to display and map an establishment to its internal Location record.
+model GoogleBusinessProfileLocation {
+  id                 String   @id @default(cuid())
+  organizationId     String   @map("organization_id")
+  organization       Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  connectionId       String   @map("connection_id")
+  connection         GoogleBusinessProfileConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  googleAccountName  String   @map("google_account_name")
+  accountDisplayName String?  @map("account_display_name")
+  googleLocationName String   @map("google_location_name")
+  title              String
+  storeCode          String?  @map("store_code")
+  address            Json?
+  primaryPhone       String?  @map("primary_phone")
+  websiteUri         String?  @map("website_uri")
+  primaryCategory    String?  @map("primary_category")
+  metadata           Json?
+  robiaLocationId    String?  @map("robia_location_id")
+  robiaLocation      Location? @relation(fields: [robiaLocationId], references: [id], onDelete: SetNull)
+  lastSyncedAt       DateTime @map("last_synced_at")
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  @@unique([connectionId, googleLocationName])
+  @@index([organizationId, lastSyncedAt])
+  @@index([robiaLocationId])
+  @@map("google_business_profile_locations")
 }
 
 model MetaConnection {
@@ -398,6 +447,7 @@ model Location {
   address        String?
   city           String?
   country        String?
+  phone          String?
   latitude       Float?
   longitude      Float?
 
@@ -413,6 +463,7 @@ model Location {
 
   audits         Audit[]
   opportunities  Opportunity[]
+  googleBusinessProfileLocations GoogleBusinessProfileLocation[]
 
   @@map("locations")
 }

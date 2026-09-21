@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Post,
@@ -42,6 +43,11 @@ export class LocationsController {
   @Get(':id')
   findOne(@Req() req: ScopedRequest, @Param('id') id: string) {
     return this.locationsService.findOne(req.organizationId, id);
+  }
+
+  @Delete(':id')
+  remove(@Req() req: ScopedRequest, @Param('id') id: string) {
+    return this.locationsService.remove(req.organizationId, id);
   }
 
   @Get(':id/weather')

@@ -4,21 +4,12 @@ import {
   IntelligenceProviderAdapter,
   IntelligenceSignal,
 } from '../intelligence.types';
+import { GoogleBusinessProfileService } from '../../integrations/google-business-profile.service';
 
 /**
- * RC-21 — Google Business Profile: contract-only placeholder.
- *
- * There is no GBP integration in RC-21 — no OAuth, no Prisma model, no
- * Graph/API client. This adapter exists so `IntelligenceProvider`'s `gbp`
- * member has a real, registered implementation behind `GET
- * /intelligence/status` (an explicit `not_connected` row) instead of a
- * silent gap, and so a future RC that adds the real integration only has
- * to replace this file, never invent the wiring.
- *
- * Deliberately zero I/O: no Prisma read, no network call, nothing —
- * `collectSignal`/`collectFindings` are pure functions of their
- * arguments. This is what "GBP absent => aucun appel réseau" means taken
- * literally, not just "no external HTTP call."
+ * Google Business Profile read-only adapter. The integration service owns
+ * OAuth and synchronization; the Intelligence Core only consumes its latest
+ * real connection/sync state and never fabricates metrics or affects SEO.
  */
 @Injectable()
 export class GbpIntelligenceAdapter implements IntelligenceProviderAdapter {
@@ -26,17 +17,25 @@ export class GbpIntelligenceAdapter implements IntelligenceProviderAdapter {
   readonly readOnly = true;
   readonly scoreInfluence = false;
 
-  // eslint-disable-next-line @typescript-eslint/require-await -- interface requires a Promise; this adapter has nothing to await by design.
+  constructor(private readonly businessProfile: GoogleBusinessProfileService) {}
+
   async collectSignal(organizationId: string): Promise<IntelligenceSignal> {
+    const signal =
+      await this.businessProfile.getIntelligenceSignal(organizationId);
     return {
       provider: this.provider,
-      status: 'not_connected',
+      status: signal.status,
       organizationId,
-      observedAt: null,
+      observedAt: signal.observedAt,
       readOnly: this.readOnly,
       scoreInfluence: this.scoreInfluence,
-      data: null,
-      unavailableReason: 'not_connected',
+      data: signal.data,
+      unavailableReason:
+        signal.status === 'not_connected'
+          ? 'not_connected'
+          : signal.status === 'not_configured'
+            ? 'not_synced'
+            : null,
     };
   }
 
