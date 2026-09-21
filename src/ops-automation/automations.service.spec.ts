@@ -1820,6 +1820,168 @@ describe('AutomationsService', () => {
       expect(run.steps[0].status).toBe('failed');
       expect(run.errorMessage).toMatch(/budget/i);
     });
+
+    // Codex review — retryStep()'s dueScheduledRetryWhere() claim path
+    // previously trusted "reached retry_scheduled" as proof of safety,
+    // never re-checking isRetrySafe() the way the abandoned-claim path
+    // already did. That trust is false for a row that reached
+    // retry_scheduled before RC27's own runStepsFrom() started gating on
+    // isRetrySafe() at creation time — simulated here without needing a
+    // literal pre-migration fixture: retrySafe is true when the row is
+    // created (so it legitimately reaches retry_scheduled via the normal
+    // path), then flips to false before the dispatcher claims it, exactly
+    // as it would for a genuinely historical row whose action's safety
+    // classification the registry never had a chance to apply at
+    // creation time.
+    it('a due retry_scheduled row is never executed once isRetrySafe is false, even though it never went through the abandoned-claim path', async () => {
+      actionsRegistry.isRetrySafe.mockReturnValue(true);
+      actionsRegistry.execute.mockRejectedValueOnce(new Error('blip'));
+      const automation = await service.create(orgA, userA, createDto());
+      const started = await service.triggerManual(orgA, userA, automation.id);
+      expect(started.steps[0].status).toBe('retry_scheduled');
+      const stepRunId = started.steps[0].id;
+      const dueAt = new Date(
+        (started.steps[0].nextAttemptAt as Date).getTime() + 1,
+      );
+
+      // The action's own safety classification is not retry-safe by the
+      // time the dispatcher gets to it — the exact shape a legacy,
+      // pre-RC27 retry_scheduled row is in from the moment RC27 ships.
+      actionsRegistry.isRetrySafe.mockReturnValue(false);
+      actionsRegistry.execute.mockClear();
+
+      await service.retryStep(stepRunId, dueAt);
+
+      // Never re-executed: claiming a due-but-unsafe retry must never call
+      // the action.
+      expect(actionsRegistry.execute).not.toHaveBeenCalled();
+      const run = await service.getRun(orgA, started.id);
+      expect(run.status).toBe('failed');
+      expect(run.steps[0].status).toBe('failed');
+      // The claim itself still consumed one attempt slot (the atomic
+      // updateMany that wins dueScheduledRetryWhere() always increments
+      // attemptCount as part of establishing the claim, before this
+      // safety check ever runs) — 1 at creation, +1 for this claim.
+      expect(run.steps[0].attemptCount).toBe(2);
+      expect(run.errorMessage).toMatch(/pas rejouable automatiquement/i);
+      expect(run.errorMessage).toMatch(/intervention humaine/i);
+    });
+
+    // Codex review — a first attempt created before RC27 shipped never had
+    // claimedAt/claimToken at all (those columns are new), so a worker
+    // killed mid-attempt (e.g. a deploy) can leave it stuck at
+    // status='running' forever: abandonedRunningClaimWhere()'s own
+    // `claimedAt: { lt: staleThreshold }` can never match a null
+    // claimedAt, so neither the dispatcher's scan nor the normal claim
+    // ever saw such a row before this reconciliation existed.
+    it('a legacy running step with no claim at all is force-failed once past the bail threshold, never re-executed', async () => {
+      actionsRegistry.execute.mockResolvedValue({ ok: true });
+      const automation = await service.create(orgA, userA, createDto());
+      const started = await service.triggerManual(orgA, userA, automation.id);
+      const stepRunId = started.steps[0].id;
+      const startedAt = new Date('2026-01-01T00:00:00.000Z');
+      // Simulates a pre-RC27 row: running, with a real startedAt (that
+      // column already existed) but neither claim column ever set.
+      prisma.automationStepRun.update({
+        where: { id: stepRunId },
+        data: {
+          status: 'running',
+          startedAt,
+          claimedAt: null,
+          claimToken: null,
+          attemptCount: 1,
+          nextAttemptAt: null,
+          finishedAt: null,
+        },
+      });
+      actionsRegistry.execute.mockClear();
+
+      const staleNow = new Date(
+        startedAt.getTime() + STEP_RETRY_CLAIM_LEASE_MS + 1,
+      );
+      await service.retryStep(stepRunId, staleNow);
+
+      expect(actionsRegistry.execute).not.toHaveBeenCalled();
+      const run = await service.getRun(orgA, started.id);
+      expect(run.status).toBe('failed');
+      expect(run.steps[0].status).toBe('failed');
+      expect(run.steps[0].attemptCount).toBe(1);
+      expect(run.errorMessage).toMatch(/intervention humaine/i);
+    });
+
+    it('a recent legacy-shaped running step (still within the bail) is left untouched', async () => {
+      actionsRegistry.execute.mockResolvedValue({ ok: true });
+      const automation = await service.create(orgA, userA, createDto());
+      const started = await service.triggerManual(orgA, userA, automation.id);
+      const stepRunId = started.steps[0].id;
+      const startedAt = new Date('2026-01-01T00:00:00.000Z');
+      prisma.automationStepRun.update({
+        where: { id: stepRunId },
+        data: {
+          status: 'running',
+          startedAt,
+          claimedAt: null,
+          claimToken: null,
+          attemptCount: 1,
+          nextAttemptAt: null,
+          finishedAt: null,
+        },
+      });
+      actionsRegistry.execute.mockClear();
+
+      // Still inside the lease from `startedAt` — must never be touched.
+      const stillFresh = new Date(
+        startedAt.getTime() + STEP_RETRY_CLAIM_LEASE_MS - 1000,
+      );
+      await service.retryStep(stepRunId, stillFresh);
+
+      // Neither claim nor the legacy reconciliation matched anything —
+      // retryStep() is a pure no-op here. The run's own stored status
+      // (already 'succeeded' from the initial real attempt, before this
+      // test overwrote the step row directly) is irrelevant; what matters
+      // is that the step row itself — the one thing retryStep() could
+      // have touched — was left exactly as forced.
+      expect(actionsRegistry.execute).not.toHaveBeenCalled();
+      const run = await service.getRun(orgA, started.id);
+      expect(run.steps[0].status).toBe('running');
+      expect(run.steps[0].claimedAt).toBeNull();
+      expect(run.steps[0].claimToken).toBeNull();
+    });
+
+    it('a running step that already holds a claim is handled only by the normal claim mechanism, never the legacy reconciliation', async () => {
+      actionsRegistry.isRetrySafe.mockReturnValue(true);
+      actionsRegistry.execute.mockResolvedValueOnce({ ok: true });
+      const automation = await service.create(orgA, userA, createDto());
+      const started = await service.triggerManual(orgA, userA, automation.id);
+      const stepRunId = started.steps[0].id;
+      const claimedAt = new Date('2026-01-01T00:00:00.000Z');
+      // Has a real claim (unlike the legacy shape above) — the legacy
+      // reconciliation's own `claimedAt: null` condition must exclude it,
+      // leaving it exclusively to abandonedRunningClaimWhere().
+      prisma.automationStepRun.update({
+        where: { id: stepRunId },
+        data: {
+          status: 'running',
+          startedAt: claimedAt,
+          claimedAt,
+          claimToken: 'stale-token-from-crashed-worker',
+          attemptCount: 1,
+          nextAttemptAt: null,
+          finishedAt: null,
+        },
+      });
+
+      const staleNow = new Date(
+        claimedAt.getTime() + STEP_RETRY_CLAIM_LEASE_MS + 1,
+      );
+      await service.retryStep(stepRunId, staleNow);
+
+      // Recovered and re-executed via the normal abandoned-claim path —
+      // never force-failed as if it were an unclaimed legacy row.
+      const run = await service.getRun(orgA, started.id);
+      expect(run.status).toBe('succeeded');
+      expect(run.steps[0].status).toBe('succeeded');
+    });
   });
 
   // ---------------------------------------------------------------------

@@ -33,6 +33,7 @@ import {
   abandonedRunningClaimWhere,
   dueScheduledRetryWhere,
   isPermanentStepError,
+  legacyUnclaimedRunningWhere,
 } from './step-retry-policy';
 import {
   AutomationLoopError,
@@ -947,18 +948,23 @@ export class AutomationsService {
   // dueScheduledRetryWhere()/abandonedRunningClaimWhere() for why the
   // distinction matters:
   //
-  // 1. dueScheduledRetryWhere: a normal, due 'retry_scheduled' row. Reaching
-  //    that status already required passing isRetrySafe() once (see
-  //    runStepsFrom()/below), so a claim won here is always safe to
-  //    re-attempt.
+  // 1. dueScheduledRetryWhere: a normal, due 'retry_scheduled' row. A row
+  //    created by *this* RC27's own runStepsFrom()/retryStep() already
+  //    passed isRetrySafe() once before ever reaching that status — but a
+  //    row created *before* RC27 shipped could not have: the pre-hardening
+  //    code scheduled a retry on any transient failure, with no retrySafe
+  //    concept at all. isRetrySafe() is therefore re-checked below
+  //    regardless of which claim won, defense-in-depth against exactly
+  //    that legacy data (Codex review) rather than trusting the status
+  //    alone to prove safety.
   // 2. abandonedRunningClaimWhere (tried only if #1 claimed nothing): a
   //    'running' row whose claim lease has gone stale — the previous
   //    claimant (first attempt or a retry) crashed with an unknown outcome.
-  //    isRetrySafe() is checked *here*, after winning the claim (only then
-  //    is the actionType known): a retry-safe action is re-attempted like
-  //    any other retry; anything else fails the run outright with a
-  //    redacted "indeterminate result, human intervention needed" error,
-  //    never guessing by re-executing a non-idempotent action blind.
+  //
+  // Either way, a non-retry-safe action is never re-executed: it fails the
+  // run outright with a redacted "not automatically replayable, human
+  // intervention needed" error, never guessing by re-executing a
+  // non-idempotent action blind.
   //
   // Every write back to the claimed row (success, failure, or scheduling
   // another retry) goes through commitStepAttempt(), gated on the
@@ -1007,11 +1013,24 @@ export class AutomationsService {
     }
 
     if (claim.count === 0) {
-      // Neither claim matched. If this is specifically a 'running' row
-      // whose attempts are already exhausted, nothing above will *ever*
-      // move it out of 'running' (both claims gate on attemptCount under
-      // budget) — force-fail it here so an abandoned, budget-exhausted step
-      // can't stay 'running' forever.
+      // Neither claim matched. Two distinct shapes neither claim above can
+      // ever reach, each needing its own direct fail — never a retry,
+      // since both mean "this step's true result is permanently unknown":
+      //
+      // 1. A legacy pre-RC27 first attempt: 'running', claimedAt=null,
+      //    claimToken=null, startedAt past the lease. Checked first since
+      //    it's the narrower, more specific shape.
+      // 2. An abandoned 'running' row whose attempts are already
+      //    exhausted — both claims above gate on attemptCount under
+      //    budget, so nothing else will ever move it out of 'running'.
+      const reconciledLegacy = await this.reconcileLegacyUnclaimedRunningStep(
+        stepRunId,
+        staleThreshold,
+        now,
+      );
+      if (reconciledLegacy) {
+        return;
+      }
       await this.failExhaustedAbandonedStep(stepRunId, staleThreshold, now);
       return;
     }
@@ -1041,9 +1060,16 @@ export class AutomationsService {
     }
     const retrySafe = this.actionsRegistry.isRetrySafe(step.actionType);
 
-    if (recoveringAbandonedClaim && !retrySafe) {
+    // Never gated on `recoveringAbandonedClaim` alone (see this method's
+    // own doc comment) — a due 'retry_scheduled' row can predate RC27's
+    // own isRetrySafe() gate just as much as an abandoned 'running' row
+    // can, so both claim origins are checked here, identically, before
+    // attemptStep() is ever called.
+    if (!retrySafe) {
       const message = redactSensitive(
-        "Résultat indéterminé après une interruption (bail de reprise dépassé) — cette action n'est pas rejouable automatiquement : intervention humaine nécessaire.",
+        recoveringAbandonedClaim
+          ? "Résultat indéterminé après une interruption (bail de reprise dépassé) — cette action n'est pas rejouable automatiquement : intervention humaine nécessaire."
+          : "Cette action n'est pas rejouable automatiquement — reprise programmée annulée, intervention humaine nécessaire.",
       ) as string;
       const owned = await this.commitStepAttempt(fresh.id, claimToken, {
         status: 'failed',
@@ -1094,6 +1120,51 @@ export class AutomationsService {
         now.getTime() + STEP_RETRY_BACKOFF_MS[fresh.attemptCount - 1],
       ),
     });
+  }
+
+  // Codex review — a first attempt created before RC27 shipped never had
+  // claimedAt/claimToken at all, so a worker killed mid-attempt (a deploy
+  // interrupting it) can leave it at status='running' with both claim
+  // columns null, forever invisible to the normal claim mechanism (see
+  // legacyUnclaimedRunningWhere()'s own doc comment for why). Reached only
+  // when neither of retryStep()'s two normal claims matched anything —
+  // this query is what actually finds this exact shape and force-fails it
+  // atomically. Its true outcome is unknowable (no claim metadata survives
+  // to even tell "first attempt" from "interrupted retry"), so it is never
+  // re-executed, exactly like an abandoned claim with an unsafe action.
+  // Silently a no-op (via the count check) whenever the row isn't in this
+  // exact state — including the common case where it simply isn't
+  // legacy/unclaimed at all, or a claim mechanism already deals with it,
+  // or it's too recent to be considered stale yet.
+  private async reconcileLegacyUnclaimedRunningStep(
+    stepRunId: string,
+    staleThreshold: Date,
+    now: Date,
+  ): Promise<boolean> {
+    const message = redactSensitive(
+      "Résultat indéterminé — cette tentative a été créée avant le suivi de claim et n'a jamais enregistré d'issue (déploiement ayant probablement interrompu le worker) : intervention humaine nécessaire.",
+    ) as string;
+    const failed = await this.prisma.automationStepRun.updateMany({
+      where: {
+        id: stepRunId,
+        ...legacyUnclaimedRunningWhere(staleThreshold),
+      },
+      data: {
+        status: 'failed',
+        error: message,
+        finishedAt: now,
+      },
+    });
+    if (failed.count !== 1) {
+      return false;
+    }
+    const stepRun = await this.prisma.automationStepRun.findFirst({
+      where: { id: stepRunId },
+    });
+    if (stepRun) {
+      await this.finishRun(stepRun.runId, 'failed', message);
+    }
+    return true;
   }
 
   // Only reached when neither claim in retryStep() matched anything — the

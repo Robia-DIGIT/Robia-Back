@@ -13,6 +13,7 @@ import {
   dueScheduledRetryWhere,
   dueStepRetryWhere,
   isPermanentStepError,
+  legacyUnclaimedRunningWhere,
 } from './step-retry-policy';
 
 describe('isPermanentStepError', () => {
@@ -67,6 +68,8 @@ describe('dueStepRetryWhere (scan predicate)', () => {
     status: string;
     nextAttemptAt: Date | null;
     claimedAt: Date | null;
+    claimToken?: string | null;
+    startedAt?: Date | null;
   }): boolean {
     const where = dueStepRetryWhere(now, stale);
     return where.OR.some((branch) => {
@@ -75,6 +78,15 @@ describe('dueStepRetryWhere (scan predicate)', () => {
           record.status === 'retry_scheduled' &&
           !!record.nextAttemptAt &&
           record.nextAttemptAt <= now
+        );
+      }
+      if ('startedAt' in branch) {
+        return (
+          record.status === 'running' &&
+          record.claimedAt === null &&
+          (record.claimToken ?? null) === null &&
+          !!record.startedAt &&
+          record.startedAt < stale
         );
       }
       return (
@@ -131,6 +143,55 @@ describe('dueStepRetryWhere (scan predicate)', () => {
         false,
       );
     }
+  });
+
+  it('matches a legacy pre-RC27 running step with no claim at all, past the lease', () => {
+    expect(
+      matches({
+        status: 'running',
+        nextAttemptAt: null,
+        claimedAt: null,
+        claimToken: null,
+        startedAt: new Date('2026-09-17T11:50:00.000Z'), // older than `stale`
+      }),
+    ).toBe(true);
+  });
+
+  it('never matches a recent legacy-shaped running step (startedAt still within the lease)', () => {
+    expect(
+      matches({
+        status: 'running',
+        nextAttemptAt: null,
+        claimedAt: null,
+        claimToken: null,
+        startedAt: new Date('2026-09-17T11:59:00.000Z'),
+      }),
+    ).toBe(false);
+  });
+
+  it('never matches a running step that already holds a claim, via the legacy branch', () => {
+    expect(
+      matches({
+        status: 'running',
+        nextAttemptAt: null,
+        claimedAt: new Date('2026-09-17T11:59:00.000Z'), // fresh claim
+        claimToken: 'token',
+        startedAt: new Date('2026-09-17T11:00:00.000Z'), // long past, irrelevant
+      }),
+    ).toBe(false);
+  });
+});
+
+describe('legacyUnclaimedRunningWhere (pre-RC27 first attempts with no claim at all)', () => {
+  const stale = new Date('2026-09-17T11:55:00.000Z');
+
+  it('is exactly status=running, claimedAt=null, claimToken=null, with a stale startedAt', () => {
+    expect(legacyUnclaimedRunningWhere(stale)).toEqual({
+      status: 'running',
+      claimedAt: null,
+      claimToken: null,
+      startedAt: { lt: stale },
+    });
   });
 });
 

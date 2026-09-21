@@ -97,6 +97,7 @@ export function dueStepRetryWhere(now: Date, staleThreshold: Date) {
     OR: [
       { status: 'retry_scheduled' as const, nextAttemptAt: { lte: now } },
       { status: 'running' as const, claimedAt: { lt: staleThreshold } },
+      legacyUnclaimedRunningWhere(staleThreshold),
     ],
   };
 }
@@ -120,4 +121,32 @@ export function dueScheduledRetryWhere(now: Date) {
 // to re-execute a non-retry-safe action — see AutomationsService.retryStep().
 export function abandonedRunningClaimWhere(staleThreshold: Date) {
   return { status: 'running' as const, claimedAt: { lt: staleThreshold } };
+}
+
+// Codex review — a first attempt created *before* RC27 shipped never had
+// claimedAt/claimToken set at all (those columns did not exist as a
+// concept yet), so a worker killed mid-attempt (e.g. a deploy) can leave
+// such a row stuck at status='running' with claimedAt=null AND
+// claimToken=null forever: abandonedRunningClaimWhere()'s own
+// `claimedAt: { lt: staleThreshold }` can never match a null claimedAt
+// (SQL NULL comparisons are never true), so neither the dispatcher's scan
+// nor retryStep()'s own claim ever saw these rows before this predicate
+// existed. `startedAt` — a column that *did* already exist pre-RC27 — is
+// the only reliable staleness signal available for this shape, so this
+// gates on it instead of claimedAt. Never matches a row with either claim
+// column set (that's abandonedRunningClaimWhere()'s and
+// dueScheduledRetryWhere()'s territory, handled by the normal — but
+// unsafe-to-blindly-retry — reclaim path) or a recent one (startedAt not
+// yet past the same lease duration everything else here uses). See
+// AutomationsService.reconcileLegacyUnclaimedRunningStep(): a row matching
+// this is never re-executed, only force-failed — its true outcome is
+// permanently unknown, exactly like an abandoned claim's, just without
+// the claim metadata to prove it via the usual mechanism.
+export function legacyUnclaimedRunningWhere(staleThreshold: Date) {
+  return {
+    status: 'running' as const,
+    claimedAt: null,
+    claimToken: null,
+    startedAt: { lt: staleThreshold },
+  };
 }
