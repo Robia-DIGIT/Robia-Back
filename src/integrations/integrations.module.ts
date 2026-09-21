@@ -4,11 +4,27 @@ import { GoogleSearchConsoleController } from './google-search-console.controlle
 import { GoogleSearchConsoleService } from './google-search-console.service';
 import { MetaController } from './meta.controller';
 import { MetaService } from './meta.service';
+import { GoogleBusinessProfileController } from './google-business-profile.controller';
+import { GoogleBusinessProfileService } from './google-business-profile.service';
 
 @Global()
 @Module({
-  controllers: [GoogleSearchConsoleController, MetaController],
-  providers: [N8nWebhookService, GoogleSearchConsoleService, MetaService],
-  exports: [N8nWebhookService, GoogleSearchConsoleService, MetaService],
+  controllers: [
+    GoogleSearchConsoleController,
+    GoogleBusinessProfileController,
+    MetaController,
+  ],
+  providers: [
+    N8nWebhookService,
+    GoogleSearchConsoleService,
+    GoogleBusinessProfileService,
+    MetaService,
+  ],
+  exports: [
+    N8nWebhookService,
+    GoogleSearchConsoleService,
+    GoogleBusinessProfileService,
+    MetaService,
+  ],
 })
 export class IntegrationsModule {}

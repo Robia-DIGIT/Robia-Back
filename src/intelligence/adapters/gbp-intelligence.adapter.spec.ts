@@ -1,11 +1,18 @@
 import { GbpIntelligenceAdapter } from './gbp-intelligence.adapter';
+import { GoogleBusinessProfileService } from '../../integrations/google-business-profile.service';
 
 describe('GbpIntelligenceAdapter', () => {
   const organizationId = 'org-1';
   let adapter: GbpIntelligenceAdapter;
 
   beforeEach(() => {
-    adapter = new GbpIntelligenceAdapter();
+    adapter = new GbpIntelligenceAdapter({
+      getIntelligenceSignal: jest.fn().mockResolvedValue({
+        status: 'not_connected',
+        observedAt: null,
+        data: null,
+      }),
+    } as unknown as GoogleBusinessProfileService);
   });
 
   it('always reports not_connected, with no data and an explicit reason', async () => {
@@ -27,12 +34,23 @@ describe('GbpIntelligenceAdapter', () => {
     expect(findings).toEqual([]);
   });
 
-  it('performs zero I/O — collectSignal takes no dependencies and touches nothing but its arguments', () => {
-    // The constructor itself takes zero constructor dependencies (no
-    // PrismaService, no HTTP client) — this is the structural guarantee
-    // "GBP absent => aucun appel réseau" rests on: there is nothing this
-    // class *could* call over the network or the database even if it
-    // wanted to.
-    expect(GbpIntelligenceAdapter.length).toBe(0);
+  it('reads the real GBP connection signal through the integration service', async () => {
+    const service = {
+      getIntelligenceSignal: jest.fn().mockResolvedValue({
+        status: 'ok',
+        observedAt: new Date('2026-09-21T10:00:00Z'),
+        data: { locationCount: 2 },
+      }),
+    };
+    const connected = new GbpIntelligenceAdapter(
+      service as unknown as GoogleBusinessProfileService,
+    );
+    expect(await connected.collectSignal(organizationId)).toMatchObject({
+      provider: 'gbp',
+      status: 'ok',
+      data: { locationCount: 2 },
+      unavailableReason: null,
+    });
+    expect(service.getIntelligenceSignal).toHaveBeenCalledWith(organizationId);
   });
 });
