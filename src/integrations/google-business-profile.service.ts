@@ -603,7 +603,10 @@ export class GoogleBusinessProfileService {
       orderBy: [{ createTime: 'desc' }, { id: 'asc' }],
       select: {
         id: true,
-        googleReviewName: true,
+        // googleReviewName is Google's internal resource name — kept only
+        // for the DB's own upsert idempotency key, never returned to the
+        // API (no client use for it, and no reason to expose Google's raw
+        // resource identifiers).
         reviewerDisplayName: true,
         starRating: true,
         comment: true,
@@ -923,14 +926,22 @@ export class GoogleBusinessProfileService {
         url.toString(),
         accessToken,
       );
+      // Fix — Google can return several DailyMetricTimeSeries for the same
+      // dailyMetric (e.g. split by dailySubEntityType). Each date within a
+      // metric must be summed across every series that reports it, never
+      // replaced by whichever series happens to be read last.
       const byMetric = new Map<string, Map<string, number>>();
       for (const group of response.multiDailyMetricTimeSeries ?? []) {
         for (const series of group.dailyMetricTimeSeries ?? []) {
           if (!series.dailyMetric) continue;
-          const byDate = new Map<string, number>();
+          const byDate =
+            byMetric.get(series.dailyMetric) ?? new Map<string, number>();
           for (const dated of series.timeSeries?.datedValues ?? []) {
             const date = this.datePartsToIso(dated.date);
-            if (date) byDate.set(date, Number(dated.value ?? 0));
+            if (!date) continue;
+            const parsed = Number(dated.value ?? 0);
+            const value = Number.isFinite(parsed) ? parsed : 0;
+            byDate.set(date, (byDate.get(date) ?? 0) + value);
           }
           byMetric.set(series.dailyMetric, byDate);
         }
@@ -983,7 +994,20 @@ export class GoogleBusinessProfileService {
         daily,
         syncedAt: new Date(),
       };
-      await this.releasePerformanceClaim(location.id, claimToken);
+      // Fix — the release must prove this worker still held the claim
+      // before the result can be trusted. If another worker already
+      // reclaimed this location (bail expired, new claim token), the
+      // release matches no row and the result is discarded: a stale
+      // worker must never hand back a "successful" read.
+      const released = await this.releasePerformanceClaim(
+        location.id,
+        claimToken,
+      );
+      if (!released) {
+        throw new ConflictException(
+          'La lecture des performances a perdu son bail et son résultat a été ignoré.',
+        );
+      }
       finalized = true;
       return result;
     } finally {
@@ -1001,10 +1025,13 @@ export class GoogleBusinessProfileService {
     locationId: string,
     claimToken: string,
   ) {
-    await this.prisma.googleBusinessProfileLocation.updateMany({
-      where: { id: locationId, performanceClaimToken: claimToken },
-      data: { performanceClaimedAt: null, performanceClaimToken: null },
-    });
+    const released = await this.prisma.googleBusinessProfileLocation.updateMany(
+      {
+        where: { id: locationId, performanceClaimToken: claimToken },
+        data: { performanceClaimedAt: null, performanceClaimToken: null },
+      },
+    );
+    return released.count === 1;
   }
 
   async disconnect(organizationId: string) {

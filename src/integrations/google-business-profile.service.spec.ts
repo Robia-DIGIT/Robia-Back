@@ -1003,6 +1003,30 @@ describe('GoogleBusinessProfileService', () => {
       expect(args.where.expiresAt.gt).toBeInstanceOf(Date);
     });
 
+    it('never selects googleReviewName, organizationId, locationId, or claim tokens for the API response', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue({
+        id: 'gbp-1',
+        organizationId: 'org-1',
+        reviewsAverageRating: null,
+        reviewsTotalReviewCount: null,
+        reviewsLastSyncedAt: null,
+        reviewsCacheExpiresAt: null,
+      });
+      prisma.googleBusinessProfileReview.findMany.mockResolvedValue([]);
+      await service.listReviews('org-1', 'gbp-1');
+      const [args] = callArgs<{ select: Record<string, unknown> }>(
+        prisma.googleBusinessProfileReview.findMany,
+      );
+      // googleReviewName is Google's internal resource name, kept in the DB
+      // only as the upsert idempotency key — never selected for the API.
+      expect(args.select).not.toHaveProperty('googleReviewName');
+      expect(args.select).not.toHaveProperty('organizationId');
+      expect(args.select).not.toHaveProperty('locationId');
+      for (const key of Object.keys(args.select)) {
+        expect(key.toLowerCase()).not.toContain('claim');
+      }
+    });
+
     it("returns Google's own averageRating/totalReviewCount from a still-valid cache, never recomputed from the stored reviews", async () => {
       const lastSyncedAt = new Date();
       const expiresAt = new Date(Date.now() + 60_000);
@@ -1620,6 +1644,50 @@ describe('GoogleBusinessProfileService', () => {
       );
     });
 
+    it('detects a lost claim before trusting a successful result, and never touches the new claimant’s token', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(
+        owningLocation,
+      );
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        encryptedRefreshToken: encrypted(),
+      });
+      // Worker A's initial claim succeeds. By the time A's Google call
+      // returns, worker B has already reclaimed this location (A's lease
+      // expired mid-flight), so A's release — scoped to A's own claim
+      // token — matches no row.
+      prisma.googleBusinessProfileLocation.updateMany
+        .mockResolvedValueOnce({ count: 1 }) // A's claim
+        .mockResolvedValueOnce({ count: 0 }); // A's release: B owns it now
+      jest
+        .spyOn(global, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ access_token: 'access' }), {
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({}), { status: 200 }),
+        );
+
+      await expect(
+        service.getPerformanceMetrics('org-1', 'gbp-1'),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      const calls = callArgs<{
+        data?: { performanceClaimToken?: string };
+        where: { performanceClaimToken?: string };
+      }>(prisma.googleBusinessProfileLocation.updateMany);
+      const claimToken = calls[0]?.data?.performanceClaimToken;
+      expect(typeof claimToken).toBe('string');
+      // Every release attempt (the failed one and the finally-block retry)
+      // is scoped to A's own token — it can never match B's differently
+      // random token, so B's claim is left untouched.
+      for (const call of calls.slice(1)) {
+        expect(call.where.performanceClaimToken).toBe(claimToken);
+      }
+    });
+
     it('releases its claim after a failed Google request so a later read can proceed', async () => {
       prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(
         owningLocation,
@@ -1729,6 +1797,81 @@ describe('GoogleBusinessProfileService', () => {
       expect(
         result.daily.find((day) => day.date === '2026-09-01'),
       ).toMatchObject({ calls: 3, websiteClicks: 7 });
+    });
+
+    it('sums multiple DailyMetricTimeSeries for the same metric and date instead of overwriting', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(
+        owningLocation,
+      );
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        encryptedRefreshToken: encrypted(),
+      });
+      jest
+        .spyOn(global, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ access_token: 'access' }), {
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              multiDailyMetricTimeSeries: [
+                {
+                  // Google can split the same dailyMetric across several
+                  // series (e.g. different dailySubEntityType) — both
+                  // report CALL_CLICKS on the same date and must be added,
+                  // not have the second overwrite the first.
+                  dailyMetricTimeSeries: [
+                    {
+                      dailyMetric: 'CALL_CLICKS',
+                      timeSeries: {
+                        datedValues: [
+                          {
+                            date: { year: 2026, month: 9, day: 1 },
+                            value: '3',
+                          },
+                        ],
+                      },
+                    },
+                    {
+                      dailyMetric: 'CALL_CLICKS',
+                      timeSeries: {
+                        datedValues: [
+                          {
+                            date: { year: 2026, month: 9, day: 1 },
+                            value: '4',
+                          },
+                        ],
+                      },
+                    },
+                    {
+                      dailyMetric: 'WEBSITE_CLICKS',
+                      timeSeries: {
+                        datedValues: [
+                          {
+                            date: { year: 2026, month: 9, day: 1 },
+                            value: 'not-a-number',
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              ],
+            }),
+            { status: 200 },
+          ),
+        );
+
+      const result = await service.getPerformanceMetrics('org-1', 'gbp-1');
+
+      const day = result.daily.find((entry) => entry.date === '2026-09-01');
+      expect(day).toMatchObject({ calls: 7, websiteClicks: 0 });
+      expect(Number.isNaN(day?.websiteClicks)).toBe(false);
+      expect(result.summary.calls).toBe(7);
+      expect(result.summary.websiteClicks).toBe(0);
     });
 
     it('reports every day as zero when Google returns no time series at all', async () => {
