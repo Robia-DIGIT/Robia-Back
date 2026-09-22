@@ -9,6 +9,7 @@ def generate_document_content(
     document_type: str,
     opportunity_title: str,
     opportunity_description: str,
+    context: dict,
 ) -> dict:
     """
     Génère le contenu d'un document via le LLM configuré.
@@ -18,7 +19,7 @@ def generate_document_content(
     provider = get_llm_provider()
 
     user_prompt = build_document_user_prompt(
-        document_type, opportunity_title, opportunity_description
+        document_type, opportunity_title, opportunity_description, context
     )
 
     content = provider.generate(DOCUMENT_SYSTEM_PROMPT, user_prompt)

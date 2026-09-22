@@ -1,7 +1,7 @@
 # ROBIA Content Studio — contrat de conception v0.1
 
 Date : 22 septembre 2026. Base backend inspectée : `2773c19`.
-Statut : fondation proposée, non activée ; aucune publication externe.
+Statut : lot 1 backend ajouté à la PR draft ; aucune publication externe.
 
 ## Objectif produit
 
@@ -39,8 +39,8 @@ Ne promettre ni classement Google garanti ni causalité entre publication et gai
 ## Livraisons verticales
 
 0. Fondation : politique pure de publication + tests + ce contrat (présente PR).
-1. Studio : contexte tenant/site/cible, génération réelle, documents versionnés,
-   édition, liaison Actions. Aucun appel d'écriture externe dans ce lot.
+1. Studio : génération libre tenant/site-scopée, brief réel, révision optimiste,
+   bibliothèque par site et liaison optionnelle à une Action (présente PR).
 2. WordPress : connexion sécurisée, import de contenus borné, création d'un
    brouillon WordPress et preuve distante ; publication avec validation explicite.
 3. GBP : post standard approuvé, publication puis vérification du statut Google.
@@ -82,10 +82,24 @@ CTA, date de publication ou compte exige aussi une nouvelle validation.
 Créer un brouillon WordPress n'est pas publier. Une réponse Google acceptée
 mais encore en modération n'est pas une visibilité publique confirmée.
 
-## Contrat HTTP proposé — non disponible tant que lot 1 non livré
+## Contrat de compatibilité livré par le lot 1 dans cette PR
 
-Réutiliser les routes documents existantes si leurs contrats peuvent être
-étendus sans rupture ; sinon ces routes explicites seront exposées sous `/copilot` :
+- POST `/documents/generate` accepte `type`, `websiteId`, `brief` et
+  `actionItemId?`; le mode historique avec `opportunityId` reste compatible.
+- GET `/documents?website_id=...` expose une bibliothèque bornée à 100 éléments ;
+  `opportunity_id` reste supporté. La pagination par curseur reste à ajouter.
+- PATCH `/documents/:id` exige `expectedRevision`; un éditeur obsolète reçoit 409.
+- Le brief est stocké, transmis au moteur Python et séparé des faits serveur.
+- `ValidationLog` reste un journal historique. Le vrai parcours d'approbation et
+  d'exécution est celui d'ActionItem ; aucune publication n'est branchée.
+
+La migration rend `Document.opportunityId` nullable, ajoute `websiteId` obligatoire,
+`brief` et `revision`, en rétro-remplissant le site via opportunité → audit.
+
+## Contrat HTTP cible après le lot 1
+
+Les routes ci-dessous restent une cible d'évolution et ne doivent pas être
+appelées par le frontend tant qu'elles ne sont pas réellement livrées :
 
 - GET `/copilot/context?websiteId=...` : facts, sources, connections, capabilities,
   warnings et cibles autorisées. Ne jamais retourner de credentials.

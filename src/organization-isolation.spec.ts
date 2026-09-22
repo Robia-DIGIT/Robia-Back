@@ -144,13 +144,14 @@ describe('Organization isolation', () => {
     const prisma = {
       document: {
         findFirst: jest.fn().mockResolvedValue(null),
-        update: jest.fn(),
+        updateMany: jest.fn().mockResolvedValue({ count: 0 }),
       },
     };
     const service = new DocumentsService(prisma as any, {} as any);
 
     await expect(
       service.update(requestingOrganizationId, 'document-org-b', {
+        expectedRevision: 1,
         content: 'forbidden update',
       }),
     ).rejects.toBeInstanceOf(NotFoundException);
@@ -159,8 +160,17 @@ describe('Organization isolation', () => {
         id: 'document-org-b',
         organizationId: requestingOrganizationId,
       },
+      select: { id: true },
     });
-    expect(prisma.document.update).not.toHaveBeenCalled();
+    expect(prisma.document.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        // Jest asymmetric matchers are typed as any in this repository's version.
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        where: expect.objectContaining({
+          organizationId: requestingOrganizationId,
+        }),
+      }),
+    );
   });
 
   it('does not update an action owned by another organization', async () => {

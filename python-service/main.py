@@ -45,7 +45,8 @@ def generate_document(request: DocumentRequest):
     result = run_document_generation(
         request.type,
         request.opportunity_title,
-        request.opportunity_description
+        request.opportunity_description,
+        request.context.model_dump(),
     )
     return result
 

@@ -253,6 +253,7 @@ model Website {
   audits Audit[]
   pages WebPage[]
   competitors Competitor[]
+  documents Document[]
 
   @@unique([organizationId, url])
   @@map("websites")
@@ -386,11 +387,15 @@ model Document {
   id             String   @id @default(cuid())
   organizationId String   @map("organization_id")
   organization   Organization @relation(fields: [organizationId], references: [id])
-  opportunityId  String   @map("opportunity_id")
-  opportunity    Opportunity @relation(fields: [opportunityId], references: [id])
+  websiteId      String   @map("website_id")
+  website        Website  @relation(fields: [websiteId], references: [id])
+  opportunityId  String?  @map("opportunity_id")
+  opportunity    Opportunity? @relation(fields: [opportunityId], references: [id], onDelete: SetNull)
   type           String   // local_page | faq | meta | gbp_post | review_reply | dev_brief | checklist
   title          String
   content        String
+  brief          Json?
+  revision       Int      @default(1)
   status         String   @default("draft") // draft | edited | validated
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @updatedAt @map("updated_at")
@@ -398,6 +403,7 @@ model Document {
   validationLogs ValidationLog[]
   actionItems    ActionItem[]
 
+  @@index([organizationId, websiteId, updatedAt])
   @@map("documents")
 }
 
