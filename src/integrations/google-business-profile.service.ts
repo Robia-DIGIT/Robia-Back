@@ -11,6 +11,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { Prisma } from '@prisma/client';
 import {
   createCipheriv,
@@ -59,6 +60,22 @@ const LOCATION_READ_MASK = [
 // readMask constant. See docs/RC40_GOOGLE_BUSINESS_PROFILE_REVIEWS_
 // PERFORMANCE.md — replying to a review is explicitly out of scope.
 const REVIEWS_PAGE_SIZE = 50;
+// RC-40 fix — Google's GBP API terms cap third-party storage of API content
+// at 30 days. This mirror targets 24h freshness, far under that ceiling:
+// every stored review (and the cached aggregate rating/count alongside it)
+// expires 24h after the sync that produced it, enforced at every read path
+// (never served past expiry, even before the purge cron runs) and by the
+// hourly purge cron itself. See docs/RC40_GOOGLE_BUSINESS_PROFILE_REVIEWS_
+// PERFORMANCE.md for the full retention policy.
+const REVIEWS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const REVIEWS_SYNC_CLAIM_LEASE_MS = 5 * 60 * 1000;
+const REVIEWS_SYNC_COOLDOWN_MS = 60 * 1000;
+// RC-40 fix — server-side quota protection for the Performance API read
+// path, independent of the frontend's disabled button. No performance data
+// is cached: the claim only guards concurrency/quota, and is released as
+// soon as the read completes (success or failure).
+const PERFORMANCE_CLAIM_LEASE_MS = 5 * 60 * 1000;
+const PERFORMANCE_COOLDOWN_MS = 60 * 1000;
 const STAR_RATING_VALUES: Record<string, number> = {
   ONE: 1,
   TWO: 2,
@@ -159,6 +176,8 @@ interface GoogleReview {
 
 interface GoogleReviewsResponse {
   reviews?: GoogleReview[];
+  averageRating?: number;
+  totalReviewCount?: number;
   nextPageToken?: string;
 }
 
@@ -577,159 +596,415 @@ export class GoogleBusinessProfileService {
   // docs/RC40_GOOGLE_BUSINESS_PROFILE_REVIEWS_PERFORMANCE.md).
 
   async listReviews(organizationId: string, locationId: string) {
-    await this.findOwnedLocation(organizationId, locationId);
-    return this.prisma.googleBusinessProfileReview.findMany({
-      where: { locationId },
+    const location = await this.findOwnedLocation(organizationId, locationId);
+    const now = new Date();
+    const reviews = await this.prisma.googleBusinessProfileReview.findMany({
+      where: { locationId: location.id, expiresAt: { gt: now } },
       orderBy: [{ createTime: 'desc' }, { id: 'asc' }],
+      select: {
+        id: true,
+        googleReviewName: true,
+        reviewerDisplayName: true,
+        starRating: true,
+        comment: true,
+        createTime: true,
+        updateTime: true,
+        replyComment: true,
+        replyUpdateTime: true,
+        lastSyncedAt: true,
+        expiresAt: true,
+      },
     });
+    // Google's own averageRating/totalReviewCount are cached alongside the
+    // reviews they summarize and expire on the exact same schedule — never
+    // recomputed from the rows above. An expired or never-synced cache is
+    // reported honestly as null rather than serving a stale aggregate.
+    const cacheValid =
+      Boolean(location.reviewsCacheExpiresAt) &&
+      location.reviewsCacheExpiresAt! > now;
+    return {
+      reviews,
+      averageRating: cacheValid ? location.reviewsAverageRating : null,
+      totalReviewCount: cacheValid ? location.reviewsTotalReviewCount : null,
+      lastSyncedAt: cacheValid ? location.reviewsLastSyncedAt : null,
+      expiresAt: cacheValid ? location.reviewsCacheExpiresAt : null,
+    };
   }
 
   async syncReviews(organizationId: string, locationId: string) {
-    const { location, accessToken } = await this.authorizedLocation(
+    // Claim before any Google request, exactly like syncLocations: the
+    // connection's access token is only refreshed once this worker holds
+    // the claim, so a concurrent/cooldown rejection never costs a call.
+    const { location, connection } = await this.findOwnedLocationWithConnection(
       organizationId,
       locationId,
     );
-    const parent = `${location.googleAccountName}/${location.googleLocationName}`;
-    const reviews: GoogleReview[] = [];
-    let pageToken: string | undefined;
-    do {
-      const url = new URL(
-        `https://mybusiness.googleapis.com/v4/${parent}/reviews`,
-      );
-      url.searchParams.set('pageSize', String(REVIEWS_PAGE_SIZE));
-      if (pageToken) url.searchParams.set('pageToken', pageToken);
-      const response = await this.googleGet<GoogleReviewsResponse>(
-        url.toString(),
-        accessToken,
-      );
-      reviews.push(...(response.reviews ?? []).filter((item) => item.name));
-      pageToken = response.nextPageToken;
-    } while (pageToken);
-
-    // Every page is read before any write, exactly like syncLocations: a
-    // failure halfway through pagination must never delete reviews the
-    // remaining pages hadn't been read yet.
-    const syncedAt = new Date();
-    const observedNames = [...new Set(reviews.map((review) => review.name))];
-    await this.prisma.$transaction(async (tx) => {
-      for (const review of reviews) {
-        await tx.googleBusinessProfileReview.upsert({
-          where: {
-            locationId_googleReviewName: {
-              locationId: location.id,
-              googleReviewName: review.name,
+    const now = new Date();
+    const claimToken = randomUUID();
+    const claim = await this.prisma.googleBusinessProfileLocation.updateMany({
+      where: {
+        id: location.id,
+        OR: [
+          { reviewsSyncClaimedAt: null },
+          {
+            reviewsSyncClaimedAt: {
+              lt: new Date(now.getTime() - REVIEWS_SYNC_CLAIM_LEASE_MS),
             },
           },
-          create: {
-            organizationId,
-            locationId: location.id,
-            ...this.reviewValues(review, syncedAt),
+        ],
+        AND: [
+          {
+            OR: [
+              { reviewsLastSyncAttemptAt: null },
+              {
+                reviewsLastSyncAttemptAt: {
+                  lte: new Date(now.getTime() - REVIEWS_SYNC_COOLDOWN_MS),
+                },
+              },
+            ],
           },
-          update: this.reviewValues(review, syncedAt),
-        });
-      }
-      await tx.googleBusinessProfileReview.deleteMany({
-        where: {
-          locationId: location.id,
-          ...(observedNames.length
-            ? { googleReviewName: { notIn: observedNames } }
-            : {}),
+        ],
+      },
+      data: {
+        reviewsSyncClaimedAt: now,
+        reviewsSyncClaimToken: claimToken,
+        reviewsLastSyncAttemptAt: now,
+        reviewsSyncStatus: 'running',
+      },
+    });
+    if (claim.count !== 1) {
+      const fresh = await this.prisma.googleBusinessProfileLocation.findUnique({
+        where: { id: location.id },
+        select: {
+          reviewsSyncClaimedAt: true,
+          reviewsLastSyncAttemptAt: true,
         },
       });
+      if (
+        fresh?.reviewsSyncClaimedAt &&
+        fresh.reviewsSyncClaimedAt.getTime() >
+          now.getTime() - REVIEWS_SYNC_CLAIM_LEASE_MS
+      ) {
+        throw new ConflictException(
+          'Une synchronisation des avis est déjà en cours pour cet établissement.',
+        );
+      }
+      throw new HttpException(
+        'Une synchronisation des avis vient déjà d’être demandée. Réessayez dans une minute.',
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
+    let finalized = false;
+    try {
+      const accessToken = await this.refreshAccessToken(
+        this.decrypt(connection.encryptedRefreshToken),
+      );
+      const parent = `${location.googleAccountName}/${location.googleLocationName}`;
+      const reviews: GoogleReview[] = [];
+      let averageRating: number | null = null;
+      let totalReviewCount: number | null = null;
+      let pageToken: string | undefined;
+      do {
+        const url = new URL(
+          `https://mybusiness.googleapis.com/v4/${parent}/reviews`,
+        );
+        url.searchParams.set('pageSize', String(REVIEWS_PAGE_SIZE));
+        if (pageToken) url.searchParams.set('pageToken', pageToken);
+        const response = await this.googleGet<GoogleReviewsResponse>(
+          url.toString(),
+          accessToken,
+        );
+        reviews.push(...(response.reviews ?? []).filter((item) => item.name));
+        if (typeof response.averageRating === 'number') {
+          averageRating = response.averageRating;
+        }
+        if (typeof response.totalReviewCount === 'number') {
+          totalReviewCount = response.totalReviewCount;
+        }
+        pageToken = response.nextPageToken;
+      } while (pageToken);
+
+      // Every page is read before any write, exactly like syncLocations: a
+      // failure halfway through pagination must never modify existing data.
+      const syncedAt = new Date();
+      const expiresAt = new Date(syncedAt.getTime() + REVIEWS_CACHE_TTL_MS);
+      const observedNames = [...new Set(reviews.map((review) => review.name))];
+      const committed = await this.prisma.$transaction(async (tx) => {
+        // Proves claim ownership BEFORE any upsert/delete. If a newer
+        // claimant has since taken over (this worker's token no longer
+        // matches), no row is touched below.
+        const owned = await tx.googleBusinessProfileLocation.updateMany({
+          where: { id: location.id, reviewsSyncClaimToken: claimToken },
+          data: { reviewsSyncClaimedAt: syncedAt },
+        });
+        if (owned.count !== 1) return false;
+        for (const review of reviews) {
+          await tx.googleBusinessProfileReview.upsert({
+            where: {
+              locationId_googleReviewName: {
+                locationId: location.id,
+                googleReviewName: review.name,
+              },
+            },
+            create: {
+              organizationId,
+              locationId: location.id,
+              ...this.reviewValues(review, syncedAt, expiresAt),
+            },
+            update: this.reviewValues(review, syncedAt, expiresAt),
+          });
+        }
+        await tx.googleBusinessProfileReview.deleteMany({
+          where: {
+            locationId: location.id,
+            ...(observedNames.length
+              ? { googleReviewName: { notIn: observedNames } }
+              : {}),
+          },
+        });
+        const released = await tx.googleBusinessProfileLocation.updateMany({
+          where: { id: location.id, reviewsSyncClaimToken: claimToken },
+          data: {
+            reviewsLastSyncedAt: syncedAt,
+            reviewsSyncStatus: 'success',
+            reviewsAverageRating: averageRating,
+            reviewsTotalReviewCount: totalReviewCount,
+            reviewsCacheExpiresAt: expiresAt,
+            reviewsSyncClaimedAt: null,
+            reviewsSyncClaimToken: null,
+          },
+        });
+        return released.count === 1;
+      });
+      if (!committed) {
+        throw new ConflictException(
+          'La synchronisation des avis a perdu son bail et son résultat a été ignoré.',
+        );
+      }
+      finalized = true;
+      return {
+        synced: true as const,
+        reviewCount: observedNames.length,
+        averageRating,
+        totalReviewCount,
+        syncedAt,
+        expiresAt,
+      };
+    } finally {
+      if (!finalized) {
+        await this.releaseReviewsSyncClaim(
+          location.id,
+          claimToken,
+          'failed',
+        ).catch(() =>
+          this.logger.warn(
+            `GBP : impossible de libérer le bail de synchronisation des avis (location=${location.id})`,
+          ),
+        );
+      }
+    }
+  }
+
+  private async releaseReviewsSyncClaim(
+    locationId: string,
+    claimToken: string,
+    status: 'partial' | 'failed',
+  ) {
+    await this.prisma.googleBusinessProfileLocation.updateMany({
+      where: { id: locationId, reviewsSyncClaimToken: claimToken },
+      data: {
+        reviewsSyncClaimedAt: null,
+        reviewsSyncClaimToken: null,
+        reviewsSyncStatus: status,
+      },
     });
-    return {
-      synced: true as const,
-      reviewCount: observedNames.length,
-      syncedAt,
-    };
+  }
+
+  // RC-40 fix — hourly purge of expired reviews. Every read path already
+  // filters expired rows out (see listReviews), so this cron is a hygiene
+  // sweep, not the enforcement mechanism: nothing expired is ever served
+  // even in the (up to ~1h) window before this runs.
+  @Cron(CronExpression.EVERY_HOUR)
+  async purgeExpiredReviews() {
+    const result = await this.prisma.googleBusinessProfileReview.deleteMany({
+      where: { expiresAt: { lte: new Date() } },
+    });
+    if (result.count > 0) {
+      this.logger.log(`GBP : purge de ${result.count} avis expirés.`);
+    }
   }
 
   async getPerformanceMetrics(organizationId: string, locationId: string) {
-    const { location, accessToken } = await this.authorizedLocation(
+    // Claim before any Google request, same rationale as syncReviews: the
+    // access token is only refreshed once the claim is held.
+    const { location, connection } = await this.findOwnedLocationWithConnection(
       organizationId,
       locationId,
     );
-    const endDate = new Date();
-    endDate.setUTCHours(0, 0, 0, 0);
-    endDate.setUTCDate(endDate.getUTCDate() - 1);
-    const startDate = new Date(endDate);
-    startDate.setUTCDate(
-      startDate.getUTCDate() - (PERFORMANCE_WINDOW_DAYS - 1),
-    );
-
-    const url = new URL(
-      `https://businessprofileperformance.googleapis.com/v1/${location.googleLocationName}:fetchMultiDailyMetricsTimeSeries`,
-    );
-    for (const metric of PERFORMANCE_METRICS) {
-      url.searchParams.append('dailyMetrics', metric);
+    const now = new Date();
+    const claimToken = randomUUID();
+    const claim = await this.prisma.googleBusinessProfileLocation.updateMany({
+      where: {
+        id: location.id,
+        OR: [
+          { performanceClaimedAt: null },
+          {
+            performanceClaimedAt: {
+              lt: new Date(now.getTime() - PERFORMANCE_CLAIM_LEASE_MS),
+            },
+          },
+        ],
+        AND: [
+          {
+            OR: [
+              { performanceLastAttemptAt: null },
+              {
+                performanceLastAttemptAt: {
+                  lte: new Date(now.getTime() - PERFORMANCE_COOLDOWN_MS),
+                },
+              },
+            ],
+          },
+        ],
+      },
+      data: {
+        performanceClaimedAt: now,
+        performanceClaimToken: claimToken,
+        performanceLastAttemptAt: now,
+      },
+    });
+    if (claim.count !== 1) {
+      const fresh = await this.prisma.googleBusinessProfileLocation.findUnique({
+        where: { id: location.id },
+        select: {
+          performanceClaimedAt: true,
+          performanceLastAttemptAt: true,
+        },
+      });
+      if (
+        fresh?.performanceClaimedAt &&
+        fresh.performanceClaimedAt.getTime() >
+          now.getTime() - PERFORMANCE_CLAIM_LEASE_MS
+      ) {
+        throw new ConflictException(
+          'Une lecture des performances Google est déjà en cours pour cet établissement.',
+        );
+      }
+      throw new HttpException(
+        'Trop de lectures des performances Google pour cet établissement. Réessayez dans une minute.',
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
     }
-    this.setDatePart(url, 'dailyRange.start_date', startDate);
-    this.setDatePart(url, 'dailyRange.end_date', endDate);
 
-    const response = await this.googleGet<GooglePerformanceResponse>(
-      url.toString(),
-      accessToken,
-    );
-    const byMetric = new Map<string, Map<string, number>>();
-    for (const group of response.multiDailyMetricTimeSeries ?? []) {
-      for (const series of group.dailyMetricTimeSeries ?? []) {
-        if (!series.dailyMetric) continue;
-        const byDate = new Map<string, number>();
-        for (const dated of series.timeSeries?.datedValues ?? []) {
-          const date = this.datePartsToIso(dated.date);
-          if (date) byDate.set(date, Number(dated.value ?? 0));
+    let finalized = false;
+    try {
+      const accessToken = await this.refreshAccessToken(
+        this.decrypt(connection.encryptedRefreshToken),
+      );
+      const endDate = new Date();
+      endDate.setUTCHours(0, 0, 0, 0);
+      endDate.setUTCDate(endDate.getUTCDate() - 1);
+      const startDate = new Date(endDate);
+      startDate.setUTCDate(
+        startDate.getUTCDate() - (PERFORMANCE_WINDOW_DAYS - 1),
+      );
+
+      const url = new URL(
+        `https://businessprofileperformance.googleapis.com/v1/${location.googleLocationName}:fetchMultiDailyMetricsTimeSeries`,
+      );
+      for (const metric of PERFORMANCE_METRICS) {
+        url.searchParams.append('dailyMetrics', metric);
+      }
+      this.setDatePart(url, 'dailyRange.start_date', startDate);
+      this.setDatePart(url, 'dailyRange.end_date', endDate);
+
+      const response = await this.googleGet<GooglePerformanceResponse>(
+        url.toString(),
+        accessToken,
+      );
+      const byMetric = new Map<string, Map<string, number>>();
+      for (const group of response.multiDailyMetricTimeSeries ?? []) {
+        for (const series of group.dailyMetricTimeSeries ?? []) {
+          if (!series.dailyMetric) continue;
+          const byDate = new Map<string, number>();
+          for (const dated of series.timeSeries?.datedValues ?? []) {
+            const date = this.datePartsToIso(dated.date);
+            if (date) byDate.set(date, Number(dated.value ?? 0));
+          }
+          byMetric.set(series.dailyMetric, byDate);
         }
-        byMetric.set(series.dailyMetric, byDate);
+      }
+
+      const dates: string[] = [];
+      for (
+        let cursor = new Date(startDate);
+        cursor.getTime() <= endDate.getTime();
+        cursor.setUTCDate(cursor.getUTCDate() + 1)
+      ) {
+        dates.push(this.formatDate(cursor));
+      }
+      const valueFor = (metric: string, date: string) =>
+        byMetric.get(metric)?.get(date) ?? 0;
+      const daily = dates.map((date) => ({
+        date,
+        impressions:
+          valueFor('BUSINESS_IMPRESSIONS_DESKTOP_MAPS', date) +
+          valueFor('BUSINESS_IMPRESSIONS_DESKTOP_SEARCH', date) +
+          valueFor('BUSINESS_IMPRESSIONS_MOBILE_MAPS', date) +
+          valueFor('BUSINESS_IMPRESSIONS_MOBILE_SEARCH', date),
+        calls: valueFor('CALL_CLICKS', date),
+        websiteClicks: valueFor('WEBSITE_CLICKS', date),
+        directionRequests: valueFor('BUSINESS_DIRECTION_REQUESTS', date),
+        conversations: valueFor('BUSINESS_CONVERSATIONS', date),
+      }));
+      const summary = daily.reduce(
+        (total, day) => ({
+          impressions: total.impressions + day.impressions,
+          calls: total.calls + day.calls,
+          websiteClicks: total.websiteClicks + day.websiteClicks,
+          directionRequests: total.directionRequests + day.directionRequests,
+          conversations: total.conversations + day.conversations,
+        }),
+        {
+          impressions: 0,
+          calls: 0,
+          websiteClicks: 0,
+          directionRequests: 0,
+          conversations: 0,
+        },
+      );
+
+      const result = {
+        locationId: location.id,
+        startDate: this.formatDate(startDate),
+        endDate: this.formatDate(endDate),
+        summary,
+        daily,
+        syncedAt: new Date(),
+      };
+      await this.releasePerformanceClaim(location.id, claimToken);
+      finalized = true;
+      return result;
+    } finally {
+      if (!finalized) {
+        await this.releasePerformanceClaim(location.id, claimToken).catch(() =>
+          this.logger.warn(
+            `GBP : impossible de libérer le bail de lecture des performances (location=${location.id})`,
+          ),
+        );
       }
     }
+  }
 
-    const dates: string[] = [];
-    for (
-      let cursor = new Date(startDate);
-      cursor.getTime() <= endDate.getTime();
-      cursor.setUTCDate(cursor.getUTCDate() + 1)
-    ) {
-      dates.push(this.formatDate(cursor));
-    }
-    const valueFor = (metric: string, date: string) =>
-      byMetric.get(metric)?.get(date) ?? 0;
-    const daily = dates.map((date) => ({
-      date,
-      impressions:
-        valueFor('BUSINESS_IMPRESSIONS_DESKTOP_MAPS', date) +
-        valueFor('BUSINESS_IMPRESSIONS_DESKTOP_SEARCH', date) +
-        valueFor('BUSINESS_IMPRESSIONS_MOBILE_MAPS', date) +
-        valueFor('BUSINESS_IMPRESSIONS_MOBILE_SEARCH', date),
-      calls: valueFor('CALL_CLICKS', date),
-      websiteClicks: valueFor('WEBSITE_CLICKS', date),
-      directionRequests: valueFor('BUSINESS_DIRECTION_REQUESTS', date),
-      conversations: valueFor('BUSINESS_CONVERSATIONS', date),
-    }));
-    const summary = daily.reduce(
-      (total, day) => ({
-        impressions: total.impressions + day.impressions,
-        calls: total.calls + day.calls,
-        websiteClicks: total.websiteClicks + day.websiteClicks,
-        directionRequests: total.directionRequests + day.directionRequests,
-        conversations: total.conversations + day.conversations,
-      }),
-      {
-        impressions: 0,
-        calls: 0,
-        websiteClicks: 0,
-        directionRequests: 0,
-        conversations: 0,
-      },
-    );
-
-    return {
-      locationId: location.id,
-      startDate: this.formatDate(startDate),
-      endDate: this.formatDate(endDate),
-      summary,
-      daily,
-      syncedAt: new Date(),
-    };
+  private async releasePerformanceClaim(
+    locationId: string,
+    claimToken: string,
+  ) {
+    await this.prisma.googleBusinessProfileLocation.updateMany({
+      where: { id: locationId, performanceClaimToken: claimToken },
+      data: { performanceClaimedAt: null, performanceClaimToken: null },
+    });
   }
 
   async disconnect(organizationId: string) {
@@ -810,6 +1085,24 @@ export class GoogleBusinessProfileService {
   }
 
   private async authorizedLocation(organizationId: string, locationId: string) {
+    const { location, connection } = await this.findOwnedLocationWithConnection(
+      organizationId,
+      locationId,
+    );
+    const accessToken = await this.refreshAccessToken(
+      this.decrypt(connection.encryptedRefreshToken),
+    );
+    return { location, connection, accessToken };
+  }
+
+  // RC-40 fix — split out from authorizedLocation() so a claim/lease check
+  // (syncReviews, getPerformanceMetrics) can run BEFORE refreshing the
+  // Google access token: the claim must be the very first thing that can
+  // reject a concurrent call, with no Google request made ahead of it.
+  private async findOwnedLocationWithConnection(
+    organizationId: string,
+    locationId: string,
+  ) {
     const location = await this.findOwnedLocation(organizationId, locationId);
     const connection =
       await this.prisma.googleBusinessProfileConnection.findUnique({
@@ -820,17 +1113,13 @@ export class GoogleBusinessProfileService {
         "Google Business Profile n'est pas connecté.",
       );
     }
-    const accessToken = await this.refreshAccessToken(
-      this.decrypt(connection.encryptedRefreshToken),
-    );
-    return { location, connection, accessToken };
+    return { location, connection };
   }
 
-  private reviewValues(review: GoogleReview, syncedAt: Date) {
+  private reviewValues(review: GoogleReview, syncedAt: Date, expiresAt: Date) {
     return {
       googleReviewName: review.name,
       reviewerDisplayName: review.reviewer?.displayName ?? null,
-      reviewerPhotoUri: review.reviewer?.profilePhotoUrl ?? null,
       starRating: review.starRating
         ? (STAR_RATING_VALUES[review.starRating] ?? null)
         : null,
@@ -842,6 +1131,7 @@ export class GoogleBusinessProfileService {
         ? new Date(review.reviewReply.updateTime)
         : null,
       lastSyncedAt: syncedAt,
+      expiresAt,
     };
   }
 
