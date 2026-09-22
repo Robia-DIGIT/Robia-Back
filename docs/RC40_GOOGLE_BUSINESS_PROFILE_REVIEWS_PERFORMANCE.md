@@ -192,24 +192,26 @@ affichées correspondent à la réalité du compte Google.
 **Aucun merge ni déploiement de ce lot sans une nouvelle revue Codex et un
 feu vert humain explicite après ce test manuel.**
 
-## Suivi requis — audit de rétention séparé pour RC38
+## Suivi requis — audit de rétention séparé pour RC38 (clos par RC41)
 
+**Traité par RC41** (voir docs/RC38_GOOGLE_BUSINESS_PROFILE_READONLY.md,
+section « RC41 — Politique de rétention et resynchronisation automatique »).
 La fiche complète RC38 (identité, horaires, adresse, catégories, etc. —
-`GoogleBusinessProfileLocation`) a été construite avant que la politique de
-rétention à 30 jours de Google ne soit examinée en détail pour ce module
-(RC40 l'a fait pour les avis). RC38 n'a **pas** aujourd'hui de politique
-d'expiration, de purge automatique ni de filtrage anti-expiration
-équivalents à ceux de RC40. Ce n'est pas nécessairement un problème — la
-fiche d'établissement pourrait relever d'une exception ou d'une durée de
-rétention différente selon les conditions Google applicables aux données de
-type "informations d'établissement" plutôt que "contenu généré par les
-utilisateurs" (avis) — mais la question n'a pas été tranchée.
+`GoogleBusinessProfileLocation`) n'avait, à l'inverse des avis, aucune
+politique d'expiration ni de purge — uniquement un bouton « Synchroniser »
+manuel. RC41 ajoute une resynchronisation automatique planifiée (toute
+connexion jamais synchronisée ou stale >24h), qui réutilise le bail de
+synchronisation déjà existant, plutôt qu'une politique de purge : contrairement
+aux avis, effacer une fiche établissement serait destructeur pour le produit,
+alors qu'un rafraîchissement automatique atteint la même garantie de
+conformité (jamais plus de 24h de retard sur Google, très en dessous du
+plafond de 30 jours) sans jamais montrer un état vide à l'utilisateur.
 
-**Avant tout lancement commercial général**, le mécanisme RC38 (mirroir de
-fiche) doit faire l'objet de son propre audit de conformité de rétention des
-données Google, indépendant de celui-ci, pour déterminer s'il a besoin d'une
-politique d'expiration/purge du même type que celle mise en place ici pour
-les avis.
+Réserve inchangée : le texte exact des conditions Google n'a pas pu être relu
+directement (accès réseau bloqué dans l'environnement de développement) —
+seulement via des résultats de recherche qui le citent. À vérifier directement
+sur `developers.google.com/my-business/content/policies` avant toute annonce
+publique.
 
 ## Configuration
 

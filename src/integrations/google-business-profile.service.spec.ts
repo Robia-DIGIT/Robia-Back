@@ -32,6 +32,7 @@ describe('GoogleBusinessProfileService', () => {
     location: { findFirst: jest.Mock };
     googleBusinessProfileConnection: {
       findUnique: jest.Mock;
+      findMany: jest.Mock;
       upsert: jest.Mock;
       update: jest.Mock;
       updateMany: jest.Mock;
@@ -62,6 +63,7 @@ describe('GoogleBusinessProfileService', () => {
       location: { findFirst: jest.fn() },
       googleBusinessProfileConnection: {
         findUnique: jest.fn(),
+        findMany: jest.fn(),
         upsert: jest.fn(),
         update: jest.fn(),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
@@ -882,6 +884,204 @@ describe('GoogleBusinessProfileService', () => {
     expect(
       prisma.googleBusinessProfileLocation.deleteMany,
     ).not.toHaveBeenCalled();
+  });
+
+  // RC-41 — Google's 30-day storage ceiling applies to the location fiche
+  // too, not just reviews (RC-40): an organization that never re-clicks
+  // "Synchroniser" must not keep a Google-sourced copy indefinitely.
+  describe('refreshStaleLocations (scheduled)', () => {
+    const encrypted = (service_: GoogleBusinessProfileService): string =>
+      (service_ as unknown as { encrypt(value: string): string }).encrypt(
+        'refresh',
+      );
+
+    it('queries only connections never synced or stale for more than 24h', async () => {
+      prisma.googleBusinessProfileConnection.findMany.mockResolvedValue([]);
+      await service.refreshStaleLocations();
+      const [args] = callArgs<{
+        where: { OR: [{ lastSyncedAt: null }, { lastSyncedAt: { lt: Date } }] };
+      }>(prisma.googleBusinessProfileConnection.findMany);
+      expect(args.where.OR[0]).toEqual({ lastSyncedAt: null });
+      expect(args.where.OR[1].lastSyncedAt.lt).toBeInstanceOf(Date);
+      expect(
+        Date.now() - args.where.OR[1].lastSyncedAt.lt.getTime(),
+      ).toBeCloseTo(24 * 60 * 60 * 1000, -3);
+    });
+
+    it('resyncs a connection whose fiche has never been synced', async () => {
+      prisma.googleBusinessProfileConnection.findMany.mockResolvedValue([
+        {
+          id: 'conn-1',
+          organizationId: 'org-1',
+          encryptedRefreshToken: encrypted(service),
+          lastSyncedAt: null,
+        },
+      ]);
+      prisma.googleBusinessProfileLocation.count.mockResolvedValue(0);
+      const fetchSpy = jest
+        .spyOn(global, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ access_token: 'access' }), {
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ accounts: [] }), { status: 200 }),
+        );
+
+      await service.refreshStaleLocations();
+
+      expect(fetchSpy).toHaveBeenCalled();
+    });
+
+    it('resyncs a connection stale for more than 24h', async () => {
+      prisma.googleBusinessProfileConnection.findMany.mockResolvedValue([
+        {
+          id: 'conn-1',
+          organizationId: 'org-1',
+          encryptedRefreshToken: encrypted(service),
+          lastSyncedAt: new Date(Date.now() - 48 * 60 * 60 * 1000),
+        },
+      ]);
+      prisma.googleBusinessProfileLocation.count.mockResolvedValue(0);
+      const fetchSpy = jest
+        .spyOn(global, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ access_token: 'access' }), {
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ accounts: [] }), { status: 200 }),
+        );
+
+      await service.refreshStaleLocations();
+
+      expect(fetchSpy).toHaveBeenCalled();
+    });
+
+    it('reuses the exact same claim/lease as a manual sync — a connection already claimed is skipped, not forced', async () => {
+      prisma.googleBusinessProfileConnection.findMany.mockResolvedValue([
+        {
+          id: 'conn-1',
+          organizationId: 'org-1',
+          encryptedRefreshToken: encrypted(service),
+          lastSyncedAt: null,
+        },
+      ]);
+      // Simulates a manual sync already holding the claim: the cron's own
+      // claim attempt matches no row.
+      prisma.googleBusinessProfileConnection.updateMany.mockResolvedValueOnce({
+        count: 0,
+      });
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValueOnce({
+        syncClaimedAt: new Date(),
+        lastSyncAttemptAt: new Date(),
+      });
+      const fetchSpy = jest.spyOn(global, 'fetch');
+
+      await expect(service.refreshStaleLocations()).resolves.toBeUndefined();
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it("one connection's failure never stops the batch for the others", async () => {
+      prisma.googleBusinessProfileConnection.findMany.mockResolvedValue([
+        {
+          id: 'conn-1',
+          organizationId: 'org-1',
+          encryptedRefreshToken: encrypted(service),
+          lastSyncedAt: null,
+        },
+        {
+          id: 'conn-2',
+          organizationId: 'org-2',
+          encryptedRefreshToken: encrypted(service),
+          lastSyncedAt: null,
+        },
+      ]);
+      // conn-1's claim fails (already claimed elsewhere); conn-2's claim
+      // succeeds (falls through to the default mockResolvedValue).
+      prisma.googleBusinessProfileConnection.updateMany.mockResolvedValueOnce({
+        count: 0,
+      });
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValueOnce({
+        syncClaimedAt: new Date(),
+        lastSyncAttemptAt: new Date(),
+      });
+      prisma.googleBusinessProfileLocation.count.mockResolvedValue(0);
+      const fetchSpy = jest
+        .spyOn(global, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ access_token: 'access' }), {
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ accounts: [] }), { status: 200 }),
+        );
+
+      await expect(service.refreshStaleLocations()).resolves.toBeUndefined();
+      // Only conn-2 ever reached Google: conn-1's claim rejection happened
+      // before any fetch, and the batch still completed for conn-2.
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // RC-41 — an honest freshness signal instead of silently trusting a
+  // mirror that hasn't been resynced in a while.
+  describe('getStatus staleness', () => {
+    it('reports fresh when last synced recently', async () => {
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        googleAccountEmail: 'owner@example.com',
+        connectedAt: new Date(),
+        lastSyncedAt: new Date(Date.now() - 60 * 60 * 1000),
+        lastSyncAttemptAt: new Date(),
+        lastSyncStatus: 'success',
+        _count: { locations: 2 },
+      });
+      await expect(service.getStatus('org-1')).resolves.toMatchObject({
+        connected: true,
+        stale: false,
+      });
+    });
+
+    it('reports stale when never synced', async () => {
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        googleAccountEmail: 'owner@example.com',
+        connectedAt: new Date(),
+        lastSyncedAt: null,
+        lastSyncAttemptAt: null,
+        lastSyncStatus: 'never',
+        _count: { locations: 0 },
+      });
+      await expect(service.getStatus('org-1')).resolves.toMatchObject({
+        connected: true,
+        stale: true,
+      });
+    });
+
+    it('reports stale once the last sync is older than 24h', async () => {
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        googleAccountEmail: 'owner@example.com',
+        connectedAt: new Date(),
+        lastSyncedAt: new Date(Date.now() - 25 * 60 * 60 * 1000),
+        lastSyncAttemptAt: new Date(),
+        lastSyncStatus: 'success',
+        _count: { locations: 2 },
+      });
+      await expect(service.getStatus('org-1')).resolves.toMatchObject({
+        connected: true,
+        stale: true,
+      });
+    });
+
+    it('is never stale when not connected at all', async () => {
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue(null);
+      await expect(service.getStatus('org-1')).resolves.toMatchObject({
+        connected: false,
+        stale: false,
+      });
+    });
   });
 
   it('deletes the local connection only after Google confirms revocation', async () => {

@@ -110,6 +110,55 @@ leurs autorisations/refresh tokens peuvent expirer après sept jours. Avant
 d'ouvrir ROBIA à des utilisateurs réels, publier l'application depuis l'écran
 Audience et terminer les validations de marque/scopes demandées par Google.
 
+## RC41 — Politique de rétention et resynchronisation automatique
+
+**Suivi clos.** RC40 (avis + performances) avait signalé que la fiche
+établissement RC38 n'avait, à l'inverse des avis, aucune politique
+d'expiration ni de resynchronisation automatique — uniquement un bouton
+« Synchroniser » manuel. Les conditions d'utilisation des Business Profile
+APIs plafonnent le stockage de tout contenu obtenu via ces APIs à **30 jours
+calendaires** (« you cannot ... store any content provided through the
+Business Profile APIs ... except ... no more than 30 calendar days ») — une
+formulation qui ne se limite pas aux avis et couvre a priori aussi les
+données de fiche (adresse, horaires, catégories, téléphone). Une organisation
+qui ne recliquait jamais sur « Synchroniser » pouvait donc conserver une
+copie Google en base indéfiniment, au-delà de ce plafond.
+
+RC41 corrige cela sans migration de schéma, en réutilisant intégralement le
+bail/claim de synchronisation déjà construit pour le bouton manuel
+(`syncClaimedAt`/`syncClaimToken`/`lastSyncAttemptAt` sur
+`GoogleBusinessProfileConnection`) :
+
+- **Resynchronisation planifiée** (`@Cron(EVERY_HOUR)`,
+  `GoogleBusinessProfileService.refreshStaleLocations()`) : toute connexion
+  jamais synchronisée ou dont `lastSyncedAt` dépasse 24h est resynchronisée
+  automatiquement, sans action utilisateur — très en dessous du plafond de 30
+  jours. Le job est un no-op la plupart des heures : il ne resynchronise
+  chaque connexion qu'une fois par jour au plus.
+- **Même bail que la synchronisation manuelle** : le cron appelle exactement
+  le même chemin de code (claim → lecture complète Google → transaction →
+  libération) qu'un clic manuel. Les deux se disputent le même bail — jamais
+  de double appel Google concurrent, jamais de course.
+- **Panne isolée par connexion** : l'échec d'une organisation (jeton révoqué,
+  claim déjà détenu par une synchronisation manuelle en cours, erreur Google
+  transitoire) est journalisé et n'interrompt jamais le traitement des autres
+  organisations dans le même passage du cron.
+- **Signal de fraîcheur honnête** : `GET .../status` expose désormais
+  `stale: boolean` (vrai si `lastSyncedAt` est absent ou dépasse 24h) — pour
+  détecter le cas où la resynchronisation planifiée échoue elle-même de façon
+  persistante, plutôt que de servir silencieusement une donnée vieillissante
+  sans jamais le signaler.
+
+**Réserve** : le texte exact des conditions Google n'a pas pu être relu
+directement depuis l'environnement de développement (accès réseau à
+`developers.google.com` bloqué) — seulement via des résultats de recherche
+qui le citent. À vérifier directement sur
+`developers.google.com/my-business/content/policies` avant toute annonce
+publique. L'implémentation ci-dessus reste correcte dans tous les cas : elle
+ne fait que garantir un rafraîchissement automatique d'une donnée déjà
+resynchronisable, sans aucune perte fonctionnelle si la règle se révèle en
+pratique plus étroite qu'anticipé.
+
 ## Hors périmètre explicite
 
 - création ou modification d'une fiche Google ;

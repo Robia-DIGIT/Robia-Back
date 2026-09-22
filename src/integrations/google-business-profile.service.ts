@@ -28,6 +28,17 @@ const BUSINESS_PROFILE_SCOPE =
 const STATE_MAX_AGE_MS = 10 * 60 * 1000;
 const SYNC_CLAIM_LEASE_MS = 5 * 60 * 1000;
 const SYNC_COOLDOWN_MS = 60 * 1000;
+// RC-41 — same 30-day storage ceiling as RC-40 ("you cannot ... store any
+// content provided through the Business Profile APIs ... except ... no more
+// than 30 calendar days") applies to the location fiche too, not just
+// reviews. Unlike reviews, the fiche was only ever resynced on a manual
+// click, so an organization that never re-clicks keeps a Google-sourced
+// copy indefinitely. A location's mirror counts as stale after this
+// threshold — used both to trigger the automatic scheduled refresh below
+// and to report an honest freshness signal from getStatus() — keeping
+// storage far under Google's ceiling regardless of user action. See
+// docs/RC38_GOOGLE_BUSINESS_PROFILE_READONLY.md.
+const LOCATIONS_STALE_AFTER_MS = 24 * 60 * 60 * 1000;
 // Fields used by ROBIA's extended location-details view. Deliberately
 // excludes relationshipData (chain/parent relationships), serviceItems (a
 // large structured service catalogue only meaningful for a handful of
@@ -325,25 +336,35 @@ export class GoogleBusinessProfileService {
           _count: { select: { locations: true } },
         },
       });
-    return connection
-      ? {
-          connected: true,
-          googleAccountEmail: connection.googleAccountEmail,
-          connectedAt: connection.connectedAt,
-          lastSyncedAt: connection.lastSyncedAt,
-          lastSyncAttemptAt: connection.lastSyncAttemptAt,
-          lastSyncStatus: connection.lastSyncStatus,
-          locationCount: connection._count.locations,
-        }
-      : {
-          connected: false,
-          googleAccountEmail: null,
-          connectedAt: null,
-          lastSyncedAt: null,
-          lastSyncAttemptAt: null,
-          lastSyncStatus: 'never',
-          locationCount: 0,
-        };
+    if (!connection) {
+      return {
+        connected: false,
+        googleAccountEmail: null,
+        connectedAt: null,
+        lastSyncedAt: null,
+        lastSyncAttemptAt: null,
+        lastSyncStatus: 'never',
+        locationCount: 0,
+        stale: false,
+      };
+    }
+    // RC-41 fix — honest freshness signal instead of silently trusting a
+    // mirror that hasn't been resynced in a while. The scheduled refresh
+    // below should keep this false in practice; it only surfaces true if
+    // that refresh has itself been failing (e.g. a revoked token).
+    const stale =
+      !connection.lastSyncedAt ||
+      Date.now() - connection.lastSyncedAt.getTime() > LOCATIONS_STALE_AFTER_MS;
+    return {
+      connected: true,
+      googleAccountEmail: connection.googleAccountEmail,
+      connectedAt: connection.connectedAt,
+      lastSyncedAt: connection.lastSyncedAt,
+      lastSyncAttemptAt: connection.lastSyncAttemptAt,
+      lastSyncStatus: connection.lastSyncStatus,
+      locationCount: connection._count.locations,
+      stale,
+    };
   }
 
   async listLocations(organizationId: string) {
@@ -374,6 +395,18 @@ export class GoogleBusinessProfileService {
         "Google Business Profile n'est pas connecté.",
       );
     }
+    return this.runLocationsSync(connection, organizationId);
+  }
+
+  // RC-41 fix — every Google-facing part of syncLocations() (claim, fetch,
+  // transactional reconciliation, release) extracted so the scheduled
+  // refresh below can drive the exact same logic per connection, instead of
+  // duplicating it. A manual click and the cron always contend for the same
+  // claim/lease — never a torn write from one racing the other.
+  private async runLocationsSync(
+    connection: Prisma.GoogleBusinessProfileConnectionGetPayload<object>,
+    organizationId: string,
+  ) {
     const now = new Date();
     const claimToken = randomUUID();
     const claim = await this.prisma.googleBusinessProfileConnection.updateMany({
@@ -534,6 +567,37 @@ export class GoogleBusinessProfileService {
             this.logger.warn(
               `GBP : impossible de libérer le bail de synchronisation (organization=${organizationId})`,
             ),
+        );
+      }
+    }
+  }
+
+  // RC-41 — automatic scheduled refresh of the location fiche, so an
+  // organization that never re-clicks "Synchroniser" never keeps a
+  // Google-sourced copy in storage indefinitely. Runs hourly but only ever
+  // acts on connections stale for more than LOCATIONS_STALE_AFTER_MS (24h),
+  // so it is a no-op most hours; it drives runLocationsSync() through the
+  // exact same claim/lease as a manual sync, so the two can never race.
+  // One organization's failure (revoked token, transient Google error, or
+  // simply a concurrent manual sync already holding the claim) is logged
+  // and skipped — it must never stop the batch for every other connection.
+  @Cron(CronExpression.EVERY_HOUR)
+  async refreshStaleLocations() {
+    const staleBefore = new Date(Date.now() - LOCATIONS_STALE_AFTER_MS);
+    const connections =
+      await this.prisma.googleBusinessProfileConnection.findMany({
+        where: {
+          OR: [{ lastSyncedAt: null }, { lastSyncedAt: { lt: staleBefore } }],
+        },
+      });
+    for (const connection of connections) {
+      try {
+        await this.runLocationsSync(connection, connection.organizationId);
+      } catch (error) {
+        this.logger.warn(
+          `GBP : resynchronisation planifiée de la fiche ignorée (organization=${connection.organizationId}) : ${
+            error instanceof Error ? error.message : 'erreur inconnue'
+          }`,
         );
       }
     }
