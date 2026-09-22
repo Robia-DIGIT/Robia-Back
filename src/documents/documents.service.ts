@@ -61,7 +61,7 @@ export class DocumentsService {
     if (!website) {
       throw new NotFoundException('Site non trouvé');
     }
-    if (!opportunity && !dto.brief?.objective.trim()) {
+    if (!opportunity && !dto.brief?.objective?.trim()) {
       throw new BadRequestException(
         'Un objectif est requis pour une génération libre',
       );
@@ -86,7 +86,7 @@ export class DocumentsService {
     }
 
     const objective =
-      dto.brief?.objective.trim() || opportunity?.title || 'Contenu local';
+      dto.brief?.objective?.trim() || opportunity?.title || 'Contenu local';
     const description = opportunity?.description ?? objective;
 
     const generated = await this.generator.generate(
@@ -110,7 +110,9 @@ export class DocumentsService {
 
     const brief: Prisma.InputJsonValue | typeof Prisma.DbNull = dto.brief
       ? {
-          objective: dto.brief.objective.trim(),
+          ...(dto.brief.objective?.trim()
+            ? { objective: dto.brief.objective.trim() }
+            : {}),
           ...(dto.brief.audience?.trim()
             ? { audience: dto.brief.audience.trim() }
             : {}),

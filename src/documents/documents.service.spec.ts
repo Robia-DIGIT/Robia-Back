@@ -114,6 +114,44 @@ describe('DocumentsService Content Studio', () => {
     expect(prisma.website.findFirst).not.toHaveBeenCalled();
   });
 
+  it('accepts an opportunity brief without an explicit objective', async () => {
+    const prisma = contextPrisma();
+    prisma.opportunity.findFirst.mockResolvedValue({
+      id: 'opportunity-a',
+      title: 'Optimiser la page locale',
+      description: 'Description',
+      audit: { websiteId: 'website-a' },
+    });
+    prisma.website.findFirst.mockResolvedValue(website);
+    prisma.document.create.mockResolvedValue({ id: 'document-a', revision: 1 });
+    const generator = {
+      generate: jest.fn().mockResolvedValue({
+        title: 'Titre',
+        content: 'Contenu',
+      }),
+    };
+    const service = new DocumentsService(
+      prisma as unknown as PrismaService,
+      generator as unknown as DocumentGeneratorService,
+    );
+
+    await service.generate('org-a', {
+      opportunityId: 'opportunity-a',
+      type: 'local_page',
+      brief: { audience: 'Clients locaux' },
+    });
+
+    expect(generator.generate).toHaveBeenCalledWith(
+      'local_page',
+      'Optimiser la page locale',
+      'Description',
+      expect.objectContaining({
+        objective: 'Optimiser la page locale',
+        audience: 'Clients locaux',
+      }),
+    );
+  });
+
   it('links a document only to a compatible, unclaimed action', async () => {
     const prisma = contextPrisma();
     prisma.website.findFirst.mockResolvedValue(website);

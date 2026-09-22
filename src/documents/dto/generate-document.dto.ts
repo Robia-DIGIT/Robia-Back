@@ -21,10 +21,11 @@ const DOCUMENT_TYPES = [
 ] as const;
 
 export class ContentBriefDto {
+  @IsOptional()
   @IsString()
   @MinLength(3)
   @MaxLength(500)
-  objective!: string;
+  objective?: string;
 
   @IsOptional()
   @IsString()
