@@ -312,3 +312,49 @@ describe('Google Business Profile read-only lifecycle integration', () => {
     expect(connection).toBeNull();
   });
 });
+
+// RC-40 — reviews and performance endpoints are thin wiring: the actual
+// org-scoping and read-only guarantees are covered in the service spec.
+describe('GoogleBusinessProfileController reviews and performance routes', () => {
+  const request = {
+    organizationId: 'org-1',
+    user: { userId: 'user-1', email: 'owner@example.com' },
+  } as never;
+  const service = {
+    listReviews: jest.fn(() => Promise.resolve([{ id: 'review-1' }])),
+    syncReviews: jest.fn(() =>
+      Promise.resolve({ synced: true, reviewCount: 1, syncedAt: new Date() }),
+    ),
+    getPerformanceMetrics: jest.fn(() =>
+      Promise.resolve({ locationId: 'gbp-1', daily: [], summary: {} }),
+    ),
+  };
+  let controller: GoogleBusinessProfileController;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    controller = new GoogleBusinessProfileController(
+      service as unknown as GoogleBusinessProfileService,
+    );
+  });
+
+  it('routes GET reviews to listReviews, scoped by organization and location', async () => {
+    await expect(controller.reviews(request, 'gbp-1')).resolves.toEqual([
+      { id: 'review-1' },
+    ]);
+    expect(service.listReviews).toHaveBeenCalledWith('org-1', 'gbp-1');
+  });
+
+  it('routes POST reviews/sync to syncReviews', async () => {
+    await controller.syncReviews(request, 'gbp-1');
+    expect(service.syncReviews).toHaveBeenCalledWith('org-1', 'gbp-1');
+  });
+
+  it('routes GET performance to getPerformanceMetrics', async () => {
+    await controller.performance(request, 'gbp-1');
+    expect(service.getPerformanceMetrics).toHaveBeenCalledWith(
+      'org-1',
+      'gbp-1',
+    );
+  });
+});

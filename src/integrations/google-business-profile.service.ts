@@ -51,6 +51,36 @@ const LOCATION_READ_MASK = [
   'metadata',
   'profile',
 ].join(',');
+// Reviews remain under the legacy `mybusiness.googleapis.com/v4` surface —
+// Google has not split review read/reply into one of the newer dedicated
+// Business Profile APIs the way it did for accounts/locations/performance.
+// Only listed here for documentation; the URL is built directly per call
+// since v4's path shape (`{account}/{location}/reviews`) doesn't fit a
+// readMask constant. See docs/RC40_GOOGLE_BUSINESS_PROFILE_REVIEWS_
+// PERFORMANCE.md — replying to a review is explicitly out of scope.
+const REVIEWS_PAGE_SIZE = 50;
+const STAR_RATING_VALUES: Record<string, number> = {
+  ONE: 1,
+  TWO: 2,
+  THREE: 3,
+  FOUR: 4,
+  FIVE: 5,
+};
+// The Performance API's own metric identifiers. Deliberately excludes
+// booking/food-order/menu-click metrics (BUSINESS_BOOKINGS,
+// BUSINESS_FOOD_ORDERS, BUSINESS_FOOD_MENU_CLICKS) — meaningful only for a
+// handful of business types and not worth the extra request weight here.
+const PERFORMANCE_METRICS = [
+  'BUSINESS_IMPRESSIONS_DESKTOP_MAPS',
+  'BUSINESS_IMPRESSIONS_DESKTOP_SEARCH',
+  'BUSINESS_IMPRESSIONS_MOBILE_MAPS',
+  'BUSINESS_IMPRESSIONS_MOBILE_SEARCH',
+  'BUSINESS_CONVERSATIONS',
+  'BUSINESS_DIRECTION_REQUESTS',
+  'CALL_CLICKS',
+  'WEBSITE_CLICKS',
+] as const;
+const PERFORMANCE_WINDOW_DAYS = 30;
 
 interface OAuthState {
   organizationId: string;
@@ -110,6 +140,42 @@ interface GoogleLocation {
 interface GoogleLocationsResponse {
   locations?: GoogleLocation[];
   nextPageToken?: string;
+}
+
+interface GoogleReviewReply {
+  comment?: string;
+  updateTime?: string;
+}
+
+interface GoogleReview {
+  name: string;
+  reviewer?: { displayName?: string; profilePhotoUrl?: string };
+  starRating?: string;
+  comment?: string;
+  createTime?: string;
+  updateTime?: string;
+  reviewReply?: GoogleReviewReply;
+}
+
+interface GoogleReviewsResponse {
+  reviews?: GoogleReview[];
+  nextPageToken?: string;
+}
+
+interface GoogleDatedValue {
+  date?: { year?: number; month?: number; day?: number };
+  value?: string;
+}
+
+interface GoogleDailyMetricTimeSeries {
+  dailyMetric?: string;
+  timeSeries?: { datedValues?: GoogleDatedValue[] };
+}
+
+interface GooglePerformanceResponse {
+  multiDailyMetricTimeSeries?: Array<{
+    dailyMetricTimeSeries?: GoogleDailyMetricTimeSeries[];
+  }>;
 }
 
 @Injectable()
@@ -505,6 +571,167 @@ export class GoogleBusinessProfileService {
     });
   }
 
+  // RC-40 — reviews and performance metrics for a single, organization-owned
+  // location. Both read-only: neither ever writes back to Google (replying
+  // to a review, in particular, is an explicit non-goal — see
+  // docs/RC40_GOOGLE_BUSINESS_PROFILE_REVIEWS_PERFORMANCE.md).
+
+  async listReviews(organizationId: string, locationId: string) {
+    await this.findOwnedLocation(organizationId, locationId);
+    return this.prisma.googleBusinessProfileReview.findMany({
+      where: { locationId },
+      orderBy: [{ createTime: 'desc' }, { id: 'asc' }],
+    });
+  }
+
+  async syncReviews(organizationId: string, locationId: string) {
+    const { location, accessToken } = await this.authorizedLocation(
+      organizationId,
+      locationId,
+    );
+    const parent = `${location.googleAccountName}/${location.googleLocationName}`;
+    const reviews: GoogleReview[] = [];
+    let pageToken: string | undefined;
+    do {
+      const url = new URL(
+        `https://mybusiness.googleapis.com/v4/${parent}/reviews`,
+      );
+      url.searchParams.set('pageSize', String(REVIEWS_PAGE_SIZE));
+      if (pageToken) url.searchParams.set('pageToken', pageToken);
+      const response = await this.googleGet<GoogleReviewsResponse>(
+        url.toString(),
+        accessToken,
+      );
+      reviews.push(...(response.reviews ?? []).filter((item) => item.name));
+      pageToken = response.nextPageToken;
+    } while (pageToken);
+
+    // Every page is read before any write, exactly like syncLocations: a
+    // failure halfway through pagination must never delete reviews the
+    // remaining pages hadn't been read yet.
+    const syncedAt = new Date();
+    const observedNames = [...new Set(reviews.map((review) => review.name))];
+    await this.prisma.$transaction(async (tx) => {
+      for (const review of reviews) {
+        await tx.googleBusinessProfileReview.upsert({
+          where: {
+            locationId_googleReviewName: {
+              locationId: location.id,
+              googleReviewName: review.name,
+            },
+          },
+          create: {
+            organizationId,
+            locationId: location.id,
+            ...this.reviewValues(review, syncedAt),
+          },
+          update: this.reviewValues(review, syncedAt),
+        });
+      }
+      await tx.googleBusinessProfileReview.deleteMany({
+        where: {
+          locationId: location.id,
+          ...(observedNames.length
+            ? { googleReviewName: { notIn: observedNames } }
+            : {}),
+        },
+      });
+    });
+    return {
+      synced: true as const,
+      reviewCount: observedNames.length,
+      syncedAt,
+    };
+  }
+
+  async getPerformanceMetrics(organizationId: string, locationId: string) {
+    const { location, accessToken } = await this.authorizedLocation(
+      organizationId,
+      locationId,
+    );
+    const endDate = new Date();
+    endDate.setUTCHours(0, 0, 0, 0);
+    endDate.setUTCDate(endDate.getUTCDate() - 1);
+    const startDate = new Date(endDate);
+    startDate.setUTCDate(
+      startDate.getUTCDate() - (PERFORMANCE_WINDOW_DAYS - 1),
+    );
+
+    const url = new URL(
+      `https://businessprofileperformance.googleapis.com/v1/${location.googleLocationName}:fetchMultiDailyMetricsTimeSeries`,
+    );
+    for (const metric of PERFORMANCE_METRICS) {
+      url.searchParams.append('dailyMetrics', metric);
+    }
+    this.setDatePart(url, 'dailyRange.start_date', startDate);
+    this.setDatePart(url, 'dailyRange.end_date', endDate);
+
+    const response = await this.googleGet<GooglePerformanceResponse>(
+      url.toString(),
+      accessToken,
+    );
+    const byMetric = new Map<string, Map<string, number>>();
+    for (const group of response.multiDailyMetricTimeSeries ?? []) {
+      for (const series of group.dailyMetricTimeSeries ?? []) {
+        if (!series.dailyMetric) continue;
+        const byDate = new Map<string, number>();
+        for (const dated of series.timeSeries?.datedValues ?? []) {
+          const date = this.datePartsToIso(dated.date);
+          if (date) byDate.set(date, Number(dated.value ?? 0));
+        }
+        byMetric.set(series.dailyMetric, byDate);
+      }
+    }
+
+    const dates: string[] = [];
+    for (
+      let cursor = new Date(startDate);
+      cursor.getTime() <= endDate.getTime();
+      cursor.setUTCDate(cursor.getUTCDate() + 1)
+    ) {
+      dates.push(this.formatDate(cursor));
+    }
+    const valueFor = (metric: string, date: string) =>
+      byMetric.get(metric)?.get(date) ?? 0;
+    const daily = dates.map((date) => ({
+      date,
+      impressions:
+        valueFor('BUSINESS_IMPRESSIONS_DESKTOP_MAPS', date) +
+        valueFor('BUSINESS_IMPRESSIONS_DESKTOP_SEARCH', date) +
+        valueFor('BUSINESS_IMPRESSIONS_MOBILE_MAPS', date) +
+        valueFor('BUSINESS_IMPRESSIONS_MOBILE_SEARCH', date),
+      calls: valueFor('CALL_CLICKS', date),
+      websiteClicks: valueFor('WEBSITE_CLICKS', date),
+      directionRequests: valueFor('BUSINESS_DIRECTION_REQUESTS', date),
+      conversations: valueFor('BUSINESS_CONVERSATIONS', date),
+    }));
+    const summary = daily.reduce(
+      (total, day) => ({
+        impressions: total.impressions + day.impressions,
+        calls: total.calls + day.calls,
+        websiteClicks: total.websiteClicks + day.websiteClicks,
+        directionRequests: total.directionRequests + day.directionRequests,
+        conversations: total.conversations + day.conversations,
+      }),
+      {
+        impressions: 0,
+        calls: 0,
+        websiteClicks: 0,
+        directionRequests: 0,
+        conversations: 0,
+      },
+    );
+
+    return {
+      locationId: location.id,
+      startDate: this.formatDate(startDate),
+      endDate: this.formatDate(endDate),
+      summary,
+      daily,
+      syncedAt: new Date(),
+    };
+  }
+
   async disconnect(organizationId: string) {
     const connection =
       await this.prisma.googleBusinessProfileConnection.findUnique({
@@ -572,6 +799,69 @@ export class GoogleBusinessProfileService {
       observedAt: status.lastSyncedAt,
       data: { locationCount: status.locationCount },
     };
+  }
+
+  private async findOwnedLocation(organizationId: string, locationId: string) {
+    const location = await this.prisma.googleBusinessProfileLocation.findFirst({
+      where: { id: locationId, organizationId },
+    });
+    if (!location) throw new NotFoundException('Établissement introuvable.');
+    return location;
+  }
+
+  private async authorizedLocation(organizationId: string, locationId: string) {
+    const location = await this.findOwnedLocation(organizationId, locationId);
+    const connection =
+      await this.prisma.googleBusinessProfileConnection.findUnique({
+        where: { id: location.connectionId },
+      });
+    if (!connection) {
+      throw new NotFoundException(
+        "Google Business Profile n'est pas connecté.",
+      );
+    }
+    const accessToken = await this.refreshAccessToken(
+      this.decrypt(connection.encryptedRefreshToken),
+    );
+    return { location, connection, accessToken };
+  }
+
+  private reviewValues(review: GoogleReview, syncedAt: Date) {
+    return {
+      googleReviewName: review.name,
+      reviewerDisplayName: review.reviewer?.displayName ?? null,
+      reviewerPhotoUri: review.reviewer?.profilePhotoUrl ?? null,
+      starRating: review.starRating
+        ? (STAR_RATING_VALUES[review.starRating] ?? null)
+        : null,
+      comment: review.comment ?? null,
+      createTime: review.createTime ? new Date(review.createTime) : null,
+      updateTime: review.updateTime ? new Date(review.updateTime) : null,
+      replyComment: review.reviewReply?.comment ?? null,
+      replyUpdateTime: review.reviewReply?.updateTime
+        ? new Date(review.reviewReply.updateTime)
+        : null,
+      lastSyncedAt: syncedAt,
+    };
+  }
+
+  private setDatePart(url: URL, prefix: string, date: Date) {
+    url.searchParams.set(`${prefix}.year`, String(date.getUTCFullYear()));
+    url.searchParams.set(`${prefix}.month`, String(date.getUTCMonth() + 1));
+    url.searchParams.set(`${prefix}.day`, String(date.getUTCDate()));
+  }
+
+  private datePartsToIso(date?: {
+    year?: number;
+    month?: number;
+    day?: number;
+  }) {
+    if (!date?.year || !date.month || !date.day) return null;
+    return `${date.year}-${String(date.month).padStart(2, '0')}-${String(date.day).padStart(2, '0')}`;
+  }
+
+  private formatDate(value: Date) {
+    return value.toISOString().slice(0, 10);
   }
 
   private async fetchAccounts(accessToken: string) {

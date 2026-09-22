@@ -79,6 +79,7 @@ model Organization {
   googleSearchConsoleConnection GoogleSearchConsoleConnection?
   googleBusinessProfileConnection GoogleBusinessProfileConnection?
   googleBusinessProfileLocations GoogleBusinessProfileLocation[]
+  googleBusinessProfileReviews GoogleBusinessProfileReview[]
   metaConnection MetaConnection?
   stripeSubscription StripeSubscription?
   automations       Automation[]
@@ -212,11 +213,43 @@ model GoogleBusinessProfileLocation {
   lastSyncedAt       DateTime @map("last_synced_at")
   createdAt          DateTime @default(now()) @map("created_at")
   updatedAt          DateTime @updatedAt @map("updated_at")
+  reviews            GoogleBusinessProfileReview[]
 
   @@unique([connectionId, googleLocationName])
   @@index([organizationId, lastSyncedAt])
   @@index([robiaLocationId])
   @@map("google_business_profile_locations")
+}
+
+// RC-40 — read-only mirror of Business Profile reviews (still `mybusiness.
+// googleapis.com/v4`; Google has not yet split review management into its
+// own dedicated API family). Never written back to Google: replying to a
+// review is an explicit non-goal of this mirror, same as RC-38's stance on
+// the location fiche itself — see docs/RC40_GOOGLE_BUSINESS_PROFILE_
+// REVIEWS_PERFORMANCE.md. `replyComment`/`replyUpdateTime` are Google's own
+// owner reply, mirrored for display only.
+model GoogleBusinessProfileReview {
+  id                  String   @id @default(cuid())
+  organizationId      String   @map("organization_id")
+  organization        Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  locationId          String   @map("location_id")
+  location            GoogleBusinessProfileLocation @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  googleReviewName    String   @map("google_review_name")
+  reviewerDisplayName String?  @map("reviewer_display_name")
+  reviewerPhotoUri    String?  @map("reviewer_photo_uri")
+  starRating          Int?     @map("star_rating") // 1-5, null if Google omits or reports STAR_RATING_UNSPECIFIED
+  comment             String?
+  createTime          DateTime? @map("create_time")
+  updateTime          DateTime? @map("update_time")
+  replyComment        String?  @map("reply_comment")
+  replyUpdateTime     DateTime? @map("reply_update_time")
+  lastSyncedAt        DateTime @map("last_synced_at")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  @@unique([locationId, googleReviewName])
+  @@index([organizationId, locationId])
+  @@map("google_business_profile_reviews")
 }
 
 model MetaConnection {
