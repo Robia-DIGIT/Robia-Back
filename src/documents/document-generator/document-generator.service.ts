@@ -6,6 +6,19 @@ export interface GeneratedDocument {
   content: string;
 }
 
+export interface DocumentGenerationContext {
+  organizationName: string;
+  sector?: string | null;
+  city?: string | null;
+  country?: string | null;
+  websiteUrl: string;
+  objective: string;
+  audience?: string;
+  tone?: string;
+  locale?: string;
+  userProvidedFacts: string[];
+}
+
 @Injectable()
 export class DocumentGeneratorService {
   private readonly aiEngineUrl: string;
@@ -20,6 +33,7 @@ export class DocumentGeneratorService {
     type: string,
     opportunityTitle: string,
     opportunityDescription: string,
+    context: DocumentGenerationContext,
   ): Promise<GeneratedDocument> {
     const response = await fetch(`${this.aiEngineUrl}/documents`, {
       method: 'POST',
@@ -28,6 +42,18 @@ export class DocumentGeneratorService {
         type,
         opportunity_title: opportunityTitle,
         opportunity_description: opportunityDescription,
+        context: {
+          organization_name: context.organizationName,
+          sector: context.sector,
+          city: context.city,
+          country: context.country,
+          website_url: context.websiteUrl,
+          objective: context.objective,
+          audience: context.audience,
+          tone: context.tone,
+          locale: context.locale,
+          user_provided_facts: context.userProvidedFacts,
+        },
       }),
     });
 

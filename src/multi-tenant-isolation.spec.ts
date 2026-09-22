@@ -351,10 +351,9 @@ describe('Multi-tenant isolation (RC-16)', () => {
         {} as unknown as DocumentGeneratorService,
       );
 
-      const result = await service.findAllByOpportunity(
-        orgA,
-        'opportunity-org-b',
-      );
+      const result = await service.findAll(orgA, {
+        opportunityId: 'opportunity-org-b',
+      });
 
       expect(result).toEqual([]);
       expect(prisma.document.findMany).toHaveBeenCalledWith(

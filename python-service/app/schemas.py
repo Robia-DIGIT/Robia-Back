@@ -226,10 +226,24 @@ class GeneratedOpportunity(BaseModel):
     recommended_steps: list[str] = Field(default_factory=list)
 
 
+class DocumentContext(BaseModel):
+    organization_name: str
+    sector: Optional[str] = None
+    city: Optional[str] = None
+    country: Optional[str] = None
+    website_url: str
+    objective: str
+    audience: Optional[str] = None
+    tone: Optional[str] = None
+    locale: Optional[str] = None
+    user_provided_facts: list[str] = Field(default_factory=list)
+
+
 class DocumentRequest(BaseModel):
     type: str
     opportunity_title: str
     opportunity_description: str
+    context: DocumentContext
 
 
 class GeneratedDocument(BaseModel):
@@ -244,4 +258,3 @@ class ActionRequest(BaseModel):
 
 class GeneratedAction(BaseModel):
     title: str
-

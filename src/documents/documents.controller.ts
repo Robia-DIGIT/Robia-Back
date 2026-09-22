@@ -33,12 +33,13 @@ export class DocumentsController {
   @Get()
   findAllByOpportunity(
     @Req() req: ScopedRequest,
-    @Query('opportunity_id') opportunityId: string,
+    @Query('opportunity_id') opportunityId?: string,
+    @Query('website_id') websiteId?: string,
   ) {
-    return this.documentsService.findAllByOpportunity(
-      req.organizationId,
+    return this.documentsService.findAll(req.organizationId, {
       opportunityId,
-    );
+      websiteId,
+    });
   }
 
   @Get(':id')

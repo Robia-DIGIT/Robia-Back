@@ -40,13 +40,14 @@ def run_document_generation(
     document_type: str,
     opportunity_title: str,
     opportunity_description: str,
+    context: dict,
 ) -> dict:
     """
     Point d'entrée unique pour la génération de documents via LLM.
     Retourne un dict respectant exactement le contrat GeneratedDocument.
     """
     return generate_document_content(
-        document_type, opportunity_title, opportunity_description
+        document_type, opportunity_title, opportunity_description, context
     )
 
 
