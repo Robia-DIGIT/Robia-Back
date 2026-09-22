@@ -2,6 +2,9 @@ import { ConfigService } from '@nestjs/config';
 import {
   BadGatewayException,
   ConflictException,
+  HttpException,
+  HttpStatus,
+  Logger,
   NotFoundException,
   ServiceUnavailableException,
   UnauthorizedException,
@@ -37,10 +40,17 @@ describe('GoogleBusinessProfileService', () => {
     googleBusinessProfileLocation: {
       findMany: jest.Mock;
       findFirst: jest.Mock;
+      findUnique: jest.Mock;
       upsert: jest.Mock;
       update: jest.Mock;
+      updateMany: jest.Mock;
       deleteMany: jest.Mock;
       count: jest.Mock;
+    };
+    googleBusinessProfileReview: {
+      findMany: jest.Mock;
+      upsert: jest.Mock;
+      deleteMany: jest.Mock;
     };
   };
   let service: GoogleBusinessProfileService;
@@ -60,10 +70,17 @@ describe('GoogleBusinessProfileService', () => {
       googleBusinessProfileLocation: {
         findMany: jest.fn(),
         findFirst: jest.fn(),
+        findUnique: jest.fn(),
         upsert: jest.fn(),
         update: jest.fn(),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
         deleteMany: jest.fn(),
         count: jest.fn(),
+      },
+      googleBusinessProfileReview: {
+        findMany: jest.fn(),
+        upsert: jest.fn(),
+        deleteMany: jest.fn(),
       },
     };
     prisma.$transaction.mockImplementation(
@@ -952,6 +969,939 @@ describe('GoogleBusinessProfileService', () => {
     expect(prisma.location.findFirst).toHaveBeenCalledWith({
       where: { id: 'location-org-2', organizationId: 'org-1' },
       select: { id: true },
+    });
+  });
+
+  // RC-40 fix — reviews, read-only mirror per location, with a strict
+  // <30-day retention window (never recomputing Google's own aggregate).
+  describe('listReviews', () => {
+    it('rejects a location that does not belong to this organization', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(null);
+      await expect(
+        service.listReviews('org-1', 'gbp-1'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(
+        prisma.googleBusinessProfileReview.findMany,
+      ).not.toHaveBeenCalled();
+    });
+
+    it('never returns an expired review, filtering strictly by expiresAt even before the purge cron runs', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue({
+        id: 'gbp-1',
+        organizationId: 'org-1',
+        reviewsAverageRating: null,
+        reviewsTotalReviewCount: null,
+        reviewsLastSyncedAt: null,
+        reviewsCacheExpiresAt: null,
+      });
+      prisma.googleBusinessProfileReview.findMany.mockResolvedValue([]);
+      await service.listReviews('org-1', 'gbp-1');
+      const [args] = callArgs<{
+        where: { locationId: string; expiresAt: { gt: Date } };
+      }>(prisma.googleBusinessProfileReview.findMany);
+      expect(args.where.locationId).toBe('gbp-1');
+      expect(args.where.expiresAt.gt).toBeInstanceOf(Date);
+    });
+
+    it('never selects googleReviewName, organizationId, locationId, or claim tokens for the API response', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue({
+        id: 'gbp-1',
+        organizationId: 'org-1',
+        reviewsAverageRating: null,
+        reviewsTotalReviewCount: null,
+        reviewsLastSyncedAt: null,
+        reviewsCacheExpiresAt: null,
+      });
+      prisma.googleBusinessProfileReview.findMany.mockResolvedValue([]);
+      await service.listReviews('org-1', 'gbp-1');
+      const [args] = callArgs<{ select: Record<string, unknown> }>(
+        prisma.googleBusinessProfileReview.findMany,
+      );
+      // googleReviewName is Google's internal resource name, kept in the DB
+      // only as the upsert idempotency key — never selected for the API.
+      expect(args.select).not.toHaveProperty('googleReviewName');
+      expect(args.select).not.toHaveProperty('organizationId');
+      expect(args.select).not.toHaveProperty('locationId');
+      for (const key of Object.keys(args.select)) {
+        expect(key.toLowerCase()).not.toContain('claim');
+      }
+    });
+
+    it("returns Google's own averageRating/totalReviewCount from a still-valid cache, never recomputed from the stored reviews", async () => {
+      const lastSyncedAt = new Date();
+      const expiresAt = new Date(Date.now() + 60_000);
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue({
+        id: 'gbp-1',
+        organizationId: 'org-1',
+        reviewsAverageRating: 4.7,
+        reviewsTotalReviewCount: 25,
+        reviewsLastSyncedAt: lastSyncedAt,
+        reviewsCacheExpiresAt: expiresAt,
+      });
+      prisma.googleBusinessProfileReview.findMany.mockResolvedValue([
+        { id: 'r1', starRating: 5 },
+        { id: 'r2', starRating: 1 },
+      ]);
+      // 4.7 comes straight from Google; a naive recomputation from the two
+      // stored star ratings above would wrongly yield 3.
+      await expect(service.listReviews('org-1', 'gbp-1')).resolves.toEqual({
+        reviews: [
+          { id: 'r1', starRating: 5 },
+          { id: 'r2', starRating: 1 },
+        ],
+        averageRating: 4.7,
+        totalReviewCount: 25,
+        lastSyncedAt,
+        expiresAt,
+      });
+    });
+
+    it('reports an honest never-synced/expired state instead of serving a stale aggregate', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue({
+        id: 'gbp-1',
+        organizationId: 'org-1',
+        reviewsAverageRating: 4.7,
+        reviewsTotalReviewCount: 25,
+        reviewsLastSyncedAt: new Date(Date.now() - 100_000),
+        reviewsCacheExpiresAt: new Date(Date.now() - 1_000),
+      });
+      prisma.googleBusinessProfileReview.findMany.mockResolvedValue([]);
+      await expect(service.listReviews('org-1', 'gbp-1')).resolves.toEqual({
+        reviews: [],
+        averageRating: null,
+        totalReviewCount: null,
+        lastSyncedAt: null,
+        expiresAt: null,
+      });
+    });
+  });
+
+  describe('purgeExpiredReviews', () => {
+    it('deletes every review whose retention window has passed', async () => {
+      prisma.googleBusinessProfileReview.deleteMany.mockResolvedValue({
+        count: 4,
+      });
+      await service.purgeExpiredReviews();
+      const [args] = callArgs<{ where: { expiresAt: { lte: Date } } }>(
+        prisma.googleBusinessProfileReview.deleteMany,
+      );
+      expect(args.where.expiresAt.lte).toBeInstanceOf(Date);
+    });
+
+    it('logs nothing when there is nothing to purge', async () => {
+      prisma.googleBusinessProfileReview.deleteMany.mockResolvedValue({
+        count: 0,
+      });
+      const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation();
+      await service.purgeExpiredReviews();
+      expect(logSpy).not.toHaveBeenCalled();
+      logSpy.mockRestore();
+    });
+  });
+
+  describe('syncReviews', () => {
+    const owningLocation = {
+      id: 'gbp-1',
+      organizationId: 'org-1',
+      connectionId: 'conn-1',
+      googleAccountName: 'accounts/123',
+      googleLocationName: 'locations/456',
+    };
+    const encrypted = () =>
+      (service as unknown as { encrypt(value: string): string }).encrypt(
+        'refresh',
+      );
+
+    it('rejects a location from another organization before contacting Google', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(null);
+      const fetchSpy = jest.spyOn(global, 'fetch');
+      await expect(
+        service.syncReviews('org-1', 'gbp-1'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it('rejects a concurrent synchronization before making any Google request', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(
+        owningLocation,
+      );
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        encryptedRefreshToken: encrypted(),
+      });
+      prisma.googleBusinessProfileLocation.updateMany.mockResolvedValueOnce({
+        count: 0,
+      });
+      prisma.googleBusinessProfileLocation.findUnique.mockResolvedValueOnce({
+        reviewsSyncClaimedAt: new Date(),
+        reviewsLastSyncAttemptAt: new Date(),
+      });
+      const fetchSpy = jest.spyOn(global, 'fetch');
+
+      await expect(
+        service.syncReviews('org-1', 'gbp-1'),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it('enforces a cooldown after a recent synchronization attempt', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(
+        owningLocation,
+      );
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        encryptedRefreshToken: encrypted(),
+      });
+      prisma.googleBusinessProfileLocation.updateMany.mockResolvedValueOnce({
+        count: 0,
+      });
+      prisma.googleBusinessProfileLocation.findUnique.mockResolvedValueOnce({
+        reviewsSyncClaimedAt: null,
+        reviewsLastSyncAttemptAt: new Date(),
+      });
+      const fetchSpy = jest.spyOn(global, 'fetch');
+
+      const error = await service
+        .syncReviews('org-1', 'gbp-1')
+        .catch((thrown: unknown) => thrown);
+      expect(error).toBeInstanceOf(HttpException);
+      expect((error as HttpException).getStatus()).toBe(
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it('recovers a synchronization whose claim lease expired after a crash', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(
+        owningLocation,
+      );
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        encryptedRefreshToken: encrypted(),
+      });
+      prisma.googleBusinessProfileReview.deleteMany.mockResolvedValue({
+        count: 0,
+      });
+      jest
+        .spyOn(global, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ access_token: 'access' }), {
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ reviews: [] }), { status: 200 }),
+        );
+
+      await expect(
+        service.syncReviews('org-1', 'gbp-1'),
+      ).resolves.toMatchObject({ synced: true, reviewCount: 0 });
+
+      const [claimArgs] = callArgs<{
+        where: {
+          OR: [
+            { reviewsSyncClaimedAt: null },
+            { reviewsSyncClaimedAt: { lt: Date } },
+          ];
+        };
+      }>(prisma.googleBusinessProfileLocation.updateMany);
+      expect(claimArgs.where.OR[0]).toEqual({ reviewsSyncClaimedAt: null });
+      expect(claimArgs.where.OR[1].reviewsSyncClaimedAt.lt).toBeInstanceOf(
+        Date,
+      );
+    });
+
+    it('paginates every review, preserves Google’s own averageRating/totalReviewCount, and computes a 24h expiry', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(
+        owningLocation,
+      );
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        encryptedRefreshToken: encrypted(),
+      });
+      prisma.googleBusinessProfileReview.upsert.mockResolvedValue({});
+      prisma.googleBusinessProfileReview.deleteMany.mockResolvedValue({
+        count: 1,
+      });
+      jest
+        .spyOn(global, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ access_token: 'access' }), {
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              reviews: [
+                {
+                  name: 'accounts/123/locations/456/reviews/r1',
+                  reviewer: {
+                    displayName: 'Client Satisfait',
+                    profilePhotoUrl: 'https://example.com/p.jpg',
+                  },
+                  starRating: 'FIVE',
+                  comment: 'Excellent service',
+                  createTime: '2026-09-01T10:00:00Z',
+                  updateTime: '2026-09-01T10:00:00Z',
+                  reviewReply: {
+                    comment: 'Merci !',
+                    updateTime: '2026-09-02T10:00:00Z',
+                  },
+                },
+              ],
+              averageRating: 4.5,
+              totalReviewCount: 12,
+              nextPageToken: 'page-2',
+            }),
+            { status: 200 },
+          ),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              reviews: [
+                {
+                  name: 'accounts/123/locations/456/reviews/r2',
+                  starRating: 'STAR_RATING_UNSPECIFIED',
+                },
+              ],
+              // Second page omits the aggregate — the last known value from
+              // an earlier page must be kept, not overwritten with nothing.
+            }),
+            { status: 200 },
+          ),
+        );
+
+      const result = await service.syncReviews('org-1', 'gbp-1');
+      expect(result).toMatchObject({
+        synced: true,
+        reviewCount: 2,
+        averageRating: 4.5,
+        totalReviewCount: 12,
+      });
+      expect(result.expiresAt.getTime() - result.syncedAt.getTime()).toBe(
+        24 * 60 * 60 * 1000,
+      );
+
+      const [firstCall] = callArgs<{
+        where: {
+          locationId_googleReviewName: {
+            locationId: string;
+            googleReviewName: string;
+          };
+        };
+        create: Record<string, unknown>;
+      }>(prisma.googleBusinessProfileReview.upsert);
+      expect(firstCall.where.locationId_googleReviewName).toEqual({
+        locationId: 'gbp-1',
+        googleReviewName: 'accounts/123/locations/456/reviews/r1',
+      });
+      expect(firstCall.create).toMatchObject({
+        organizationId: 'org-1',
+        locationId: 'gbp-1',
+        reviewerDisplayName: 'Client Satisfait',
+        starRating: 5,
+        comment: 'Excellent service',
+        replyComment: 'Merci !',
+      });
+      expect(firstCall.create).not.toHaveProperty('reviewerPhotoUri');
+      expect(firstCall.create.expiresAt).toBeInstanceOf(Date);
+
+      const [secondCall] = callArgs<{ create: Record<string, unknown> }>(
+        prisma.googleBusinessProfileReview.upsert,
+      ).slice(1);
+      expect(secondCall.create).toMatchObject({ starRating: null });
+
+      expect(
+        prisma.googleBusinessProfileReview.deleteMany,
+      ).toHaveBeenCalledWith({
+        where: {
+          locationId: 'gbp-1',
+          googleReviewName: {
+            notIn: [
+              'accounts/123/locations/456/reviews/r1',
+              'accounts/123/locations/456/reviews/r2',
+            ],
+          },
+        },
+      });
+
+      const releaseArgs = callArgs<{
+        where: { id: string; reviewsSyncClaimToken: string };
+        data: {
+          reviewsAverageRating: number;
+          reviewsTotalReviewCount: number;
+          reviewsCacheExpiresAt: Date;
+          reviewsSyncStatus: string;
+        };
+      }>(prisma.googleBusinessProfileLocation.updateMany).at(-1);
+      expect(releaseArgs).toMatchObject({
+        where: { id: 'gbp-1' },
+        data: {
+          reviewsAverageRating: 4.5,
+          reviewsTotalReviewCount: 12,
+          reviewsSyncStatus: 'success',
+        },
+      });
+    });
+
+    it('handles a fully-synced establishment with zero reviews correctly', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(
+        owningLocation,
+      );
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        encryptedRefreshToken: encrypted(),
+      });
+      prisma.googleBusinessProfileReview.deleteMany.mockResolvedValue({
+        count: 3,
+      });
+      jest
+        .spyOn(global, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ access_token: 'access' }), {
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              reviews: [],
+              averageRating: 0,
+              totalReviewCount: 0,
+            }),
+            { status: 200 },
+          ),
+        );
+
+      await expect(
+        service.syncReviews('org-1', 'gbp-1'),
+      ).resolves.toMatchObject({
+        synced: true,
+        reviewCount: 0,
+        averageRating: 0,
+        totalReviewCount: 0,
+      });
+      expect(prisma.googleBusinessProfileReview.upsert).not.toHaveBeenCalled();
+      expect(
+        prisma.googleBusinessProfileReview.deleteMany,
+      ).toHaveBeenCalledWith({ where: { locationId: 'gbp-1' } });
+    });
+
+    it('writes nothing when Google pagination fails midway', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(
+        owningLocation,
+      );
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        encryptedRefreshToken: encrypted(),
+      });
+      jest
+        .spyOn(global, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ access_token: 'access' }), {
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              reviews: [{ name: 'accounts/123/locations/456/reviews/r1' }],
+              nextPageToken: 'page-2',
+            }),
+            { status: 200 },
+          ),
+        )
+        .mockResolvedValueOnce(new Response('{}', { status: 503 }));
+
+      await expect(
+        service.syncReviews('org-1', 'gbp-1'),
+      ).rejects.toBeInstanceOf(BadGatewayException);
+      expect(prisma.googleBusinessProfileReview.upsert).not.toHaveBeenCalled();
+      expect(
+        prisma.googleBusinessProfileReview.deleteMany,
+      ).not.toHaveBeenCalled();
+
+      const releaseArgs = callArgs<{
+        where: { id: string; reviewsSyncClaimToken: string };
+        data: {
+          reviewsSyncClaimedAt: null;
+          reviewsSyncClaimToken: null;
+          reviewsSyncStatus: string;
+        };
+      }>(prisma.googleBusinessProfileLocation.updateMany).at(-1);
+      expect(releaseArgs).toMatchObject({
+        where: { id: 'gbp-1' },
+        data: {
+          reviewsSyncClaimedAt: null,
+          reviewsSyncClaimToken: null,
+          reviewsSyncStatus: 'failed',
+        },
+      });
+      expect(typeof releaseArgs?.where.reviewsSyncClaimToken).toBe('string');
+    });
+
+    it('ignores a fully fetched result when the worker lost its claim before commit', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(
+        owningLocation,
+      );
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        encryptedRefreshToken: encrypted(),
+      });
+      prisma.googleBusinessProfileLocation.updateMany
+        .mockResolvedValueOnce({ count: 1 })
+        .mockResolvedValueOnce({ count: 0 })
+        .mockResolvedValueOnce({ count: 0 });
+      jest
+        .spyOn(global, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ access_token: 'access' }), {
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              reviews: [{ name: 'accounts/123/locations/456/reviews/r1' }],
+            }),
+            { status: 200 },
+          ),
+        );
+
+      await expect(
+        service.syncReviews('org-1', 'gbp-1'),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(prisma.googleBusinessProfileReview.upsert).not.toHaveBeenCalled();
+      expect(
+        prisma.googleBusinessProfileReview.deleteMany,
+      ).not.toHaveBeenCalled();
+    });
+
+    it('never logs the OAuth access token or review content', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(
+        owningLocation,
+      );
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        encryptedRefreshToken: encrypted(),
+      });
+      prisma.googleBusinessProfileReview.upsert.mockResolvedValue({});
+      prisma.googleBusinessProfileReview.deleteMany.mockResolvedValue({
+        count: 0,
+      });
+      const secretToken = 'super-secret-access-token-value';
+      const secretComment =
+        'This review contains a very private complaint about staff.';
+      jest
+        .spyOn(global, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ access_token: secretToken }), {
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              reviews: [
+                {
+                  name: 'accounts/123/locations/456/reviews/r1',
+                  comment: secretComment,
+                },
+              ],
+            }),
+            { status: 200 },
+          ),
+        );
+      const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation();
+      const warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+      const errorSpy = jest
+        .spyOn(Logger.prototype, 'error')
+        .mockImplementation();
+
+      await service.syncReviews('org-1', 'gbp-1');
+
+      const everythingLogged = JSON.stringify([
+        ...logSpy.mock.calls,
+        ...warnSpy.mock.calls,
+        ...errorSpy.mock.calls,
+      ]);
+      expect(everythingLogged).not.toContain(secretToken);
+      expect(everythingLogged).not.toContain(secretComment);
+      logSpy.mockRestore();
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    });
+  });
+
+  describe('getPerformanceMetrics', () => {
+    const owningLocation = {
+      id: 'gbp-1',
+      organizationId: 'org-1',
+      connectionId: 'conn-1',
+      googleAccountName: 'accounts/123',
+      googleLocationName: 'locations/456',
+    };
+    const encrypted = () =>
+      (service as unknown as { encrypt(value: string): string }).encrypt(
+        'refresh',
+      );
+
+    it('rejects a location from another organization before contacting Google', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(null);
+      const fetchSpy = jest.spyOn(global, 'fetch');
+      await expect(
+        service.getPerformanceMetrics('org-1', 'gbp-1'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it('rejects a concurrent performance read before contacting Google', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(
+        owningLocation,
+      );
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        encryptedRefreshToken: encrypted(),
+      });
+      prisma.googleBusinessProfileLocation.updateMany.mockResolvedValueOnce({
+        count: 0,
+      });
+      prisma.googleBusinessProfileLocation.findUnique.mockResolvedValueOnce({
+        performanceClaimedAt: new Date(),
+        performanceLastAttemptAt: new Date(),
+      });
+      const fetchSpy = jest.spyOn(global, 'fetch');
+
+      await expect(
+        service.getPerformanceMetrics('org-1', 'gbp-1'),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it('enforces a cooldown after a recent performance read attempt', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(
+        owningLocation,
+      );
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        encryptedRefreshToken: encrypted(),
+      });
+      prisma.googleBusinessProfileLocation.updateMany.mockResolvedValueOnce({
+        count: 0,
+      });
+      prisma.googleBusinessProfileLocation.findUnique.mockResolvedValueOnce({
+        performanceClaimedAt: null,
+        performanceLastAttemptAt: new Date(),
+      });
+      const fetchSpy = jest.spyOn(global, 'fetch');
+
+      const error = await service
+        .getPerformanceMetrics('org-1', 'gbp-1')
+        .catch((thrown: unknown) => thrown);
+      expect(error).toBeInstanceOf(HttpException);
+      expect((error as HttpException).getStatus()).toBe(
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it('recovers a performance read whose claim lease expired after a crash', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(
+        owningLocation,
+      );
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        encryptedRefreshToken: encrypted(),
+      });
+      jest
+        .spyOn(global, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ access_token: 'access' }), {
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({}), { status: 200 }),
+        );
+
+      await expect(
+        service.getPerformanceMetrics('org-1', 'gbp-1'),
+      ).resolves.toMatchObject({ locationId: 'gbp-1' });
+
+      const [claimArgs] = callArgs<{
+        where: {
+          OR: [
+            { performanceClaimedAt: null },
+            { performanceClaimedAt: { lt: Date } },
+          ];
+        };
+      }>(prisma.googleBusinessProfileLocation.updateMany);
+      expect(claimArgs.where.OR[0]).toEqual({ performanceClaimedAt: null });
+      expect(claimArgs.where.OR[1].performanceClaimedAt.lt).toBeInstanceOf(
+        Date,
+      );
+    });
+
+    it('detects a lost claim before trusting a successful result, and never touches the new claimant’s token', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(
+        owningLocation,
+      );
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        encryptedRefreshToken: encrypted(),
+      });
+      // Worker A's initial claim succeeds. By the time A's Google call
+      // returns, worker B has already reclaimed this location (A's lease
+      // expired mid-flight), so A's release — scoped to A's own claim
+      // token — matches no row.
+      prisma.googleBusinessProfileLocation.updateMany
+        .mockResolvedValueOnce({ count: 1 }) // A's claim
+        .mockResolvedValueOnce({ count: 0 }); // A's release: B owns it now
+      jest
+        .spyOn(global, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ access_token: 'access' }), {
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({}), { status: 200 }),
+        );
+
+      await expect(
+        service.getPerformanceMetrics('org-1', 'gbp-1'),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      const calls = callArgs<{
+        data?: { performanceClaimToken?: string };
+        where: { performanceClaimToken?: string };
+      }>(prisma.googleBusinessProfileLocation.updateMany);
+      const claimToken = calls[0]?.data?.performanceClaimToken;
+      expect(typeof claimToken).toBe('string');
+      // Every release attempt (the failed one and the finally-block retry)
+      // is scoped to A's own token — it can never match B's differently
+      // random token, so B's claim is left untouched.
+      for (const call of calls.slice(1)) {
+        expect(call.where.performanceClaimToken).toBe(claimToken);
+      }
+    });
+
+    it('releases its claim after a failed Google request so a later read can proceed', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(
+        owningLocation,
+      );
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        encryptedRefreshToken: encrypted(),
+      });
+      jest
+        .spyOn(global, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ access_token: 'access' }), {
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(new Response('{}', { status: 503 }));
+
+      await expect(
+        service.getPerformanceMetrics('org-1', 'gbp-1'),
+      ).rejects.toBeInstanceOf(BadGatewayException);
+
+      const releaseArgs = callArgs<{
+        where: { id: string; performanceClaimToken: string };
+        data: { performanceClaimedAt: null; performanceClaimToken: null };
+      }>(prisma.googleBusinessProfileLocation.updateMany).at(-1);
+      expect(releaseArgs).toMatchObject({
+        where: { id: 'gbp-1' },
+        data: { performanceClaimedAt: null, performanceClaimToken: null },
+      });
+    });
+
+    it('requests every tracked metric over a 30-day window and aggregates the response', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(
+        owningLocation,
+      );
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        encryptedRefreshToken: encrypted(),
+      });
+      let requestedUrl: URL | undefined;
+      jest
+        .spyOn(global, 'fetch')
+        .mockImplementationOnce(() =>
+          Promise.resolve(
+            new Response(JSON.stringify({ access_token: 'access' }), {
+              status: 200,
+            }),
+          ),
+        )
+        .mockImplementationOnce((input: string) => {
+          requestedUrl = new URL(input);
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                multiDailyMetricTimeSeries: [
+                  {
+                    dailyMetricTimeSeries: [
+                      {
+                        dailyMetric: 'CALL_CLICKS',
+                        timeSeries: {
+                          datedValues: [
+                            {
+                              date: { year: 2026, month: 9, day: 1 },
+                              value: '3',
+                            },
+                          ],
+                        },
+                      },
+                      {
+                        dailyMetric: 'WEBSITE_CLICKS',
+                        timeSeries: {
+                          datedValues: [
+                            {
+                              date: { year: 2026, month: 9, day: 1 },
+                              value: '7',
+                            },
+                          ],
+                        },
+                      },
+                    ],
+                  },
+                ],
+              }),
+              { status: 200 },
+            ),
+          );
+        });
+
+      const result = await service.getPerformanceMetrics('org-1', 'gbp-1');
+
+      expect(requestedUrl?.pathname).toContain(
+        'locations/456:fetchMultiDailyMetricsTimeSeries',
+      );
+      expect(requestedUrl?.searchParams.getAll('dailyMetrics')).toEqual([
+        'BUSINESS_IMPRESSIONS_DESKTOP_MAPS',
+        'BUSINESS_IMPRESSIONS_DESKTOP_SEARCH',
+        'BUSINESS_IMPRESSIONS_MOBILE_MAPS',
+        'BUSINESS_IMPRESSIONS_MOBILE_SEARCH',
+        'BUSINESS_CONVERSATIONS',
+        'BUSINESS_DIRECTION_REQUESTS',
+        'CALL_CLICKS',
+        'WEBSITE_CLICKS',
+      ]);
+      expect(result.summary.calls).toBe(3);
+      expect(result.summary.websiteClicks).toBe(7);
+      expect(result.daily).toHaveLength(30);
+      expect(
+        result.daily.find((day) => day.date === '2026-09-01'),
+      ).toMatchObject({ calls: 3, websiteClicks: 7 });
+    });
+
+    it('sums multiple DailyMetricTimeSeries for the same metric and date instead of overwriting', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(
+        owningLocation,
+      );
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        encryptedRefreshToken: encrypted(),
+      });
+      jest
+        .spyOn(global, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ access_token: 'access' }), {
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              multiDailyMetricTimeSeries: [
+                {
+                  // Google can split the same dailyMetric across several
+                  // series (e.g. different dailySubEntityType) — both
+                  // report CALL_CLICKS on the same date and must be added,
+                  // not have the second overwrite the first.
+                  dailyMetricTimeSeries: [
+                    {
+                      dailyMetric: 'CALL_CLICKS',
+                      timeSeries: {
+                        datedValues: [
+                          {
+                            date: { year: 2026, month: 9, day: 1 },
+                            value: '3',
+                          },
+                        ],
+                      },
+                    },
+                    {
+                      dailyMetric: 'CALL_CLICKS',
+                      timeSeries: {
+                        datedValues: [
+                          {
+                            date: { year: 2026, month: 9, day: 1 },
+                            value: '4',
+                          },
+                        ],
+                      },
+                    },
+                    {
+                      dailyMetric: 'WEBSITE_CLICKS',
+                      timeSeries: {
+                        datedValues: [
+                          {
+                            date: { year: 2026, month: 9, day: 1 },
+                            value: 'not-a-number',
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              ],
+            }),
+            { status: 200 },
+          ),
+        );
+
+      const result = await service.getPerformanceMetrics('org-1', 'gbp-1');
+
+      const day = result.daily.find((entry) => entry.date === '2026-09-01');
+      expect(day).toMatchObject({ calls: 7, websiteClicks: 0 });
+      expect(Number.isNaN(day?.websiteClicks)).toBe(false);
+      expect(result.summary.calls).toBe(7);
+      expect(result.summary.websiteClicks).toBe(0);
+    });
+
+    it('reports every day as zero when Google returns no time series at all', async () => {
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(
+        owningLocation,
+      );
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        encryptedRefreshToken: encrypted(),
+      });
+      jest
+        .spyOn(global, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ access_token: 'access' }), {
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({}), { status: 200 }),
+        );
+
+      const result = await service.getPerformanceMetrics('org-1', 'gbp-1');
+      expect(result.summary).toEqual({
+        impressions: 0,
+        calls: 0,
+        websiteClicks: 0,
+        directionRequests: 0,
+        conversations: 0,
+      });
+      expect(result.daily.every((day) => day.impressions === 0)).toBe(true);
     });
   });
 });

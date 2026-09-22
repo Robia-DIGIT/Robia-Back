@@ -141,6 +141,27 @@ export class GoogleBusinessProfileController {
     return this.businessProfile.unlinkLocation(request.organizationId, id);
   }
 
+  @Get('locations/:id/reviews')
+  @UseGuards(JwtAuthGuard, OrgScopeGuard)
+  reviews(@Req() request: ScopedRequest, @Param('id') id: string) {
+    return this.businessProfile.listReviews(request.organizationId, id);
+  }
+
+  @Post('locations/:id/reviews/sync')
+  @UseGuards(JwtAuthGuard, OrgScopeGuard)
+  syncReviews(@Req() request: ScopedRequest, @Param('id') id: string) {
+    return this.businessProfile.syncReviews(request.organizationId, id);
+  }
+
+  @Get('locations/:id/performance')
+  @UseGuards(JwtAuthGuard, OrgScopeGuard)
+  performance(@Req() request: ScopedRequest, @Param('id') id: string) {
+    return this.businessProfile.getPerformanceMetrics(
+      request.organizationId,
+      id,
+    );
+  }
+
   @Delete()
   @UseGuards(JwtAuthGuard, OrgScopeGuard)
   disconnect(@Req() request: ScopedRequest) {

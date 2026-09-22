@@ -79,6 +79,7 @@ model Organization {
   googleSearchConsoleConnection GoogleSearchConsoleConnection?
   googleBusinessProfileConnection GoogleBusinessProfileConnection?
   googleBusinessProfileLocations GoogleBusinessProfileLocation[]
+  googleBusinessProfileReviews GoogleBusinessProfileReview[]
   metaConnection MetaConnection?
   stripeSubscription StripeSubscription?
   automations       Automation[]
@@ -212,11 +213,70 @@ model GoogleBusinessProfileLocation {
   lastSyncedAt       DateTime @map("last_synced_at")
   createdAt          DateTime @default(now()) @map("created_at")
   updatedAt          DateTime @updatedAt @map("updated_at")
+  reviews            GoogleBusinessProfileReview[]
+
+  // RC-40 fix — atomic claim/lease state for the per-location reviews sync
+  // (same claim-token pattern as AutomationSchedulerService), plus Google's
+  // own aggregate rating/count cached alongside the reviews it summarizes
+  // so both expire together. Never recomputed from stored reviews.
+  reviewsSyncClaimedAt      DateTime? @map("reviews_sync_claimed_at")
+  reviewsSyncClaimToken     String?   @map("reviews_sync_claim_token")
+  reviewsLastSyncAttemptAt  DateTime? @map("reviews_last_sync_attempt_at")
+  reviewsLastSyncedAt       DateTime? @map("reviews_last_synced_at")
+  reviewsSyncStatus         String    @default("never") @map("reviews_sync_status") // never | success | partial | failed
+  reviewsAverageRating      Float?    @map("reviews_average_rating")
+  reviewsTotalReviewCount   Int?      @map("reviews_total_review_count")
+  reviewsCacheExpiresAt     DateTime? @map("reviews_cache_expires_at")
+
+  // RC-40 fix — same claim/lease pattern applied to the Performance API
+  // read path, for server-side quota protection independent of the
+  // frontend's disabled button.
+  performanceClaimedAt      DateTime? @map("performance_claimed_at")
+  performanceClaimToken     String?   @map("performance_claim_token")
+  performanceLastAttemptAt  DateTime? @map("performance_last_attempt_at")
 
   @@unique([connectionId, googleLocationName])
   @@index([organizationId, lastSyncedAt])
   @@index([robiaLocationId])
   @@map("google_business_profile_locations")
+}
+
+// RC-40 — read-only mirror of Business Profile reviews (still `mybusiness.
+// googleapis.com/v4`; Google has not yet split review management into its
+// own dedicated API family). Never written back to Google: replying to a
+// review is an explicit non-goal of this mirror, same as RC-38's stance on
+// the location fiche itself — see docs/RC40_GOOGLE_BUSINESS_PROFILE_
+// REVIEWS_PERFORMANCE.md. `replyComment`/`replyUpdateTime` are Google's own
+// owner reply, mirrored for display only.
+model GoogleBusinessProfileReview {
+  id                  String   @id @default(cuid())
+  organizationId      String   @map("organization_id")
+  organization        Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  locationId          String   @map("location_id")
+  location            GoogleBusinessProfileLocation @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  googleReviewName    String   @map("google_review_name")
+  reviewerDisplayName String?  @map("reviewer_display_name")
+  starRating          Int?     @map("star_rating") // 1-5, null if Google omits or reports STAR_RATING_UNSPECIFIED
+  comment             String?
+  createTime          DateTime? @map("create_time")
+  updateTime          DateTime? @map("update_time")
+  replyComment        String?  @map("reply_comment")
+  replyUpdateTime     DateTime? @map("reply_update_time")
+  // RC-40 fix — Google's GBP API terms cap third-party storage of API
+  // content at 30 days. `expiresAt` is set well under that cap (see
+  // docs/RC40_...md for the exact value) and enforced at every read path,
+  // not just by the purge cron, so an expired row is never served even if
+  // the scheduled purge hasn't run yet.
+  lastSyncedAt        DateTime @map("last_synced_at")
+  expiresAt           DateTime @map("expires_at")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  @@unique([locationId, googleReviewName])
+  @@index([organizationId, locationId])
+  @@index([expiresAt])
+  @@index([lastSyncedAt])
+  @@map("google_business_profile_reviews")
 }
 
 model MetaConnection {
