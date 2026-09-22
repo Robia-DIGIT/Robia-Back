@@ -193,11 +193,17 @@ export class DocumentsService {
     documentId: string,
     dto: UpdateDocumentDto,
   ) {
+    // Transitional compatibility for the pre-RC39 editor. New clients must
+    // send expectedRevision; legacy clients keep their previous behavior until
+    // the coordinated frontend rollout is complete.
+    const expectedRevision =
+      dto.expectedRevision ??
+      (await this.findOne(organizationId, documentId)).revision;
     const updated = await this.prisma.document.updateMany({
       where: {
         id: documentId,
         organizationId,
-        revision: dto.expectedRevision,
+        revision: expectedRevision,
       },
       data: {
         content: dto.content,

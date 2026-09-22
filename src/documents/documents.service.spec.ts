@@ -222,6 +222,32 @@ describe('DocumentsService Content Studio', () => {
     });
   });
 
+  it('keeps the pre-RC39 editor compatible when expectedRevision is absent', async () => {
+    const prisma = contextPrisma();
+    prisma.document.findFirst
+      .mockResolvedValueOnce({ id: 'document-a', revision: 4 })
+      .mockResolvedValueOnce({ id: 'document-a', revision: 5 });
+    prisma.document.updateMany.mockResolvedValue({ count: 1 });
+    const service = new DocumentsService(
+      prisma as unknown as PrismaService,
+      {} as DocumentGeneratorService,
+    );
+
+    await service.update('org-a', 'document-a', {
+      content: 'Texte historique',
+    });
+
+    expect(prisma.document.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: 'document-a',
+          organizationId: 'org-a',
+          revision: 4,
+        },
+      }),
+    );
+  });
+
   it('returns not found rather than conflict for another tenant document', async () => {
     const prisma = contextPrisma();
     prisma.document.updateMany.mockResolvedValue({ count: 0 });

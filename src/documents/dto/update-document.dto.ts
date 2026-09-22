@@ -1,9 +1,10 @@
-import { IsInt, IsString, Min, MinLength } from 'class-validator';
+import { IsInt, IsOptional, IsString, Min, MinLength } from 'class-validator';
 
 export class UpdateDocumentDto {
+  @IsOptional()
   @IsInt()
   @Min(1)
-  expectedRevision!: number;
+  expectedRevision?: number;
 
   @IsString()
   @MinLength(1)
