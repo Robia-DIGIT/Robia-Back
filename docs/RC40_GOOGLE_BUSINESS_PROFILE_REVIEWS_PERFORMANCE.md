@@ -192,26 +192,37 @@ affichées correspondent à la réalité du compte Google.
 **Aucun merge ni déploiement de ce lot sans une nouvelle revue Codex et un
 feu vert humain explicite après ce test manuel.**
 
-## Suivi requis — audit de rétention séparé pour RC38 (clos par RC41)
+## Suivi requis — audit de rétention séparé pour RC38 (clos par RC40.1)
 
-**Traité par RC41** (voir docs/RC38_GOOGLE_BUSINESS_PROFILE_READONLY.md,
-section « RC41 — Politique de rétention et resynchronisation automatique »).
+**Traité par RC40.1** (voir docs/RC38_GOOGLE_BUSINESS_PROFILE_READONLY.md,
+section « RC40.1 — Politique de rétention et resynchronisation automatique »).
 La fiche complète RC38 (identité, horaires, adresse, catégories, etc. —
 `GoogleBusinessProfileLocation`) n'avait, à l'inverse des avis, aucune
 politique d'expiration ni de purge — uniquement un bouton « Synchroniser »
-manuel. RC41 ajoute une resynchronisation automatique planifiée (toute
-connexion jamais synchronisée ou stale >24h), qui réutilise le bail de
-synchronisation déjà existant, plutôt qu'une politique de purge : contrairement
-aux avis, effacer une fiche établissement serait destructeur pour le produit,
-alors qu'un rafraîchissement automatique atteint la même garantie de
-conformité (jamais plus de 24h de retard sur Google, très en dessous du
-plafond de 30 jours) sans jamais montrer un état vide à l'utilisateur.
+manuel.
 
-Réserve inchangée : le texte exact des conditions Google n'a pas pu être relu
-directement (accès réseau bloqué dans l'environnement de développement) —
-seulement via des résultats de recherche qui le citent. À vérifier directement
-sur `developers.google.com/my-business/content/policies` avant toute annonce
-publique.
+Une première correction (RC41, devenue RC40.1) s'était arrêtée à une
+resynchronisation automatique planifiée (24h) réutilisant le bail existant,
+en présentant ce seul rafraîchissement comme la garantie de conformité aux
+« 30 jours calendaires » des conditions Google. **Cette affirmation était
+incorrecte** : un rafraîchissement qui échoue en continu (jeton révoqué,
+compte Google indisponible en permanence) ne fait rien expirer et pouvait
+laisser une fiche en base indéfiniment au-delà du plafond, exactement le
+défaut qu'il prétendait corriger.
+
+RC40.1 corrige cela avec un plafond absolu séparé (29 jours,
+`LOCATIONS_ABSOLUTE_EXPIRY_MS`, marge sous les 30 jours contractuels) : les
+lectures (`listLocations()`, comptage de `getStatus()`) filtrent strictement
+toute fiche dont `lastSyncedAt` dépasse ce plafond, et
+`purgeExpiredLocations()` (`@Cron(EVERY_HOUR)`) la supprime physiquement —
+contrairement aux avis, aucune fiche n'est effacée avant ce plafond (une
+panne sous 30 jours conserve la donnée précédente, seulement marquée
+`stale`), donc pas d'état vide destructeur pour l'utilisateur en usage
+normal, mais une garantie réelle de conformité sous panne permanente, plutôt
+qu'une simple cible de fraîcheur présentée à tort comme suffisante.
+
+Texte officiel désormais vérifié : « le contenu GBP stocké doit rester
+temporaire et ne pas dépasser 30 jours calendaires ».
 
 ## Configuration
 

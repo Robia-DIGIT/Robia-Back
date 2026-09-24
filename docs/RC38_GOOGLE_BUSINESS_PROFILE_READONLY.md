@@ -110,54 +110,86 @@ leurs autorisations/refresh tokens peuvent expirer après sept jours. Avant
 d'ouvrir ROBIA à des utilisateurs réels, publier l'application depuis l'écran
 Audience et terminer les validations de marque/scopes demandées par Google.
 
-## RC41 — Politique de rétention et resynchronisation automatique
+## RC40.1 — Politique de rétention et resynchronisation automatique
 
 **Suivi clos.** RC40 (avis + performances) avait signalé que la fiche
 établissement RC38 n'avait, à l'inverse des avis, aucune politique
 d'expiration ni de resynchronisation automatique — uniquement un bouton
 « Synchroniser » manuel. Les conditions d'utilisation des Business Profile
-APIs plafonnent le stockage de tout contenu obtenu via ces APIs à **30 jours
-calendaires** (« you cannot ... store any content provided through the
-Business Profile APIs ... except ... no more than 30 calendar days ») — une
-formulation qui ne se limite pas aux avis et couvre a priori aussi les
-données de fiche (adresse, horaires, catégories, téléphone). Une organisation
-qui ne recliquait jamais sur « Synchroniser » pouvait donc conserver une
-copie Google en base indéfiniment, au-delà de ce plafond.
+APIs imposent que **« le contenu GBP stocké doit rester temporaire et ne pas
+dépasser 30 jours calendaires »** — texte officiel désormais vérifié, qui ne
+se limite pas aux avis et couvre également les données de fiche (adresse,
+horaires, catégories, téléphone). Une organisation qui ne recliquait jamais
+sur « Synchroniser » pouvait donc conserver une copie Google en base
+indéfiniment, au-delà de ce plafond.
 
-RC41 corrige cela sans migration de schéma, en réutilisant intégralement le
-bail/claim de synchronisation déjà construit pour le bouton manuel
-(`syncClaimedAt`/`syncClaimToken`/`lastSyncAttemptAt` sur
-`GoogleBusinessProfileConnection`) :
+Une première correction (RC41, devenue RC40.1 après relecture) avait ajouté
+une resynchronisation planifiée mais **confondait la cadence de
+rafraîchissement (24h) avec la garantie de conformité (30 jours)** : un
+rafraîchissement qui échoue en continu (jeton révoqué, compte Google
+indisponible) ne bloquait rien et n'expirait jamais la donnée — le cron
+*visait* la fraîcheur, il ne *garantissait* pas la rétention. RC40.1 sépare
+explicitement les deux notions et ajoute le mécanisme qui manquait :
 
-- **Resynchronisation planifiée** (`@Cron(EVERY_HOUR)`,
-  `GoogleBusinessProfileService.refreshStaleLocations()`) : toute connexion
-  jamais synchronisée ou dont `lastSyncedAt` dépasse 24h est resynchronisée
-  automatiquement, sans action utilisateur — très en dessous du plafond de 30
-  jours. Le job est un no-op la plupart des heures : il ne resynchronise
-  chaque connexion qu'une fois par jour au plus.
+- **Cible de fraîcheur (24h, `LOCATIONS_STALE_AFTER_MS`)** — best-effort : la
+  resynchronisation planifiée (`@Cron(EVERY_HOUR)`,
+  `GoogleBusinessProfileService.refreshStaleLocations()`) vise à rafraîchir
+  toute connexion jamais synchronisée ou dont `lastSyncedAt` dépasse 24h.
+  Manquer cette cible (jeton révoqué, panne Google) ne viole rien en
+  soi — c'est un signal de dégradation, pas une violation de conformité.
+  Le dispatcher est déterministe et borné : sélection `orderBy
+  lastSyncedAt asc` (valeurs jamais synchronisées en premier) puis `id asc`,
+  `take` d'un lot fixe (`LOCATIONS_REFRESH_BATCH_SIZE = 50`), traitement
+  séquentiel (chaque connexion effectue déjà sa propre pagination Google
+  complète ; le plafond de lot borne déjà le volume d'appels Google par
+  passage), et **aucun jeton de rafraîchissement chargé pour le lot** — le
+  `select` ne porte que sur `id`/`organizationId`.
+- **Plafond absolu de conformité (29 jours, `LOCATIONS_ABSOLUTE_EXPIRY_MS`,
+  avec marge sous les 30 jours contractuels)** — c'est ce plafond, et non le
+  cron de rafraîchissement, qui garantit réellement la limite de 30 jours,
+  même sous panne permanente : `listLocations()` et le comptage de
+  `getStatus()` filtrent strictement `lastSyncedAt > now - 29j` à chaque
+  lecture (une fiche expirée n'est plus jamais servie, y compris dans la
+  fenêtre avant le passage du cron de purge), et
+  `purgeExpiredLocations()` (`@Cron(EVERY_HOUR)`) supprime physiquement les
+  lignes expirées. Réutilise `lastSyncedAt`, déjà présent depuis RC38 —
+  aucune migration de schéma n'a été nécessaire.
+- **Backoff d'échec** (`LOCATIONS_FAILURE_BACKOFF_MS = 6h`) : une connexion
+  dont la dernière tentative a échoué n'est pas retentée à chaque passage
+  horaire (un jeton révoqué serait sinon interrogé 24×/jour pour rien) —
+  elle est exclue du lot tant que `lastSyncAttemptAt` n'a pas dépassé cette
+  fenêtre, dérivé de `lastSyncStatus`/`lastSyncAttemptAt` sans nouvelle
+  colonne. Largement retentée avant d'atteindre le plafond des 29 jours.
+- **Course avec un changement de compte corrigée** : la première version du
+  dispatcher transportait un objet connexion pré-chargé (avant l'acquisition
+  du bail) jusqu'à l'appel de synchronisation — une reconnexion OAuth vers un
+  autre compte Google entre la découverte et l'acquisition du bail pouvait
+  alors utiliser un jeton déjà périmé. `runLocationsSync()` ne prend
+  désormais que `connectionId`/`organizationId` ; le jeton, le
+  `googleAccountSubject` et `lastSyncedAt` ne sont relus qu'**après**
+  l'acquisition du bail, jamais avant.
 - **Même bail que la synchronisation manuelle** : le cron appelle exactement
-  le même chemin de code (claim → lecture complète Google → transaction →
-  libération) qu'un clic manuel. Les deux se disputent le même bail — jamais
-  de double appel Google concurrent, jamais de course.
+  le même chemin de code (claim → lecture fraîche post-bail → lecture
+  complète Google → transaction → libération) qu'un clic manuel. Les deux se
+  disputent le même bail — jamais de double appel Google concurrent, jamais
+  de course.
 - **Panne isolée par connexion** : l'échec d'une organisation (jeton révoqué,
   claim déjà détenu par une synchronisation manuelle en cours, erreur Google
   transitoire) est journalisé et n'interrompt jamais le traitement des autres
   organisations dans le même passage du cron.
-- **Signal de fraîcheur honnête** : `GET .../status` expose désormais
-  `stale: boolean` (vrai si `lastSyncedAt` est absent ou dépasse 24h) — pour
-  détecter le cas où la resynchronisation planifiée échoue elle-même de façon
-  persistante, plutôt que de servir silencieusement une donnée vieillissante
-  sans jamais le signaler.
+- **Deux signaux honnêtes, jamais confondus** : `GET .../status` expose
+  `stale: boolean` (cible de fraîcheur manquée — la donnée est toujours
+  servie) et `expired: boolean` (plafond de conformité dépassé — la fiche a
+  été purgée côté serveur, `locationCount` en tient déjà compte). Le
+  frontend affiche un état explicite « données expirées » distinct du simple
+  état « obsolète », et affiche le signal de fraîcheur même lorsque la
+  dernière tentative a échoué ou est incomplète (`lastSyncStatus`
+  `failed`/`partial`), pas seulement en cas de succès.
 
-**Réserve** : le texte exact des conditions Google n'a pas pu être relu
-directement depuis l'environnement de développement (accès réseau à
-`developers.google.com` bloqué) — seulement via des résultats de recherche
-qui le citent. À vérifier directement sur
-`developers.google.com/my-business/content/policies` avant toute annonce
-publique. L'implémentation ci-dessus reste correcte dans tous les cas : elle
-ne fait que garantir un rafraîchissement automatique d'une donnée déjà
-resynchronisable, sans aucune perte fonctionnelle si la règle se révèle en
-pratique plus étroite qu'anticipé.
+Un simple rafraîchissement qui réussit occasionnellement ne suffit pas à
+garantir la conformité si une panne peut être permanente — c'est le plafond
+absolu + la purge qui la garantissent, indépendamment de l'état du jeton
+Google ou de la disponibilité de Google.
 
 ## Hors périmètre explicite
 

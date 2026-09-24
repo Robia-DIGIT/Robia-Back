@@ -363,7 +363,7 @@ describe('GoogleBusinessProfileService', () => {
         googleAccountSubject: 'old-subject',
         encryptedRefreshToken: 'encrypted-old',
       })
-      .mockResolvedValueOnce({
+      .mockResolvedValue({
         id: 'conn-1',
         organizationId: 'org-1',
         googleAccountSubject: 'new-subject',
@@ -886,37 +886,81 @@ describe('GoogleBusinessProfileService', () => {
     ).not.toHaveBeenCalled();
   });
 
-  // RC-41 — Google's 30-day storage ceiling applies to the location fiche
+  // RC-40.1 — Google's 30-day storage ceiling applies to the location fiche
   // too, not just reviews (RC-40): an organization that never re-clicks
-  // "Synchroniser" must not keep a Google-sourced copy indefinitely.
+  // "Synchroniser" must not keep a Google-sourced copy indefinitely. The
+  // scheduled refresh below is the freshness-target side of that guarantee;
+  // the absolute-ceiling side (purgeExpiredLocations, listLocations/
+  // getStatus filtering) is covered in its own describe block further down.
   describe('refreshStaleLocations (scheduled)', () => {
     const encrypted = (service_: GoogleBusinessProfileService): string =>
       (service_ as unknown as { encrypt(value: string): string }).encrypt(
         'refresh',
       );
 
-    it('queries only connections never synced or stale for more than 24h', async () => {
+    it('selects a deterministic, bounded batch — id/organizationId only, oldest-first, capped, no refresh token ever loaded for the scan', async () => {
       prisma.googleBusinessProfileConnection.findMany.mockResolvedValue([]);
       await service.refreshStaleLocations();
       const [args] = callArgs<{
-        where: { OR: [{ lastSyncedAt: null }, { lastSyncedAt: { lt: Date } }] };
+        where: unknown;
+        select: Record<string, boolean>;
+        orderBy: unknown[];
+        take: number;
+      }>(prisma.googleBusinessProfileConnection.findMany);
+      expect(args.select).toEqual({ id: true, organizationId: true });
+      expect(Object.keys(args.select)).not.toContain('encryptedRefreshToken');
+      expect(args.orderBy).toEqual([
+        { lastSyncedAt: { sort: 'asc', nulls: 'first' } },
+        { id: 'asc' },
+      ]);
+      expect(args.take).toBe(50);
+    });
+
+    it('is eligible only when never synced or stale beyond 24h, and excludes a recently-failed connection until its backoff window passes', async () => {
+      prisma.googleBusinessProfileConnection.findMany.mockResolvedValue([]);
+      await service.refreshStaleLocations();
+      const [args] = callArgs<{
+        where: {
+          OR: [{ lastSyncedAt: null }, { lastSyncedAt: { lt: Date } }];
+          AND: [
+            {
+              OR: [
+                { lastSyncStatus: { not: string } },
+                { lastSyncAttemptAt: { lt: Date } },
+              ];
+            },
+          ];
+        };
       }>(prisma.googleBusinessProfileConnection.findMany);
       expect(args.where.OR[0]).toEqual({ lastSyncedAt: null });
       expect(args.where.OR[1].lastSyncedAt.lt).toBeInstanceOf(Date);
       expect(
         Date.now() - args.where.OR[1].lastSyncedAt.lt.getTime(),
       ).toBeCloseTo(24 * 60 * 60 * 1000, -3);
+      const backoff = args.where.AND[0].OR;
+      expect(backoff[0]).toEqual({ lastSyncStatus: { not: 'failed' } });
+      expect(backoff[1].lastSyncAttemptAt.lt).toBeInstanceOf(Date);
+      // A connection that failed within this window is skipped this tick
+      // (avoiding an hourly hammer of a revoked token); once its last
+      // attempt is older than the window, the same clause makes it
+      // eligible again — recovery is automatic, not a separate code path.
+      expect(
+        Date.now() - backoff[1].lastSyncAttemptAt.lt.getTime(),
+      ).toBeCloseTo(6 * 60 * 60 * 1000, -3);
     });
 
     it('resyncs a connection whose fiche has never been synced', async () => {
       prisma.googleBusinessProfileConnection.findMany.mockResolvedValue([
-        {
-          id: 'conn-1',
-          organizationId: 'org-1',
-          encryptedRefreshToken: encrypted(service),
-          lastSyncedAt: null,
-        },
+        { id: 'conn-1', organizationId: 'org-1' },
       ]);
+      // The fresh, post-claim read is what actually supplies the token —
+      // never the bare {id, organizationId} the scan discovered.
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        organizationId: 'org-1',
+        encryptedRefreshToken: encrypted(service),
+        lastSyncedAt: null,
+      });
       prisma.googleBusinessProfileLocation.count.mockResolvedValue(0);
       const fetchSpy = jest
         .spyOn(global, 'fetch')
@@ -936,13 +980,14 @@ describe('GoogleBusinessProfileService', () => {
 
     it('resyncs a connection stale for more than 24h', async () => {
       prisma.googleBusinessProfileConnection.findMany.mockResolvedValue([
-        {
-          id: 'conn-1',
-          organizationId: 'org-1',
-          encryptedRefreshToken: encrypted(service),
-          lastSyncedAt: new Date(Date.now() - 48 * 60 * 60 * 1000),
-        },
+        { id: 'conn-1', organizationId: 'org-1' },
       ]);
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        organizationId: 'org-1',
+        encryptedRefreshToken: encrypted(service),
+        lastSyncedAt: new Date(Date.now() - 48 * 60 * 60 * 1000),
+      });
       prisma.googleBusinessProfileLocation.count.mockResolvedValue(0);
       const fetchSpy = jest
         .spyOn(global, 'fetch')
@@ -962,15 +1007,10 @@ describe('GoogleBusinessProfileService', () => {
 
     it('reuses the exact same claim/lease as a manual sync — a connection already claimed is skipped, not forced', async () => {
       prisma.googleBusinessProfileConnection.findMany.mockResolvedValue([
-        {
-          id: 'conn-1',
-          organizationId: 'org-1',
-          encryptedRefreshToken: encrypted(service),
-          lastSyncedAt: null,
-        },
+        { id: 'conn-1', organizationId: 'org-1' },
       ]);
       // Simulates a manual sync already holding the claim: the cron's own
-      // claim attempt matches no row.
+      // claim attempt matches no row, so no fresh read is ever needed.
       prisma.googleBusinessProfileConnection.updateMany.mockResolvedValueOnce({
         count: 0,
       });
@@ -986,28 +1026,26 @@ describe('GoogleBusinessProfileService', () => {
 
     it("one connection's failure never stops the batch for the others", async () => {
       prisma.googleBusinessProfileConnection.findMany.mockResolvedValue([
-        {
-          id: 'conn-1',
-          organizationId: 'org-1',
-          encryptedRefreshToken: encrypted(service),
-          lastSyncedAt: null,
-        },
-        {
+        { id: 'conn-1', organizationId: 'org-1' },
+        { id: 'conn-2', organizationId: 'org-2' },
+      ]);
+      // conn-1's claim fails (already claimed elsewhere); conn-2's claim
+      // succeeds (falls through to the default mockResolvedValue) and its
+      // post-claim fresh read supplies its token.
+      prisma.googleBusinessProfileConnection.updateMany.mockResolvedValueOnce({
+        count: 0,
+      });
+      prisma.googleBusinessProfileConnection.findUnique
+        .mockResolvedValueOnce({
+          syncClaimedAt: new Date(),
+          lastSyncAttemptAt: new Date(),
+        })
+        .mockResolvedValue({
           id: 'conn-2',
           organizationId: 'org-2',
           encryptedRefreshToken: encrypted(service),
           lastSyncedAt: null,
-        },
-      ]);
-      // conn-1's claim fails (already claimed elsewhere); conn-2's claim
-      // succeeds (falls through to the default mockResolvedValue).
-      prisma.googleBusinessProfileConnection.updateMany.mockResolvedValueOnce({
-        count: 0,
-      });
-      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValueOnce({
-        syncClaimedAt: new Date(),
-        lastSyncAttemptAt: new Date(),
-      });
+        });
       prisma.googleBusinessProfileLocation.count.mockResolvedValue(0);
       const fetchSpy = jest
         .spyOn(global, 'fetch')
@@ -1025,10 +1063,56 @@ describe('GoogleBusinessProfileService', () => {
       // before any fetch, and the batch still completed for conn-2.
       expect(fetchSpy).toHaveBeenCalledTimes(2);
     });
+
+    // RC-40.1 fix — the pre-claim snapshot race: the discovery scan above
+    // never carries account-specific data (see the `select` assertion
+    // above), so even if OAuth reconnects org-1 to a different Google
+    // account between discovery and claim acquisition, there is no stale
+    // token in scope to misuse — only the post-claim fresh read can ever
+    // supply one, and it always reflects whichever account is current at
+    // that moment.
+    it('never uses a stale pre-claim account: a reconnection between discovery and claim acquisition is only ever observed through the fresh post-claim read', async () => {
+      const encryptedAccountB = (
+        service as unknown as { encrypt(value: string): string }
+      ).encrypt('refresh-account-B');
+      // The scan discovers only bare identifiers — structurally incapable
+      // of carrying account A's now-superseded token forward.
+      prisma.googleBusinessProfileConnection.findMany.mockResolvedValue([
+        { id: 'conn-1', organizationId: 'org-1' },
+      ]);
+      // By the time the claim succeeds, OAuth has already reconnected
+      // org-1 to account B — this is the only source of truth used.
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        organizationId: 'org-1',
+        googleAccountSubject: 'account-B',
+        encryptedRefreshToken: encryptedAccountB,
+        lastSyncedAt: null,
+      });
+      prisma.googleBusinessProfileLocation.count.mockResolvedValue(0);
+      const fetchSpy = jest
+        .spyOn(global, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ access_token: 'access' }), {
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ accounts: [] }), { status: 200 }),
+        );
+
+      await service.refreshStaleLocations();
+
+      expect(fetchSpy).toHaveBeenCalled();
+      const tokenRequestBody = fetchSpy.mock.calls[0][1]?.body as
+        URLSearchParams | undefined;
+      expect(tokenRequestBody?.get('refresh_token')).toBe('refresh-account-B');
+    });
   });
 
-  // RC-41 — an honest freshness signal instead of silently trusting a
-  // mirror that hasn't been resynced in a while.
+  // RC-40.1 — an honest freshness signal instead of silently trusting a
+  // mirror that hasn't been resynced in a while, plus the absolute
+  // compliance ceiling that actually guarantees the 30-day limit.
   describe('getStatus staleness', () => {
     it('reports fresh when last synced recently', async () => {
       prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
@@ -1037,11 +1121,13 @@ describe('GoogleBusinessProfileService', () => {
         lastSyncedAt: new Date(Date.now() - 60 * 60 * 1000),
         lastSyncAttemptAt: new Date(),
         lastSyncStatus: 'success',
-        _count: { locations: 2 },
       });
+      prisma.googleBusinessProfileLocation.count.mockResolvedValue(2);
       await expect(service.getStatus('org-1')).resolves.toMatchObject({
         connected: true,
         stale: false,
+        expired: false,
+        locationCount: 2,
       });
     });
 
@@ -1052,11 +1138,12 @@ describe('GoogleBusinessProfileService', () => {
         lastSyncedAt: null,
         lastSyncAttemptAt: null,
         lastSyncStatus: 'never',
-        _count: { locations: 0 },
       });
+      prisma.googleBusinessProfileLocation.count.mockResolvedValue(0);
       await expect(service.getStatus('org-1')).resolves.toMatchObject({
         connected: true,
         stale: true,
+        expired: false,
       });
     });
 
@@ -1067,19 +1154,158 @@ describe('GoogleBusinessProfileService', () => {
         lastSyncedAt: new Date(Date.now() - 25 * 60 * 60 * 1000),
         lastSyncAttemptAt: new Date(),
         lastSyncStatus: 'success',
-        _count: { locations: 2 },
       });
+      prisma.googleBusinessProfileLocation.count.mockResolvedValue(2);
       await expect(service.getStatus('org-1')).resolves.toMatchObject({
         connected: true,
         stale: true,
+        expired: false,
       });
     });
 
-    it('is never stale when not connected at all', async () => {
+    it('is never stale or expired when not connected at all', async () => {
       prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue(null);
       await expect(service.getStatus('org-1')).resolves.toMatchObject({
         connected: false,
         stale: false,
+        expired: false,
+      });
+    });
+  });
+
+  // RC-40.1 — the absolute compliance ceiling: the 24h refresh cadence is
+  // only a freshness TARGET (missing it doesn't itself violate anything).
+  // This is what actually guarantees Google's 30-day storage cap is never
+  // exceeded, even under a permanently revoked token or a Google outage —
+  // via LOCATIONS_ABSOLUTE_EXPIRY_MS (29 days, with margin), enforced both
+  // at every read path and by the hourly purge cron.
+  describe('absolute 30-day retention ceiling', () => {
+    it('listLocations filters strictly by the absolute ceiling, for this organization only', async () => {
+      prisma.googleBusinessProfileLocation.findMany.mockResolvedValue([]);
+      await service.listLocations('org-1');
+      const [args] = callArgs<{
+        where: { organizationId: string; lastSyncedAt: { gt: Date } };
+      }>(prisma.googleBusinessProfileLocation.findMany);
+      expect(args.where.organizationId).toBe('org-1');
+      expect(args.where.lastSyncedAt.gt).toBeInstanceOf(Date);
+      expect(Date.now() - args.where.lastSyncedAt.gt.getTime()).toBeCloseTo(
+        29 * 24 * 60 * 60 * 1000,
+        -3,
+      );
+    });
+
+    it('a Google failure under 30 days keeps the previous data — marked stale, not expired, still counted', async () => {
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        googleAccountEmail: 'owner@example.com',
+        connectedAt: new Date(),
+        lastSyncedAt: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000),
+        lastSyncAttemptAt: new Date(),
+        lastSyncStatus: 'failed',
+      });
+      prisma.googleBusinessProfileLocation.count.mockResolvedValue(2);
+      await expect(service.getStatus('org-1')).resolves.toMatchObject({
+        connected: true,
+        stale: true,
+        expired: false,
+        locationCount: 2,
+      });
+    });
+
+    it('a persistent failure beyond 30 days reports expired and serves no Google data', async () => {
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        googleAccountEmail: 'owner@example.com',
+        connectedAt: new Date(),
+        lastSyncedAt: new Date(Date.now() - 40 * 24 * 60 * 60 * 1000),
+        lastSyncAttemptAt: new Date(),
+        lastSyncStatus: 'failed',
+      });
+      prisma.googleBusinessProfileLocation.count.mockResolvedValue(0);
+      await expect(service.getStatus('org-1')).resolves.toMatchObject({
+        connected: true,
+        stale: true,
+        expired: true,
+        locationCount: 0,
+      });
+      const [countArgs] = callArgs<{
+        where: { lastSyncedAt: { gt: Date } };
+      }>(prisma.googleBusinessProfileLocation.count);
+      expect(countArgs.where.lastSyncedAt.gt).toBeInstanceOf(Date);
+    });
+
+    it('a successful resync gives the fiche a fresh valid period, however old the previous one was', async () => {
+      const encrypted = (
+        service as unknown as { encrypt(value: string): string }
+      ).encrypt('refresh');
+      prisma.googleBusinessProfileConnection.findUnique.mockResolvedValue({
+        id: 'conn-1',
+        organizationId: 'org-1',
+        encryptedRefreshToken: encrypted,
+        lastSyncedAt: new Date(Date.now() - 40 * 24 * 60 * 60 * 1000),
+      });
+      prisma.googleBusinessProfileLocation.deleteMany.mockResolvedValue({
+        count: 0,
+      });
+      jest
+        .spyOn(global, 'fetch')
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ access_token: 'access' }), {
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({ accounts: [{ name: 'accounts/123' }] }),
+            { status: 200 },
+          ),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              locations: [{ name: 'locations/1', title: 'A' }],
+            }),
+            { status: 200 },
+          ),
+        );
+
+      const before = Date.now();
+      await expect(service.syncLocations('org-1')).resolves.toMatchObject({
+        synced: true,
+        status: 'success',
+      });
+      const [releaseArgs] = callArgs<{ data: { lastSyncedAt?: Date } }>(
+        prisma.googleBusinessProfileConnection.updateMany,
+      )
+        .filter((args) => args.data.lastSyncedAt !== undefined)
+        .slice(-1);
+      expect(releaseArgs.data.lastSyncedAt!.getTime()).toBeGreaterThanOrEqual(
+        before,
+      );
+    });
+
+    describe('purgeExpiredLocations', () => {
+      it('deletes every fiche whose last sync is at or before the absolute ceiling', async () => {
+        prisma.googleBusinessProfileLocation.deleteMany.mockResolvedValue({
+          count: 5,
+        });
+        await service.purgeExpiredLocations();
+        const [args] = callArgs<{ where: { lastSyncedAt: { lte: Date } } }>(
+          prisma.googleBusinessProfileLocation.deleteMany,
+        );
+        expect(args.where.lastSyncedAt.lte).toBeInstanceOf(Date);
+        expect(Date.now() - args.where.lastSyncedAt.lte.getTime()).toBeCloseTo(
+          29 * 24 * 60 * 60 * 1000,
+          -3,
+        );
+      });
+
+      it('never deletes still-fresh data — logs nothing when there is nothing to purge', async () => {
+        prisma.googleBusinessProfileLocation.deleteMany.mockResolvedValue({
+          count: 0,
+        });
+        const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation();
+        await service.purgeExpiredLocations();
+        expect(logSpy).not.toHaveBeenCalled();
+        logSpy.mockRestore();
       });
     });
   });
