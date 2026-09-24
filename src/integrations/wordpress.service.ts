@@ -1,10 +1,10 @@
 import {
-  BadGatewayException,
   BadRequestException,
   ConflictException,
   Injectable,
   NotFoundException,
   ServiceUnavailableException,
+  UnprocessableEntityException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Prisma } from '@prisma/client';
@@ -80,13 +80,13 @@ export class WordPressService {
       authorization,
     });
     if (response.status !== 200 || !this.remoteUser(response.body)) {
-      throw new BadGatewayException(
+      throw new UnprocessableEntityException(
         'WordPress a refusé la vérification des identifiants.',
       );
     }
     const remoteUser = this.remoteUser(response.body)!;
     if (!remoteUser.canCreatePosts && !remoteUser.canCreatePages) {
-      throw new BadGatewayException(
+      throw new UnprocessableEntityException(
         'Le compte WordPress ne peut créer ni article ni page.',
       );
     }
@@ -423,7 +423,7 @@ export class WordPressService {
             'Réponse WordPress ambiguë. Une réconciliation est requise.',
           );
         }
-        throw new BadGatewayException(
+        throw new UnprocessableEntityException(
           `WordPress a refusé le brouillon (HTTP ${response.status}).`,
         );
       }
