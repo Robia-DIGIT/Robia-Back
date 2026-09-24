@@ -59,17 +59,27 @@ function isPrivateIpv4(address: string) {
 
 function isPrivateIpv6(address: string) {
   const normalized = address.toLowerCase().split('%')[0];
-  if (normalized.startsWith('::ffff:')) {
-    return isPrivateIpv4(normalized.slice(7));
-  }
+  // Reject all IPv4-mapped/compatible forms. The same host can use its A
+  // record; accepting textual or hex-mapped IPv4 here creates avoidable parser
+  // ambiguity around private-range detection.
+  if (normalized.startsWith('::ffff:') || normalized.startsWith('::ffff:0:'))
+    return true;
+  if (normalized.startsWith('::') && normalized.includes('.')) return true;
   return (
     normalized === '::' ||
     normalized === '::1' ||
     normalized.startsWith('fc') ||
     normalized.startsWith('fd') ||
-    /^fe[89ab]/.test(normalized) ||
+    /^fe[89a-f]/.test(normalized) ||
     normalized.startsWith('ff') ||
-    normalized.startsWith('2001:db8:')
+    normalized.startsWith('100:') ||
+    normalized.startsWith('64:ff9b:') ||
+    normalized.startsWith('2001:0:') ||
+    normalized.startsWith('2001:10:') ||
+    normalized.startsWith('2001:20:') ||
+    normalized.startsWith('2001:db8:') ||
+    normalized.startsWith('2002:') ||
+    normalized.startsWith('3fff:')
   );
 }
 
