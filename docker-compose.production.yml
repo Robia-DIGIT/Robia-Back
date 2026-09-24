@@ -7,11 +7,30 @@ services:
       target: migrate
     env_file:
       - .env.production
+    # hardening/prisma-migration-guard — MIGRATION_ENVIRONMENT is hardcoded
+    # to "production" here because this compose file IS the production
+    # deployment (never sourced from .env.production, unlike the two
+    # EXPECTED_DATABASE_* values below, which name what THIS production
+    # actually is and must come from .env.production so they stay in lockstep
+    # with the real DATABASE_URL/DIRECT_URL — see docs/PRISMA_MIGRATION_GUARD.md).
+    # npm_config_cache moves npx's own cache off the (now read-only) root
+    # filesystem and onto the writable tmpfs /tmp mount below.
+    environment:
+      NODE_ENV: production
+      MIGRATION_ENVIRONMENT: production
+      EXPECTED_DATABASE_HOST: ${EXPECTED_DATABASE_HOST:?Set EXPECTED_DATABASE_HOST in .env.production}
+      EXPECTED_DATABASE_NAME: ${EXPECTED_DATABASE_NAME:?Set EXPECTED_DATABASE_NAME in .env.production}
+      npm_config_cache: /tmp/npm-cache
     networks:
       - supabase
     restart: "no"
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
 
   ai-engine:
     build:

@@ -17,9 +17,22 @@ RUN npm prune --omit=dev
 
 FROM dependencies AS migrate
 
-COPY prisma.config.ts ./
-COPY prisma ./prisma
-CMD ["npx", "prisma", "migrate", "deploy"]
+COPY --chown=node:node prisma.config.ts ./
+COPY --chown=node:node prisma ./prisma
+# hardening/prisma-migration-guard — never invoke `prisma migrate deploy`
+# directly. DATABASE_URL (runtime) and DIRECT_URL (this stage's migration
+# target, per prisma.config.ts) are two independently-configured env vars
+# Prisma itself never cross-checks; a prior incident had them pointing at
+# two different databases (QA vs production) with nothing catching it. This
+# script is the mandatory gate — see docs/PRISMA_MIGRATION_GUARD.md. Do not
+# bypass it with a direct `prisma migrate deploy`/`npx prisma ...` CMD here.
+COPY --chown=node:node scripts/safe-prisma-migrate.cjs ./scripts/safe-prisma-migrate.cjs
+# Runs as the same non-root user as the `runtime` stage: this stage still
+# opens real network connections to production PostgreSQL, and a process
+# with no legitimate need for UID 0 should never run as root.
+USER node
+
+CMD ["node", "/app/scripts/safe-prisma-migrate.cjs"]
 
 FROM node:22-bookworm-slim AS runtime
 

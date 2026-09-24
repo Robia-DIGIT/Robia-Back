@@ -74,6 +74,11 @@ jobs:
       - run: cp .env.production.example .env.production
       - run: docker compose --env-file .env.production -f docker-compose.production.yml config --quiet
       - run: docker build --target runtime --tag robia-backend:test .
+      # hardening/prisma-migration-guard — the migrate stage now runs the
+      # mandatory guard script instead of Prisma directly; build it here so
+      # a broken COPY/CMD in that stage fails CI immediately, independent of
+      # the deeper container-vs-real-PostgreSQL behavior proven below.
+      - run: docker build --target migrate --tag robia-backend-migrate:test .
       - run: docker build --tag robia-ai-engine:test ./python-service
 
   deployment-tests:
@@ -83,7 +88,10 @@ jobs:
     # daemon, always present on this runner) to prove the ODC upload volume
     # actually persists across container recreation, not just that the
     # compose file parses.
-    timeout-minutes: 15
+    # hardening/prisma-migration-guard — test_prisma_migration_guard.py adds
+    # a second real-image build (the `migrate` target) plus several
+    # ephemeral PostgreSQL containers per test; timeout raised accordingly.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - run: sh -n deploy/github-deploy.sh

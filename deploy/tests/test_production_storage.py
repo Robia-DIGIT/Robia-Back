@@ -39,6 +39,8 @@ class ProductionOdcStorageTests(unittest.TestCase):
                 [
                     "docker",
                     "compose",
+                    "--env-file",
+                    str(ENV_PRODUCTION),
                     "-f",
                     str(COMPOSE_FILE),
                     "config",
