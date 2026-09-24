@@ -19,7 +19,15 @@ FROM dependencies AS migrate
 
 COPY prisma.config.ts ./
 COPY prisma ./prisma
-CMD ["npx", "prisma", "migrate", "deploy"]
+# hardening/prisma-migration-guard — never invoke `prisma migrate deploy`
+# directly. DATABASE_URL (runtime) and DIRECT_URL (this stage's migration
+# target, per prisma.config.ts) are two independently-configured env vars
+# Prisma itself never cross-checks; a prior incident had them pointing at
+# two different databases (QA vs production) with nothing catching it. This
+# script is the mandatory gate — see docs/PRISMA_MIGRATION_GUARD.md. Do not
+# bypass it with a direct `prisma migrate deploy`/`npx prisma ...` CMD here.
+COPY scripts/safe-prisma-migrate.cjs ./scripts/safe-prisma-migrate.cjs
+CMD ["node", "/app/scripts/safe-prisma-migrate.cjs"]
 
 FROM node:22-bookworm-slim AS runtime
 
