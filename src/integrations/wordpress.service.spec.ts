@@ -58,7 +58,12 @@ function harness() {
       updateMany: jest.fn(),
     },
     document: { findFirst: jest.fn() },
-    actionItem: { findFirst: jest.fn() },
+    actionItem: {
+      findFirst: jest.fn(),
+      updateMany: jest.fn(),
+      findUniqueOrThrow: jest.fn(),
+    },
+    actionExecutionEvent: { create: jest.fn() },
     wordPressDraftApproval: {
       findUnique: jest.fn(),
       findFirst: jest.fn(),
@@ -221,6 +226,63 @@ describe('WordPressService', () => {
     expect(prisma.wordPressConnection.update).not.toHaveBeenCalled();
   });
 
+  it('refuses credential rotation while a draft attempt still awaits reconciliation (status unknown)', async () => {
+    const { prisma, http, service } = harness();
+    prisma.website.findFirst.mockResolvedValue({
+      id: websiteId,
+      url: 'https://example.com',
+    });
+    http.request.mockResolvedValue({
+      status: 200,
+      body: { id: 7, capabilities: { edit_posts: true, edit_pages: true } },
+    });
+    prisma.wordPressConnection.findFirst.mockResolvedValue({
+      id: 'connection-1',
+    });
+    // A prior attempt's remote result was never confirmed (network drop,
+    // ambiguous 5xx, ...) — rotating the credentials it depends on for
+    // reconciliation would strand it, same as an in-flight attempt.
+    prisma.wordPressDraftAttempt.count.mockResolvedValue(1);
+
+    await expect(
+      service.connect(organizationId, {
+        websiteId,
+        username: 'editor',
+        applicationPassword: 'new-application-password',
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(prisma.wordPressDraftAttempt.count).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          status: { in: ['in_flight', 'unknown'] },
+        }),
+      }),
+    );
+    expect(prisma.wordPressConnection.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses disconnect while a draft attempt is in flight or awaits reconciliation', async () => {
+    const { prisma, service } = harness();
+    prisma.website.findFirst.mockResolvedValue({ id: websiteId });
+    prisma.wordPressConnection.findFirst.mockResolvedValue({
+      id: 'connection-1',
+      status: 'ready',
+    });
+    prisma.wordPressDraftAttempt.count.mockResolvedValue(1);
+
+    await expect(
+      service.disconnect(organizationId, websiteId),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(prisma.wordPressDraftAttempt.count).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          status: { in: ['in_flight', 'unknown'] },
+        }),
+      }),
+    );
+    expect(prisma.wordPressConnection.updateMany).not.toHaveBeenCalled();
+  });
+
   it('rejects an approval from another tenant even if a repository returned it', async () => {
     const { prisma, service } = harness();
     const context = approvalFor(service);
@@ -319,7 +381,46 @@ describe('WordPressService', () => {
       expect.objectContaining({
         data: expect.objectContaining({
           status: 'failed',
-          errorCode: 'binding_changed_before_dispatch',
+          errorCode: 'publication_denied_before_dispatch_approval_stale',
+        }),
+      }),
+    );
+  });
+
+  it('sends nothing to WordPress when the approval is revoked between the pre-claim read and the claimed read', async () => {
+    const { prisma, http, service } = harness();
+    const context = approvalFor(service);
+    context.connection.encryptedApplicationPassword = 'configured';
+    const initial = {
+      ...context.approval,
+      connection: context.connection,
+      document: context.document,
+      actionItem: context.action,
+    };
+    // Simulates revokeApproval() committing in the window between the
+    // pre-claim publicationContext() read and the post-claim re-read.
+    const revokedAfterClaim = { ...initial, revokedAt: new Date() };
+    prisma.wordPressDraftApproval.findFirst
+      .mockResolvedValueOnce(initial)
+      .mockResolvedValueOnce(revokedAfterClaim);
+    prisma.wordPressDraftAttempt.findFirst.mockResolvedValue(null);
+    prisma.wordPressDraftAttempt.create.mockResolvedValue({ id: 'attempt-1' });
+    prisma.wordPressDraftAttempt.updateMany.mockResolvedValue({ count: 1 });
+
+    await expect(
+      service.createDraft(organizationId, userId, {
+        approvalId: context.approval.id,
+        idempotencyKey: 'request-123',
+      }),
+    ).rejects.toThrow(
+      'L’approbation n’est plus valide (elle a été révoquée avant l’envoi).',
+    );
+    expect(http.request).not.toHaveBeenCalled();
+    expect(prisma.wordPressDraftAttempt.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: 'failed',
+          errorCode: 'publication_denied_before_dispatch_approval_required',
         }),
       }),
     );
@@ -382,8 +483,10 @@ describe('WordPressService', () => {
     });
     prisma.wordPressDraftAttempt.findFirst.mockResolvedValue(null);
     prisma.wordPressDraftAttempt.create.mockResolvedValue({ id: 'attempt-1' });
-    prisma.wordPressDraftAttempt.updateMany.mockResolvedValue({ count: 1 });
     const tx = {
+      wordPressDraftAttempt: {
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
       actionItem: {
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
         findUniqueOrThrow: jest.fn().mockResolvedValue({ organizationId }),
@@ -459,6 +562,7 @@ describe('WordPressService', () => {
         idempotencyKey: 'request-123',
       }),
     ).rejects.toThrow('perdu son bail');
-    expect(prisma.$transaction).toHaveBeenCalledTimes(0);
+    expect(prisma.actionItem.updateMany).not.toHaveBeenCalled();
+    expect(prisma.actionExecutionEvent.create).not.toHaveBeenCalled();
   });
 });

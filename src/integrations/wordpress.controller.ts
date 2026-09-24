@@ -16,6 +16,7 @@ import { OrgScopeGuard } from '../common/guards/org-scope.guard';
 import { ApproveWordPressDraftDto } from './dto/approve-wordpress-draft.dto';
 import { ConnectWordPressDto } from './dto/connect-wordpress.dto';
 import { CreateWordPressDraftDto } from './dto/create-wordpress-draft.dto';
+import { WebsiteIdQueryDto } from './dto/website-id-query.dto';
 import { WordPressService } from './wordpress.service';
 
 interface ScopedRequest extends Request {
@@ -35,16 +36,13 @@ export class WordPressController {
   }
 
   @Get('status')
-  status(@Req() request: ScopedRequest, @Query('websiteId') websiteId: string) {
-    return this.wordpress.status(request.organizationId, websiteId);
+  status(@Req() request: ScopedRequest, @Query() query: WebsiteIdQueryDto) {
+    return this.wordpress.status(request.organizationId, query.websiteId);
   }
 
   @Delete()
-  disconnect(
-    @Req() request: ScopedRequest,
-    @Query('websiteId') websiteId: string,
-  ) {
-    return this.wordpress.disconnect(request.organizationId, websiteId);
+  disconnect(@Req() request: ScopedRequest, @Query() query: WebsiteIdQueryDto) {
+    return this.wordpress.disconnect(request.organizationId, query.websiteId);
   }
 
   @Post('draft-approvals')
@@ -95,10 +93,7 @@ export class WordPressController {
   }
 
   @Get('attempts')
-  attempts(
-    @Req() request: ScopedRequest,
-    @Query('websiteId') websiteId: string,
-  ) {
-    return this.wordpress.listAttempts(request.organizationId, websiteId);
+  attempts(@Req() request: ScopedRequest, @Query() query: WebsiteIdQueryDto) {
+    return this.wordpress.listAttempts(request.organizationId, query.websiteId);
   }
 }

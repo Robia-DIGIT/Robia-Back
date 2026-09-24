@@ -384,18 +384,52 @@ export class WordPressService {
       claimedContext.approval.postType as 'post' | 'page',
       claimedPayload,
     );
+    // Re-run the full policy against the freshly re-read approval — not just
+    // a binding-drift comparison — so a revocation (or a connection dropping
+    // out of `ready`) that lands between the pre-claim read and this claimed
+    // read is caught before any WordPress request, not just a content/target
+    // change. The pre-claim `decision` above is now only an early rejection;
+    // this is the check that actually gates the dispatch.
+    const claimedDecision = evaluatePublication({
+      current: claimedBinding,
+      approval: {
+        organizationId: claimedContext.approval.organizationId,
+        documentId: claimedContext.approval.documentId,
+        revision: claimedContext.approval.documentRevision,
+        contentDigest: claimedContext.approval.contentDigest,
+        destination: 'wordpress_post',
+        targetId: claimedContext.approval.targetId,
+        connectionVersion: claimedContext.approval.connectionVersion,
+        approvedBy: claimedContext.approval.approvedById,
+        revoked: claimedContext.approval.revokedAt !== null,
+      },
+      publishingEnabled: true,
+      connectionReady:
+        claimedContext.connection.status === 'ready' &&
+        Boolean(claimedContext.connection.encryptedApplicationPassword),
+      previousAttempt: null,
+    });
     if (
-      publicationOperationKey(claimedBinding) !==
-      claimedContext.approval.operationKey
+      !claimedDecision.allowed ||
+      claimedDecision.operationKey !== claimedContext.approval.operationKey
     ) {
+      // 'approval_required' is the only reason this call site can hit from a
+      // revoked approval (approval is never null here and approvedBy is
+      // always the persisted approver) — every other reason means the
+      // document/connection/binding drifted, not that it was revoked.
+      const reason = claimedDecision.allowed
+        ? 'binding_changed_before_dispatch'
+        : claimedDecision.reason;
       await this.finishFailedAttempt(
         attemptId,
         claimToken,
         'failed',
-        'binding_changed_before_dispatch',
+        `publication_denied_before_dispatch_${reason}`,
       );
       throw new ConflictException(
-        'Le document ou la connexion a changé avant l’envoi.',
+        reason === 'approval_required'
+          ? 'L’approbation n’est plus valide (elle a été révoquée avant l’envoi).'
+          : 'Le document ou la connexion a changé avant l’envoi.',
       );
     }
     const authorization = this.connectionAuthorization(
@@ -747,26 +781,6 @@ export class WordPressService {
       remote.link,
     );
     const remoteEditorUrl = `${context.connection.siteUrl.replace(/\/$/, '')}/wp-admin/post.php?post=${encodeURIComponent(remotePostId)}&action=edit`;
-    const finalized = await this.prisma.wordPressDraftAttempt.updateMany({
-      where: { id: attemptId, claimToken, status: 'in_flight' },
-      data: {
-        status: 'confirmed',
-        claimToken: null,
-        claimedAt: null,
-        remotePostId,
-        remoteUrl,
-        remoteEditorUrl,
-        errorCode: null,
-        errorMessage: null,
-        confirmedAt: new Date(),
-      },
-    });
-    if (finalized.count !== 1) {
-      throw new ConflictException(
-        'La tentative a perdu son bail; son résultat local a été ignoré.',
-      );
-    }
-
     const evidence = {
       destination: 'wordpress',
       mode: 'draft_only',
@@ -776,7 +790,34 @@ export class WordPressService {
       remoteEditorUrl,
       documentId: context.document.id,
     };
-    await this.prisma.$transaction(async (tx) => {
+
+    // Finalizing the attempt, marking the Action done and recording the
+    // execution event must commit together: a crash between separate writes
+    // here would otherwise leave a confirmed WordPress draft with the Action
+    // still `ready` and no execution evidence at all. A lost claim (someone
+    // else's reconciliation already finalized/reclaimed this attempt) rolls
+    // the whole transaction back rather than partially applying it.
+    const attempt = await this.prisma.$transaction(async (tx) => {
+      const finalized = await tx.wordPressDraftAttempt.updateMany({
+        where: { id: attemptId, claimToken, status: 'in_flight' },
+        data: {
+          status: 'confirmed',
+          claimToken: null,
+          claimedAt: null,
+          remotePostId,
+          remoteUrl,
+          remoteEditorUrl,
+          errorCode: null,
+          errorMessage: null,
+          confirmedAt: new Date(),
+        },
+      });
+      if (finalized.count !== 1) {
+        throw new ConflictException(
+          'La tentative a perdu son bail; son résultat local a été ignoré.',
+        );
+      }
+
       const action = await tx.actionItem.updateMany({
         where: {
           id: context.action.id,
@@ -790,33 +831,31 @@ export class WordPressService {
           attemptCount: { increment: 1 },
         },
       });
-      if (action.count !== 1) return;
-      await tx.actionExecutionEvent.create({
-        data: {
-          organizationId: (
-            await tx.actionItem.findUniqueOrThrow({
-              where: { id: context.action.id },
-              select: { organizationId: true },
-            })
-          ).organizationId,
-          actionItemId: context.action.id,
-          userId,
-          eventType: 'execution_succeeded',
-          idempotencyKey: `${context.action.id}:wordpress:${context.approval.operationKey}`,
-          payload: evidence,
-        },
-      });
-    });
-    return {
-      attempt: {
+      if (action.count === 1) {
+        const owner = await tx.actionItem.findUniqueOrThrow({
+          where: { id: context.action.id },
+          select: { organizationId: true },
+        });
+        await tx.actionExecutionEvent.create({
+          data: {
+            organizationId: owner.organizationId,
+            actionItemId: context.action.id,
+            userId,
+            eventType: 'execution_succeeded',
+            idempotencyKey: `${context.action.id}:wordpress:${context.approval.operationKey}`,
+            payload: evidence,
+          },
+        });
+      }
+      return {
         id: attemptId,
-        status: 'confirmed',
+        status: 'confirmed' as const,
         remotePostId,
         remoteUrl,
         remoteEditorUrl,
-      },
-      idempotent: false,
-    };
+      };
+    });
+    return { attempt, idempotent: false };
   }
 
   private async finishFailedAttempt(
@@ -883,12 +922,17 @@ export class WordPressService {
     tx: Prisma.TransactionClient,
     connectionId: string,
   ) {
+    // `unknown` means the last POST result was never confirmed — the remote
+    // WordPress identifiers (site, credentials) that attempt depends on for
+    // reconciliation must not be rotated or dropped out from under it, same
+    // as `in_flight`. Only the two states requiring reconciliation, not a
+    // resolved `confirmed`/`failed` attempt, block rotation/disconnect here.
     const active = await tx.wordPressDraftAttempt.count({
-      where: { connectionId, status: 'in_flight' },
+      where: { connectionId, status: { in: ['in_flight', 'unknown'] } },
     });
     if (active > 0) {
       throw new ConflictException(
-        'Une création WordPress est en cours; la connexion ne peut pas être modifiée.',
+        'Une tentative WordPress est en cours ou en attente de réconciliation; la connexion ne peut pas être modifiée.',
       );
     }
   }
