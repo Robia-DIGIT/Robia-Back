@@ -21,6 +21,8 @@ test_odc_storage_integration.py split in this same directory:
 import json
 import shutil
 import subprocess
+import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -94,7 +96,11 @@ class PrismaMigrationGuardWiringTests(unittest.TestCase):
             self.assertIn(symbol, source)
 
     def test_dockerfile_migrate_stage_copies_the_guard_script(self):
-        self.assertIn("COPY scripts/safe-prisma-migrate.cjs", self.dockerfile_text)
+        self.assertIn("scripts/safe-prisma-migrate.cjs ./scripts/safe-prisma-migrate.cjs", self.dockerfile_text)
+
+    def test_dockerfile_migrate_stage_runs_as_non_root(self):
+        migrate_stage = self.dockerfile_text.split("AS migrate", 1)[1].split("FROM ", 1)[0]
+        self.assertIn("USER node", migrate_stage)
 
     def test_dockerfile_migrate_stage_cmd_runs_the_guard_not_prisma_directly(self):
         migrate_stage = self.dockerfile_text.split("AS migrate", 1)[1].split(
@@ -131,7 +137,87 @@ class PrismaMigrationGuardWiringTests(unittest.TestCase):
         text = ENV_EXAMPLE.read_text(encoding="utf-8")
         self.assertIn("EXPECTED_DATABASE_HOST=db", text)
         self.assertIn("EXPECTED_DATABASE_NAME=postgres", text)
-        self.assertIn("MIGRATION_ENVIRONMENT=production", text)
+        # MIGRATION_ENVIRONMENT is hardcoded in docker-compose.production.yml
+        # (never read from .env.production) — this file must not assign it,
+        # or the example would misleadingly suggest the VPS operator needs to
+        # set a third variable that the compose file never actually reads.
+        # (A prose mention explaining that fact, as in the comment above, is
+        # fine — only an actual `MIGRATION_ENVIRONMENT=...` assignment isn't.)
+        self.assertNotIn("\nMIGRATION_ENVIRONMENT=", text)
+
+
+class PrismaMigrationGuardComposeRequiredVarsTests(unittest.TestCase):
+    """`docker compose config` itself must refuse to resolve
+    docker-compose.production.yml when EXPECTED_DATABASE_HOST or
+    EXPECTED_DATABASE_NAME is missing — the mandatory guard must never be
+    reachable at all with an incomplete env file, not merely rely on the
+    guard script noticing at container-start time."""
+
+    def _config_with_env(self, env_text: str) -> subprocess.CompletedProcess:
+        # `docker compose config` resolves each service's own `env_file:
+        # .env.production` line regardless of `--env-file` (see
+        # PrismaMigrationGuardWiringTests.setUpClass above for the same
+        # constraint) — both must point at the same content, or a missing
+        # variable in ours would be masked by whatever real file exists.
+        with tempfile.NamedTemporaryFile(
+            "w", dir=ROOT, prefix=".env.production.test-", delete=False
+        ) as handle:
+            handle.write(env_text)
+            temp_path = Path(handle.name)
+        owns_env_production = not ENV_PRODUCTION.exists()
+        if owns_env_production:
+            ENV_PRODUCTION.write_text(env_text, encoding="utf-8")
+        try:
+            return subprocess.run(
+                [
+                    "docker",
+                    "compose",
+                    "--env-file",
+                    str(temp_path),
+                    "-f",
+                    str(COMPOSE_FILE),
+                    "config",
+                    "--quiet",
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        finally:
+            temp_path.unlink(missing_ok=True)
+            if owns_env_production:
+                ENV_PRODUCTION.unlink(missing_ok=True)
+
+    def test_config_succeeds_when_both_expected_variables_are_present(self):
+        result = self._config_with_env(ENV_EXAMPLE.read_text(encoding="utf-8"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_config_refuses_when_expected_database_host_is_missing(self):
+        text = ENV_EXAMPLE.read_text(encoding="utf-8")
+        lines = [line for line in text.splitlines() if not line.startswith("EXPECTED_DATABASE_HOST=")]
+        result = self._config_with_env("\n".join(lines) + "\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("EXPECTED_DATABASE_HOST", result.stderr)
+
+    def test_config_refuses_when_expected_database_name_is_missing(self):
+        text = ENV_EXAMPLE.read_text(encoding="utf-8")
+        lines = [line for line in text.splitlines() if not line.startswith("EXPECTED_DATABASE_NAME=")]
+        result = self._config_with_env("\n".join(lines) + "\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("EXPECTED_DATABASE_NAME", result.stderr)
+
+    def test_config_refuses_when_expected_database_host_is_set_but_empty(self):
+        text = ENV_EXAMPLE.read_text(encoding="utf-8")
+        lines = [
+            line
+            for line in text.splitlines()
+            if not line.startswith("EXPECTED_DATABASE_HOST=")
+        ]
+        lines.append("EXPECTED_DATABASE_HOST=")
+        result = self._config_with_env("\n".join(lines) + "\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("EXPECTED_DATABASE_HOST", result.stderr)
 
 
 @unittest.skipUnless(_docker_daemon_reachable(), "docker daemon not reachable")
@@ -281,6 +367,60 @@ class PrismaMigrationGuardContainerTests(unittest.TestCase):
         self.assertNotIn(FIXTURE_PASSWORD, combined)
         self.assertNotIn(database_url, combined)
         self.assertNotIn(direct_url, combined)
+
+    def test_migrate_container_does_not_run_as_root(self):
+        # hardening/prisma-migration-guard — the `migrate` stage now runs as
+        # `USER node` (see Dockerfile): a process opening real network
+        # connections to production PostgreSQL has no legitimate need for
+        # UID 0. Overrides the default CMD with `id -u` to read back the
+        # actual effective UID the container runs as, independent of what
+        # the Dockerfile merely claims.
+        result = subprocess.run(
+            ["docker", "run", "--rm", "--entrypoint", "id", IMAGE, "-u"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        uid = result.stdout.strip()
+        self.assertNotEqual(uid, "0", f"migrate container runs as UID {uid!r}, expected non-root")
+
+    def test_unreachable_database_host_is_refused_within_the_bounded_timeout(self):
+        # No PostgreSQL server is ever started at this address. A private,
+        # non-routable IP is used rather than an unused port on a live host,
+        # because the latter fails almost instantly with ECONNREFUSED and
+        # would never prove that a genuine hang is actually bounded. Without
+        # connectionTimeoutMillis, `pg`'s TCP connect would only give up on
+        # the OS's own retry timeout (commonly well over a minute); the
+        # guard must fail in roughly 10 seconds instead.
+        unreachable_host = "10.255.255.1"
+        url = (
+            f"postgresql://postgres:{FIXTURE_PASSWORD}@{unreachable_host}:5432/"
+            f"postgres?schema=public"
+        )
+
+        started = time.monotonic()
+        result = self._run_migrate_container(
+            {
+                "DATABASE_URL": url,
+                "DIRECT_URL": url,
+                "EXPECTED_DATABASE_HOST": unreachable_host,
+                "EXPECTED_DATABASE_NAME": "postgres",
+                "MIGRATION_ENVIRONMENT": "production",
+            }
+        )
+        elapsed = time.monotonic() - started
+
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, REFUSAL_EXIT_CODE, combined)
+        self.assertLess(
+            elapsed,
+            30,
+            f"guard took {elapsed:.1f}s against an unreachable host — the 10s "
+            "connection timeout does not appear to bound pg's connect()",
+        )
+        self.assertNotIn(FIXTURE_PASSWORD, combined)
+        self.assertNotIn(url, combined)
 
     def test_postgres_database_name_is_refused_without_explicit_production_environment(self):
         # The database is literally named "postgres" (matching the real

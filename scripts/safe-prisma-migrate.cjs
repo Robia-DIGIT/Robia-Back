@@ -27,6 +27,17 @@ const { spawnSync } = require('node:child_process');
 
 const REFUSAL_EXIT_CODE = 42;
 
+// Neither opening a connection nor running the identity query may hang
+// indefinitely — an unreachable PostgreSQL server (a firewalled host, a
+// server that never replies) must fail cleanly and promptly, not leave the
+// deploy pipeline stuck forever. connectionTimeoutMillis bounds
+// client.connect(); query_timeout bounds each query on an already-open
+// connection; statement_timeout is the same bound enforced server-side, as
+// defense in depth if the client-side timer is ever bypassed. Whatever the
+// underlying `pg` error says on a timeout, it is never surfaced directly —
+// every catch block below substitutes its own redacted message.
+const CONNECTION_TIMEOUT_MS = 10_000;
+
 // The production database is genuinely named "postgres" today (see
 // docs/PRISMA_MIGRATION_GUARD.md) — a name PostgreSQL also uses for its own
 // template/administrative databases. Running a real applicative migration
@@ -107,7 +118,13 @@ async function queryServerIdentity(client) {
  */
 async function runMigrationGuard({
   env = process.env,
-  createClient = (connectionString) => new Client({ connectionString }),
+  createClient = (connectionString) =>
+    new Client({
+      connectionString,
+      connectionTimeoutMillis: CONNECTION_TIMEOUT_MS,
+      query_timeout: CONNECTION_TIMEOUT_MS,
+      statement_timeout: CONNECTION_TIMEOUT_MS,
+    }),
   spawnMigrate = () =>
     spawnSync('npx', ['prisma', 'migrate', 'deploy'], { stdio: 'inherit', env }),
   log = (message) => console.log(`[safe-prisma-migrate] ${message}`),

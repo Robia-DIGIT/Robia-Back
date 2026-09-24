@@ -32,12 +32,22 @@ de déploiement ne le détecte.
 `prisma migrate deploy` (voir l'étage `migrate` du `Dockerfile`) qui rend
 cette classe d'incident structurellement impossible.
 
+L'étage `migrate` du `Dockerfile` s'exécute avec `USER node` (même
+utilisateur non privilégié que l'étage `runtime`) : ce conteneur ouvre de
+vraies connexions réseau vers la production et n'a aucun besoin légitime de
+tourner en UID 0.
+
 ## Ce que le garde-fou vérifie, dans l'ordre
 
 1. **Présence des variables** — `DATABASE_URL`, `DIRECT_URL`,
    `EXPECTED_DATABASE_HOST`, `EXPECTED_DATABASE_NAME` doivent toutes être
    définies. Absence de l'une d'entre elles → refus immédiat, avant tout
-   accès réseau.
+   accès réseau. `EXPECTED_DATABASE_HOST`/`EXPECTED_DATABASE_NAME` sont même
+   obligatoires une étape plus tôt : `docker-compose.production.yml` les
+   déclare avec la syntaxe `${VAR:?message}`, donc `docker compose config`
+   (et par extension tout `up`/`run`) refuse déjà de résoudre le service
+   `migrate` si l'une des deux manque dans `.env.production` — le garde-fou
+   lui-même n'est même jamais atteint dans ce cas.
 2. **Cohérence déclarée** — `DATABASE_URL` et `DIRECT_URL` doivent parser
    vers la **même cible logique** : hôte, port, base de données, schéma.
    Une divergence est refusée avant même d'ouvrir une connexion.
@@ -54,7 +64,13 @@ cette classe d'incident structurellement impossible.
 5. **Connexions réelles** — le garde-fou ouvre ensuite **deux vraies
    connexions PostgreSQL** (via `pg`), une pour chaque URL. Une panne de
    connexion (PostgreSQL indisponible, identifiants invalides, etc.) est
-   refusée.
+   refusée. Chaque connexion et chaque requête est bornée à **10 secondes**
+   (`connectionTimeoutMillis`/`query_timeout` côté client, `statement_timeout`
+   côté serveur en défense en profondeur) : un serveur PostgreSQL injoignable
+   ou qui ne répond jamais échoue proprement dans ce délai plutôt que de
+   bloquer indéfiniment le pipeline de déploiement. Comme pour toute autre
+   panne de connexion, aucun détail de l'erreur `pg` sous-jacente n'est
+   journalisé — uniquement le message de refus générique ci-dessus.
 6. **Identité réelle du serveur** — sur chaque connexion, le garde-fou lit
    `current_database()`, `current_schema()`, `inet_server_addr()` et
    `inet_server_port()` :
@@ -82,9 +98,11 @@ secrets).
 
 La production actuelle cible réellement `host=db`, `database=postgres`,
 `schema=public` — d'où la présence de `postgres` dans
-`EXPECTED_DATABASE_NAME` et l'exigence explicite de
-`MIGRATION_ENVIRONMENT=production` dans `.env.production` /
-`docker-compose.production.yml` (voir la vérification n°4 ci-dessus).
+`EXPECTED_DATABASE_NAME`. `MIGRATION_ENVIRONMENT=production` (l'exigence
+explicite de la vérification n°4 ci-dessus) est déjà fixé en dur dans
+`docker-compose.production.yml` — ce Compose **est** le déploiement de
+production, cette variable n'est donc jamais lue depuis `.env.production`.
+Le VPS n'a besoin de recevoir que les deux variables suivantes :
 
 ```bash
 # .env.production (jamais versionné avec de vraies valeurs)
@@ -92,7 +110,6 @@ DATABASE_URL=postgresql://<user>:<password>@db:5432/postgres?schema=public
 DIRECT_URL=postgresql://<user>:<password>@db:5432/postgres?schema=public
 EXPECTED_DATABASE_HOST=db
 EXPECTED_DATABASE_NAME=postgres
-MIGRATION_ENVIRONMENT=production
 ```
 
 Le déploiement standard (`docker compose -f docker-compose.production.yml

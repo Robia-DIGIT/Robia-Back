@@ -18,8 +18,8 @@ services:
     environment:
       NODE_ENV: production
       MIGRATION_ENVIRONMENT: production
-      EXPECTED_DATABASE_HOST: ${EXPECTED_DATABASE_HOST}
-      EXPECTED_DATABASE_NAME: ${EXPECTED_DATABASE_NAME}
+      EXPECTED_DATABASE_HOST: ${EXPECTED_DATABASE_HOST:?Set EXPECTED_DATABASE_HOST in .env.production}
+      EXPECTED_DATABASE_NAME: ${EXPECTED_DATABASE_NAME:?Set EXPECTED_DATABASE_NAME in .env.production}
       npm_config_cache: /tmp/npm-cache
     networks:
       - supabase
