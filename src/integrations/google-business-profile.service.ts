@@ -7,6 +7,7 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  OnModuleInit,
   ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
@@ -28,6 +29,41 @@ const BUSINESS_PROFILE_SCOPE =
 const STATE_MAX_AGE_MS = 10 * 60 * 1000;
 const SYNC_CLAIM_LEASE_MS = 5 * 60 * 1000;
 const SYNC_COOLDOWN_MS = 60 * 1000;
+// RC-40.1 — Google's Business Profile APIs terms: stored content "must be
+// stored temporarily" and must not be kept "for more than 30 calendar
+// days". This applies to the location fiche too, not just reviews (RC-40).
+//
+// Two numbers, two different jobs — never conflate them:
+//   - LOCATIONS_STALE_AFTER_MS is a freshness TARGET: the cadence the
+//     scheduled refresh below aims for. Missing it (a revoked token, Google
+//     down) does not by itself violate anything.
+//   - LOCATIONS_ABSOLUTE_EXPIRY_MS is the actual compliance CEILING: once a
+//     fiche's last successful sync is older than this, it is purged and
+//     never served again, unconditionally — whether or not the refresh
+//     token is still valid, whether or not Google is reachable at all. The
+//     refresh cadence is what keeps data usable in the common case; the
+//     absolute expiry + purge below is what actually guarantees the 30-day
+//     limit is never exceeded, even under a permanent failure.
+// See docs/RC38_GOOGLE_BUSINESS_PROFILE_READONLY.md.
+const LOCATIONS_STALE_AFTER_MS = 24 * 60 * 60 * 1000;
+const LOCATIONS_ABSOLUTE_EXPIRY_MS = 29 * 24 * 60 * 60 * 1000;
+// Scheduled refresh dispatcher: deterministic, bounded batch (oldest-first)
+// so a growing customer base can never turn one cron tick into an
+// unbounded fan-out of Google calls. Processed sequentially, not with
+// bounded concurrency: each entry already does its own full Google
+// pagination internally, and capping at LOCATIONS_REFRESH_BATCH_SIZE per
+// hourly tick already bounds the total Google call volume — adding a
+// concurrency pool would only reduce wall-clock time, not call volume, at
+// the cost of bursting several organizations' Google calls at once.
+const LOCATIONS_REFRESH_BATCH_SIZE = 50;
+// A connection whose last attempt failed OR was partial is not retried
+// every hour indefinitely (a revoked token would otherwise be hammered
+// 24x/day for nothing) — it waits out this backoff, derived from
+// lastSyncStatus/lastSyncAttemptAt (no new column), before the scheduler
+// considers it again. Comfortably retried many times over before
+// LOCATIONS_ABSOLUTE_EXPIRY_MS is reached, so a transient outage still
+// recovers well before data would be purged.
+const LOCATIONS_FAILURE_BACKOFF_MS = 6 * 60 * 60 * 1000;
 // Fields used by ROBIA's extended location-details view. Deliberately
 // excludes relationshipData (chain/parent relationships), serviceItems (a
 // large structured service catalogue only meaningful for a handful of
@@ -198,13 +234,33 @@ interface GooglePerformanceResponse {
 }
 
 @Injectable()
-export class GoogleBusinessProfileService {
+export class GoogleBusinessProfileService implements OnModuleInit {
   private readonly logger = new Logger(GoogleBusinessProfileService.name);
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
   ) {}
+
+  // RC-40.1 fix — the hourly purge cron leaves a window (up to ~1h, or far
+  // longer under a prolonged scheduler outage) where an already-expired
+  // fiche sits in the database unpurged; every read path independently
+  // filters it out (defense in depth), but running the purge once at boot
+  // closes that window immediately after a deploy/restart instead of
+  // waiting for the next tick. Awaited so the purge completes before the
+  // service goes live, but best-effort, idempotent and non-fatal for
+  // startup: purgeExpiredLocations is a plain DELETE keyed only on
+  // lastSyncedAt age, so calling it twice in quick succession (e.g. a fast
+  // restart loop) just no-ops the second time, and a failure here (DB not
+  // ready yet, a transient error) is caught and logged, never thrown —
+  // module initialization must never fail because of this.
+  async onModuleInit() {
+    await this.purgeExpiredLocations().catch((error) => {
+      this.logger.warn(
+        `GBP : purge au démarrage impossible : ${error instanceof Error ? error.message : 'erreur inconnue'}`,
+      );
+    });
+  }
 
   getAuthorizationUrl(organizationId: string, userId: string) {
     const url = new URL('https://accounts.google.com/o/oauth2/v2/auth');
@@ -322,33 +378,85 @@ export class GoogleBusinessProfileService {
           lastSyncedAt: true,
           lastSyncAttemptAt: true,
           lastSyncStatus: true,
-          _count: { select: { locations: true } },
         },
       });
-    return connection
-      ? {
-          connected: true,
-          googleAccountEmail: connection.googleAccountEmail,
-          connectedAt: connection.connectedAt,
-          lastSyncedAt: connection.lastSyncedAt,
-          lastSyncAttemptAt: connection.lastSyncAttemptAt,
-          lastSyncStatus: connection.lastSyncStatus,
-          locationCount: connection._count.locations,
-        }
-      : {
-          connected: false,
-          googleAccountEmail: null,
-          connectedAt: null,
-          lastSyncedAt: null,
-          lastSyncAttemptAt: null,
-          lastSyncStatus: 'never',
-          locationCount: 0,
-        };
+    if (!connection) {
+      return {
+        connected: false,
+        googleAccountEmail: null,
+        connectedAt: null,
+        lastSyncedAt: null,
+        lastSyncAttemptAt: null,
+        lastSyncStatus: 'never',
+        locationCount: 0,
+        stale: false,
+        expired: false,
+      };
+    }
+    // RC-40.1 fix — two distinct, honest signals instead of one:
+    //   - `stale` is the freshness target (24h) — missing it just means the
+    //     scheduled refresh may be struggling; nothing has been discarded.
+    //   - `expired` is the absolute compliance ceiling (29 days, safely
+    //     under Google's 30-day cap) — once true, the fiche has actually
+    //     been purged (see purgeExpiredLocations()) and locationCount below
+    //     already reflects that, independent of whether the refresh token
+    //     is still valid or Google is reachable at all.
+    //
+    // `stale` is measured from lastSyncedAt when present, but falls back to
+    // connectedAt for a connection that has never completed a sync yet — a
+    // freshly-connected organization has had no chance to sync at all, so
+    // treating it as immediately "stale" (measuring from a null timestamp)
+    // would show a false "automatic refresh seems to be failing" warning
+    // seconds after connecting. It only becomes stale once 24h have passed
+    // without a first success. `expired`, by contrast, is deliberately
+    // measured from lastSyncedAt alone, never connectedAt: it reflects how
+    // long actual Google-sourced content has been sitting in storage, which
+    // is undefined (and irrelevant — there is nothing to expire) before a
+    // first successful sync.
+    const staleReferenceAt = connection.lastSyncedAt ?? connection.connectedAt;
+    const staleAgeMs = Date.now() - staleReferenceAt.getTime();
+    const stale = staleAgeMs > LOCATIONS_STALE_AFTER_MS;
+    const expiryAgeMs = connection.lastSyncedAt
+      ? Date.now() - connection.lastSyncedAt.getTime()
+      : null;
+    const expired =
+      expiryAgeMs !== null && expiryAgeMs > LOCATIONS_ABSOLUTE_EXPIRY_MS;
+    const locationCount = await this.prisma.googleBusinessProfileLocation.count(
+      {
+        where: {
+          organizationId,
+          lastSyncedAt: {
+            gt: new Date(Date.now() - LOCATIONS_ABSOLUTE_EXPIRY_MS),
+          },
+        },
+      },
+    );
+    return {
+      connected: true,
+      googleAccountEmail: connection.googleAccountEmail,
+      connectedAt: connection.connectedAt,
+      lastSyncedAt: connection.lastSyncedAt,
+      lastSyncAttemptAt: connection.lastSyncAttemptAt,
+      lastSyncStatus: connection.lastSyncStatus,
+      locationCount,
+      stale,
+      expired,
+    };
   }
 
   async listLocations(organizationId: string) {
+    // RC-40.1 fix — the absolute compliance ceiling: a fiche whose last
+    // successful sync is older than Google's 30-day storage cap (with
+    // margin) is never returned, regardless of why it never got refreshed
+    // (revoked token, Google outage, or simply not purged yet — this filter
+    // is what guarantees it, not the purge cron's schedule).
     return this.prisma.googleBusinessProfileLocation.findMany({
-      where: { organizationId },
+      where: {
+        organizationId,
+        lastSyncedAt: {
+          gt: new Date(Date.now() - LOCATIONS_ABSOLUTE_EXPIRY_MS),
+        },
+      },
       orderBy: [{ title: 'asc' }, { id: 'asc' }],
       include: {
         robiaLocation: {
@@ -368,17 +476,35 @@ export class GoogleBusinessProfileService {
     const connection =
       await this.prisma.googleBusinessProfileConnection.findUnique({
         where: { organizationId },
+        select: { id: true },
       });
     if (!connection) {
       throw new NotFoundException(
         "Google Business Profile n'est pas connecté.",
       );
     }
+    return this.runLocationsSync(connection.id, organizationId);
+  }
+
+  // RC-40.1 fix — takes only connectionId/organizationId, never a
+  // connection object. The claim is acquired first, purely from those two
+  // identifiers; only AFTER it succeeds does this method read the
+  // connection's refresh token / Google account subject / lastSyncedAt —
+  // and only that post-claim read is ever used. This closes a race where
+  // OAuth reconnects to a different Google account (completeAuthorization's
+  // upsert overwrites the same row, same id) between a caller's lookup and
+  // the claim: a pre-claim snapshot could otherwise carry account A's
+  // already-superseded token into a sync that only /looks/ like it belongs
+  // to the connection. If a reconnection instead lands mid-flight (after
+  // this read, before the final transaction), the transaction's own
+  // ownership re-proof (unchanged below) still catches it — that path was
+  // already correct.
+  private async runLocationsSync(connectionId: string, organizationId: string) {
     const now = new Date();
     const claimToken = randomUUID();
     const claim = await this.prisma.googleBusinessProfileConnection.updateMany({
       where: {
-        id: connection.id,
+        id: connectionId,
         OR: [
           { syncClaimedAt: null },
           {
@@ -410,7 +536,7 @@ export class GoogleBusinessProfileService {
     if (claim.count !== 1) {
       const fresh =
         await this.prisma.googleBusinessProfileConnection.findUnique({
-          where: { id: connection.id },
+          where: { id: connectionId },
           select: { syncClaimedAt: true, lastSyncAttemptAt: true },
         });
       if (
@@ -429,6 +555,17 @@ export class GoogleBusinessProfileService {
 
     let finalized = false;
     try {
+      // Fresh read, strictly after the claim succeeded — never a value
+      // carried over from before it.
+      const connection =
+        await this.prisma.googleBusinessProfileConnection.findUnique({
+          where: { id: connectionId },
+        });
+      if (!connection) {
+        throw new NotFoundException(
+          "Google Business Profile n'est pas connecté.",
+        );
+      }
       const accessToken = await this.refreshAccessToken(
         this.decrypt(connection.encryptedRefreshToken),
       );
@@ -529,7 +666,7 @@ export class GoogleBusinessProfileService {
       };
     } finally {
       if (!finalized) {
-        await this.releaseSyncClaim(connection.id, claimToken, 'failed').catch(
+        await this.releaseSyncClaim(connectionId, claimToken, 'failed').catch(
           () =>
             this.logger.warn(
               `GBP : impossible de libérer le bail de synchronisation (organization=${organizationId})`,
@@ -537,6 +674,162 @@ export class GoogleBusinessProfileService {
         );
       }
     }
+  }
+
+  // RC-40.1 — automatic scheduled refresh of the location fiche, so an
+  // organization that never re-clicks "Synchroniser" never keeps a
+  // Google-sourced copy in storage indefinitely. Runs hourly; deterministic
+  // and bounded (capped batch, no refresh token ever loaded for the scan) so
+  // a growing customer base can't turn one tick into an unbounded fan-out of
+  // Google calls. A connection whose last attempt failed or was partial
+  // backs off instead of being retried every hour — see
+  // LOCATIONS_FAILURE_BACKOFF_MS. It drives runLocationsSync() through the
+  // exact same claim/lease as a manual sync, so the two can never race, and
+  // that method's own fresh post-claim read is what actually gets used —
+  // this scan intentionally carries no account-specific data at all. One
+  // organization's failure (revoked token, transient Google error, or
+  // simply a concurrent manual sync already holding the claim) is logged
+  // and skipped — it must never stop the batch for every other connection.
+  // Sequential by design, not bounded concurrency: see
+  // LOCATIONS_REFRESH_BATCH_SIZE above for why.
+  //
+  // Ordering fix — a batch this small (50) next to a growing customer base
+  // must never let a block of permanently-failing connections starve out
+  // everyone else: ordering primarily by `lastSyncedAt` (as an earlier
+  // version of this dispatcher did) is exactly that trap, because a
+  // connection stuck in a failure loop never advances its `lastSyncedAt` at
+  // all, so it keeps sorting first forever, crowding out connections that
+  // have never even had a first attempt. Ordering primarily by
+  // `lastSyncAttemptAt` instead fixes this structurally: every attempt
+  // (success, failure, or partial) advances it to "now", so a
+  // repeatedly-failing connection's turn moves to the back of the queue
+  // after each try, and a connection that has NEVER been attempted
+  // (`lastSyncAttemptAt: null`) always sorts first via `nulls: 'first'` —
+  // it can never be starved out by any number of already-tried connections,
+  // however many are failing. `lastSyncedAt` remains the tiebreaker among
+  // connections with the same attempt recency, and `id` the final one for
+  // full determinism.
+  @Cron(CronExpression.EVERY_HOUR)
+  async refreshStaleLocations() {
+    const staleBefore = new Date(Date.now() - LOCATIONS_STALE_AFTER_MS);
+    const failureBackoffBefore = new Date(
+      Date.now() - LOCATIONS_FAILURE_BACKOFF_MS,
+    );
+    const claimLeaseBefore = new Date(Date.now() - SYNC_CLAIM_LEASE_MS);
+    const connections =
+      await this.prisma.googleBusinessProfileConnection.findMany({
+        where: {
+          OR: [{ lastSyncedAt: null }, { lastSyncedAt: { lt: staleBefore } }],
+          AND: [
+            {
+              OR: [
+                { lastSyncStatus: { notIn: ['failed', 'partial'] } },
+                { lastSyncAttemptAt: { lt: failureBackoffBefore } },
+              ],
+            },
+            // A connection whose claim lease is still active (a manual
+            // sync, or another worker, already holds it) is excluded from
+            // the scan itself rather than merely failing its claim attempt
+            // once selected — so it never consumes one of the batch's 50
+            // slots at another connection's expense. runLocationsSync()'s
+            // own claim/lease check remains the authority against a race
+            // (a claim acquired between this scan and the claim attempt
+            // below is still handled correctly, just less commonly hit).
+            {
+              OR: [
+                { syncClaimedAt: null },
+                { syncClaimedAt: { lt: claimLeaseBefore } },
+              ],
+            },
+          ],
+        },
+        select: { id: true, organizationId: true },
+        orderBy: [
+          { lastSyncAttemptAt: { sort: 'asc', nulls: 'first' } },
+          { lastSyncedAt: { sort: 'asc', nulls: 'first' } },
+          { id: 'asc' },
+        ],
+        take: LOCATIONS_REFRESH_BATCH_SIZE,
+      });
+    for (const connection of connections) {
+      try {
+        await this.runLocationsSync(connection.id, connection.organizationId);
+      } catch (error) {
+        this.logger.warn(
+          `GBP : resynchronisation planifiée de la fiche ignorée (organization=${connection.organizationId}) : ${
+            error instanceof Error ? error.message : 'erreur inconnue'
+          }`,
+        );
+      }
+    }
+  }
+
+  // RC-40.1 — the absolute compliance ceiling in force: unlike the refresh
+  // above, this purge needs nothing from Google and cannot itself fail due
+  // to a revoked token or a Google outage — it only ever reads/writes
+  // ROBIA's own database, so it is what actually guarantees the fiche is
+  // never kept past Google's 30-day storage cap even under a permanent
+  // connection failure. listLocations()/getStatus() already filter out
+  // anything past this ceiling on every read, independent of whether this
+  // cron has run yet; this is hygiene, not the enforcement mechanism.
+  //
+  // Residual risk this doesn't cover: if this cron itself stops running for
+  // a prolonged period (a stuck event loop, a scheduler registration bug,
+  // an extended outage) with the process never restarting, already-expired
+  // rows are never served (every read path filters independently) but do
+  // keep sitting at rest in the database past the 30-day window until the
+  // next boot's onModuleInit() purge or the next successful tick — a
+  // storage-hygiene/compliance-posture gap, not a data-leak one. The
+  // gbp_location_retention heartbeat below is the signal to alert on for
+  // this; because it is only emitted from within this same cron, a
+  // scheduler outage also silences the heartbeat that would reveal it, so
+  // monitoring must alert on the heartbeat's absence (no log line in the
+  // expected window), not only on its values.
+  @Cron(CronExpression.EVERY_HOUR)
+  async purgeExpiredLocations() {
+    const expiredBefore = new Date(Date.now() - LOCATIONS_ABSOLUTE_EXPIRY_MS);
+    const result = await this.prisma.googleBusinessProfileLocation.deleteMany({
+      where: { lastSyncedAt: { lte: expiredBefore } },
+    });
+    if (result.count > 0) {
+      this.logger.log(
+        `GBP : purge de ${result.count} fiche(s) établissement expirée(s).`,
+      );
+    }
+    await this.logLocationsRetentionMetric();
+  }
+
+  // RC-40.1 fix — an unconditional heartbeat, not a conditional metric: it
+  // is emitted every single time this runs, zero rows included, so its own
+  // *absence* from the logs (rather than any particular value) is what
+  // reveals a dead scheduler — a metric that only logs when there's
+  // something to report is indistinguishable, from the outside, from a
+  // scheduler that stopped running entirely. Emitted right after a purge
+  // pass so it reflects the ceiling actually in force, not a stale
+  // pre-purge value. A single aggregate query (count + min(lastSyncedAt))
+  // rather than a separate count() and findFirst() — the same round trip
+  // that a count-then-oldest pair would cost, but as one query instead of
+  // two. No dedicated metrics backend is wired up yet (same approach as
+  // NotificationDispatcherService's/N8nWebhookService's structured `metric`
+  // log lines) — this is a plain, structured log line an external alert can
+  // match on. Under normal operation maxAgeHours should stay small (well
+  // under ceilingHours); a value climbing towards the ceiling means the
+  // scheduled refresh has itself been failing for a long time, undetected
+  // because nothing here has actually violated the ceiling yet.
+  private async logLocationsRetentionMetric() {
+    const result = await this.prisma.googleBusinessProfileLocation.aggregate({
+      _count: true,
+      _min: { lastSyncedAt: true },
+    });
+    const oldest = result._min.lastSyncedAt;
+    this.logger.log({
+      metric: 'gbp_location_retention',
+      rowCount: result._count,
+      maxAgeHours: oldest
+        ? Math.round((Date.now() - oldest.getTime()) / (60 * 60 * 1000))
+        : null,
+      ceilingHours: Math.round(LOCATIONS_ABSOLUTE_EXPIRY_MS / (60 * 60 * 1000)),
+    });
   }
 
   private async releaseSyncClaim(
@@ -554,16 +847,26 @@ export class GoogleBusinessProfileService {
     });
   }
 
+  // RC-40.1 fix — routed through findOwnedLocation() (rather than a
+  // standalone findFirst) so an expired fiche is exactly as unreachable
+  // here as it is for reviews/performance. The two lookups still resolve
+  // in parallel and a missing/expired fiche still collapses into the same
+  // NotFoundException as a missing ROBIA location — but only a
+  // NotFoundException is caught here. Anything else (a Prisma error, a
+  // timeout, a genuine internal failure) is rethrown as-is: it must surface
+  // as a server error, never be silently reinterpreted as "not found".
   async linkLocation(
     organizationId: string,
     googleLocationId: string,
     robiaLocationId: string,
   ) {
     const [googleLocation, robiaLocation] = await Promise.all([
-      this.prisma.googleBusinessProfileLocation.findFirst({
-        where: { id: googleLocationId, organizationId },
-        select: { id: true },
-      }),
+      this.findOwnedLocation(organizationId, googleLocationId).catch(
+        (error: unknown) => {
+          if (error instanceof NotFoundException) return null;
+          throw error;
+        },
+      ),
       this.prisma.location.findFirst({
         where: { id: robiaLocationId, organizationId },
         select: { id: true },
@@ -579,11 +882,10 @@ export class GoogleBusinessProfileService {
   }
 
   async unlinkLocation(organizationId: string, googleLocationId: string) {
-    const location = await this.prisma.googleBusinessProfileLocation.findFirst({
-      where: { id: googleLocationId, organizationId },
-      select: { id: true },
-    });
-    if (!location) throw new NotFoundException('Établissement introuvable.');
+    const location = await this.findOwnedLocation(
+      organizationId,
+      googleLocationId,
+    );
     return this.prisma.googleBusinessProfileLocation.update({
       where: { id: location.id },
       data: { robiaLocationId: null },
@@ -1089,23 +1391,45 @@ export class GoogleBusinessProfileService {
         data: null,
       };
     }
-    if (status.lastSyncStatus !== 'success') {
+    // RC-40.1 fix — expired and stale must never resolve to a silent 'ok':
+    // `expired` means the fiche has actually been purged server-side
+    // (locationCount already reflects that — never presented as healthy
+    // just because a sync happened to succeed before it went stale), and
+    // `stale` means the scheduled refresh may itself be failing even though
+    // the last attempt that did complete was a success. Either one — like a
+    // non-'success' lastSyncStatus — degrades this to 'partial', explicit
+    // in `data` for Command Center to distinguish the reason.
+    const data = {
+      locationCount: status.locationCount,
+      expired: status.expired,
+      stale: status.stale,
+    };
+    if (status.expired || status.stale || status.lastSyncStatus !== 'success') {
       return {
         status: 'partial' as const,
         observedAt: status.lastSyncedAt,
-        data: { locationCount: status.locationCount },
+        data,
       };
     }
-    return {
-      status: 'ok' as const,
-      observedAt: status.lastSyncedAt,
-      data: { locationCount: status.locationCount },
-    };
+    return { status: 'ok' as const, observedAt: status.lastSyncedAt, data };
   }
 
+  // RC-40.1 fix — the single source of truth for the absolute expiry
+  // ceiling on every identifier-based route (link/unlink, reviews,
+  // performance): an expired fiche is treated as not found at all, exactly
+  // like listLocations()/getStatus() already treat it on the listing paths.
+  // This runs before any Google call on every caller (findOwnedLocationWithConnection,
+  // syncReviews, getPerformanceMetrics all call this first), so an expired
+  // fiche can never trigger a Google request either.
   private async findOwnedLocation(organizationId: string, locationId: string) {
     const location = await this.prisma.googleBusinessProfileLocation.findFirst({
-      where: { id: locationId, organizationId },
+      where: {
+        id: locationId,
+        organizationId,
+        lastSyncedAt: {
+          gt: new Date(Date.now() - LOCATIONS_ABSOLUTE_EXPIRY_MS),
+        },
+      },
     });
     if (!location) throw new NotFoundException('Établissement introuvable.');
     return location;
