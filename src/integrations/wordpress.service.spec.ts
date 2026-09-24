@@ -565,4 +565,34 @@ describe('WordPressService', () => {
     expect(prisma.actionItem.updateMany).not.toHaveBeenCalled();
     expect(prisma.actionExecutionEvent.create).not.toHaveBeenCalled();
   });
+
+  it('exposes the document revision each attempt was created for, from its approval', async () => {
+    const { prisma, service } = harness();
+    prisma.website.findFirst.mockResolvedValue({ id: websiteId });
+    prisma.wordPressDraftAttempt.findMany.mockResolvedValue([
+      {
+        id: 'attempt-1',
+        approvalId: 'approval-1',
+        documentId: 'document-1',
+        actionItemId: 'action-1',
+        status: 'confirmed',
+        remotePostId: '42',
+        remoteUrl: 'https://example.com/?p=42',
+        remoteEditorUrl: 'https://example.com/wp-admin/post.php?post=42',
+        errorCode: null,
+        createdAt: new Date('2026-09-24T08:00:00Z'),
+        updatedAt: new Date('2026-09-24T08:00:00Z'),
+        confirmedAt: new Date('2026-09-24T08:00:00Z'),
+        approval: { documentRevision: 3 },
+      },
+    ]);
+
+    const attempts = await service.listAttempts(organizationId, websiteId);
+
+    expect(attempts).toEqual([
+      expect.objectContaining({ id: 'attempt-1', documentRevision: 3 }),
+    ]);
+    // The join detail never leaks into the response shape callers consume.
+    expect(attempts[0]).not.toHaveProperty('approval');
+  });
 });

@@ -639,7 +639,7 @@ export class WordPressService {
 
   async listAttempts(organizationId: string, websiteId: string) {
     await this.requireWebsite(organizationId, websiteId);
-    return this.prisma.wordPressDraftAttempt.findMany({
+    const attempts = await this.prisma.wordPressDraftAttempt.findMany({
       where: { organizationId, connection: { websiteId } },
       select: {
         id: true,
@@ -654,10 +654,20 @@ export class WordPressService {
         createdAt: true,
         updatedAt: true,
         confirmedAt: true,
+        // The attempt row itself never stores the revision it was created
+        // for — only its approval does. Exposing it here lets callers tell
+        // a canonical attempt for the document's CURRENT revision apart
+        // from a stale one left over from an earlier revision, without a
+        // second round-trip per attempt.
+        approval: { select: { documentRevision: true } },
       },
       orderBy: { createdAt: 'desc' },
       take: 100,
     });
+    return attempts.map(({ approval, ...attempt }) => ({
+      ...attempt,
+      documentRevision: approval.documentRevision,
+    }));
   }
 
   private async publicationContext(organizationId: string, approvalId: string) {
