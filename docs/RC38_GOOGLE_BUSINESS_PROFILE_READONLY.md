@@ -231,11 +231,11 @@ ci-dessus, tous corrigés dans ce même lot :
   expirer).
 - **Purge opérationnelle renforcée** : `purgeExpiredLocations()` s'exécute
   désormais aussi une fois au démarrage du backend (`onModuleInit()`),
-  idempotent et sans jamais bloquer ni faire échouer le démarrage, pour
-  réduire la fenêtre entre un redémarrage et la prochaine purge horaire.
-  Elle émet également une métrique structurée
-  (`metric: 'gbp_location_max_age_hours'`) sur l'âge de la fiche la plus
-  ancienne encore présente, à surveiller par une alerte externe.
+  best-effort, idempotent et non fatal pour le démarrage, pour réduire la
+  fenêtre entre un redémarrage et la prochaine purge horaire. Elle émet
+  également un heartbeat structuré (`metric: 'gbp_location_retention'`,
+  détaillé dans la correction suivante) sur l'état de rétention réel, à
+  surveiller par une alerte externe.
 
 **Risque résiduel réel** (remplace toute affirmation antérieure d'absence de
 risque) : si le cron horaire de purge s'arrête pendant une durée prolongée
@@ -244,11 +244,44 @@ risque) : si le cron horaire de purge s'arrête pendant une durée prolongée
 jamais servie (chaque chemin de lecture filtre indépendamment), mais elle
 reste physiquement en base au-delà des 30 jours jusqu'au prochain démarrage
 ou au prochain passage réussi du cron — un problème d'hygiène de stockage/
-posture de conformité, pas de fuite de donnée. La métrique
-`gbp_location_max_age_hours` n'étant émise que par ce même cron, une panne
-du scheduler la fait taire aussi : la surveillance doit donc alerter sur
-l'**absence** de cette métrique dans la fenêtre attendue, pas seulement sur
-sa valeur.
+posture de conformité, pas de fuite de donnée. Le heartbeat
+`gbp_location_retention` n'étant émis que par ce même cron, une panne du
+scheduler le fait taire aussi : la surveillance doit donc alerter sur
+l'**absence** de ce heartbeat dans la fenêtre attendue, pas seulement sur ses
+valeurs.
+
+### Correction 2 — masquage d'erreur dans linkLocation, heartbeat conditionnel, formulation onModuleInit
+
+Une seconde relecture, ciblée sur `Robia-Back#64` uniquement, a identifié
+trois défauts supplémentaires :
+
+- **`linkLocation()` masquait les erreurs internes** : le `.catch(() =>
+  null)` posé autour de `findOwnedLocation()` pour fusionner « fiche
+  expirée » et « fiche introuvable » en un même 404 attrapait *toute*
+  rejection, y compris une erreur Prisma, un timeout ou une panne interne
+  réelle — qui se retrouvait alors réinterprétée à tort comme un simple
+  « établissement introuvable » (404) au lieu de remonter comme une erreur
+  serveur. Corrigé : seul un `NotFoundException` est intercepté et
+  transformé en `null` ; toute autre erreur est relancée telle quelle.
+- **Heartbeat de rétention conditionnel** : `logLocationsRetentionMetric()`
+  ne loggait rien en l'absence de toute fiche (`return` anticipé), ce qui
+  rendait « zéro fiche » indiscernable, dans les logs, d'un scheduler
+  purement et simplement arrêté — exactement le scénario que ce heartbeat
+  est censé révéler. Il est désormais émis **sans condition**, à chaque
+  exécution, avec le format `{ metric: 'gbp_location_retention', rowCount:
+  number, maxAgeHours: number | null, ceilingHours: number }` —
+  `maxAgeHours: null` quand `rowCount` est `0`. Une seule requête Prisma
+  `aggregate()` (`_count` + `_min(lastSyncedAt)`) calcule les deux valeurs en
+  un aller-retour, au lieu d'un `count()` et d'un `findFirst()` séparés.
+- **Formulation `onModuleInit()`** : la purge au démarrage était déjà
+  `await`-ée (donc terminée avant la mise en service) avec son erreur
+  capturée sans jamais la relancer — le comportement était déjà correct,
+  seule la formulation en commentaire (« non bloquant ») prêtait à confusion
+  avec un appel fire-and-forget non attendu. Reformulé partout en
+  « best-effort, idempotent et non fatal pour le démarrage », qui décrit
+  précisément ce qui est garanti : la purge s'exécute avant que le service
+  ne soit prêt, une panne ne fait jamais échouer le démarrage, et l'appeler
+  plusieurs fois de suite reste sans risque.
 
 ## Hors périmètre explicite
 

@@ -47,6 +47,7 @@ describe('GoogleBusinessProfileService', () => {
       updateMany: jest.Mock;
       deleteMany: jest.Mock;
       count: jest.Mock;
+      aggregate: jest.Mock;
     };
     googleBusinessProfileReview: {
       findMany: jest.Mock;
@@ -78,6 +79,9 @@ describe('GoogleBusinessProfileService', () => {
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
         deleteMany: jest.fn(),
         count: jest.fn(),
+        aggregate: jest
+          .fn()
+          .mockResolvedValue({ _count: 0, _min: { lastSyncedAt: null } }),
       },
       googleBusinessProfileReview: {
         findMany: jest.fn(),
@@ -1392,49 +1396,121 @@ describe('GoogleBusinessProfileService', () => {
         );
       });
 
-      it('never deletes still-fresh data — logs nothing when there is nothing to purge and no rows remain', async () => {
+      it('logs nothing but the heartbeat when there is nothing to purge', async () => {
         prisma.googleBusinessProfileLocation.deleteMany.mockResolvedValue({
           count: 0,
         });
         const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation();
         await service.purgeExpiredLocations();
-        expect(logSpy).not.toHaveBeenCalled();
-        logSpy.mockRestore();
-      });
-
-      // RC-40.1 fix — operational monitoring: the oldest remaining row's
-      // age, so an alert can catch the scheduler having silently stopped
-      // long before any row would actually breach the 30-day ceiling.
-      it('emits a structured max-age metric for the oldest still-present fiche after purging', async () => {
-        prisma.googleBusinessProfileLocation.deleteMany.mockResolvedValue({
-          count: 0,
-        });
-        prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue({
-          lastSyncedAt: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000),
-        });
-        const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation();
-        await service.purgeExpiredLocations();
-        const metricCalls = callArgs<Record<string, unknown>>(
+        const calls = callArgs<Record<string, unknown>>(
           logSpy as unknown as jest.Mock,
         );
-        const metricCall = metricCalls.find(
-          (call) => call.metric === 'gbp_location_max_age_hours',
-        );
-        expect(metricCall).toBeDefined();
-        expect(metricCall!.ageHours).toBeCloseTo(10 * 24, 0);
-        expect(metricCall!.ceilingHours).toBe(29 * 24);
+        expect(calls).toHaveLength(1);
+        expect(calls[0].metric).toBe('gbp_location_retention');
         logSpy.mockRestore();
       });
 
-      it('emits no max-age metric when no location rows exist at all', async () => {
-        prisma.googleBusinessProfileLocation.deleteMany.mockResolvedValue({
-          count: 0,
+      // RC-40.1 fix — an unconditional heartbeat: its own *absence* from the
+      // logs (not any particular value) is what an alert watches for, since
+      // a scheduler that has stopped running entirely would otherwise look
+      // identical to one that simply has nothing to report.
+      describe('gbp_location_retention heartbeat', () => {
+        it('is emitted even when zero fiches exist — rowCount:0, maxAgeHours:null', async () => {
+          prisma.googleBusinessProfileLocation.deleteMany.mockResolvedValue({
+            count: 0,
+          });
+          prisma.googleBusinessProfileLocation.aggregate.mockResolvedValue({
+            _count: 0,
+            _min: { lastSyncedAt: null },
+          });
+          const logSpy = jest
+            .spyOn(Logger.prototype, 'log')
+            .mockImplementation();
+          await service.purgeExpiredLocations();
+          const metricCall = callArgs<Record<string, unknown>>(
+            logSpy as unknown as jest.Mock,
+          ).find((call) => call.metric === 'gbp_location_retention');
+          expect(metricCall).toEqual({
+            metric: 'gbp_location_retention',
+            rowCount: 0,
+            maxAgeHours: null,
+            ceilingHours: 29 * 24,
+          });
+          logSpy.mockRestore();
         });
-        prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(null);
-        const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation();
-        await service.purgeExpiredLocations();
-        expect(logSpy).not.toHaveBeenCalled();
-        logSpy.mockRestore();
+
+        it('reports the real row count and the oldest fiche age when fiches exist', async () => {
+          prisma.googleBusinessProfileLocation.deleteMany.mockResolvedValue({
+            count: 0,
+          });
+          prisma.googleBusinessProfileLocation.aggregate.mockResolvedValue({
+            _count: 7,
+            _min: {
+              lastSyncedAt: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000),
+            },
+          });
+          const logSpy = jest
+            .spyOn(Logger.prototype, 'log')
+            .mockImplementation();
+          await service.purgeExpiredLocations();
+          const metricCall = callArgs<{
+            metric: string;
+            rowCount: number;
+            maxAgeHours: number;
+            ceilingHours: number;
+          }>(logSpy as unknown as jest.Mock).find(
+            (call) => call.metric === 'gbp_location_retention',
+          );
+          expect(metricCall).toBeDefined();
+          expect(metricCall!.rowCount).toBe(7);
+          expect(metricCall!.maxAgeHours).toBeCloseTo(10 * 24, 0);
+          expect(metricCall!.ceilingHours).toBe(29 * 24);
+          logSpy.mockRestore();
+        });
+
+        it('computes its values from the post-purge state — the aggregate is queried after the delete', async () => {
+          prisma.googleBusinessProfileLocation.deleteMany.mockResolvedValue({
+            count: 3,
+          });
+          prisma.googleBusinessProfileLocation.aggregate.mockResolvedValue({
+            _count: 2,
+            _min: { lastSyncedAt: new Date(Date.now() - 60 * 60 * 1000) },
+          });
+          const callOrder: string[] = [];
+          prisma.googleBusinessProfileLocation.deleteMany.mockImplementation(
+            () => {
+              callOrder.push('deleteMany');
+              return Promise.resolve({ count: 3 });
+            },
+          );
+          prisma.googleBusinessProfileLocation.aggregate.mockImplementation(
+            () => {
+              callOrder.push('aggregate');
+              return Promise.resolve({
+                _count: 2,
+                _min: { lastSyncedAt: new Date(Date.now() - 60 * 60 * 1000) },
+              });
+            },
+          );
+          await service.purgeExpiredLocations();
+          expect(callOrder).toEqual(['deleteMany', 'aggregate']);
+        });
+
+        it('uses a single aggregate query for both row count and oldest age, never a separate count() and findFirst()', async () => {
+          prisma.googleBusinessProfileLocation.deleteMany.mockResolvedValue({
+            count: 0,
+          });
+          await service.purgeExpiredLocations();
+          expect(
+            prisma.googleBusinessProfileLocation.aggregate,
+          ).toHaveBeenCalledTimes(1);
+          expect(
+            prisma.googleBusinessProfileLocation.count,
+          ).not.toHaveBeenCalled();
+          expect(
+            prisma.googleBusinessProfileLocation.findFirst,
+          ).not.toHaveBeenCalled();
+        });
       });
     });
 
@@ -1570,6 +1646,38 @@ describe('GoogleBusinessProfileService', () => {
       await expect(
         service.linkLocation('org-1', 'expired-loc', 'robia-1'),
       ).rejects.toBeInstanceOf(NotFoundException);
+      expect(
+        prisma.googleBusinessProfileLocation.update,
+      ).not.toHaveBeenCalled();
+    });
+
+    it('linkLocation returns 404 for a fiche that simply does not exist', async () => {
+      // Same query shape as the expired case above — findOwnedLocation()'s
+      // WHERE clause returns no row either way, and that ambiguity is
+      // intentional: from the caller's perspective, an expired fiche must
+      // be exactly as unreachable as one that was never there.
+      prisma.googleBusinessProfileLocation.findFirst.mockResolvedValue(null);
+      prisma.location.findFirst.mockResolvedValue({ id: 'robia-1' });
+      await expect(
+        service.linkLocation('org-1', 'never-existed', 'robia-1'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(
+        prisma.googleBusinessProfileLocation.update,
+      ).not.toHaveBeenCalled();
+    });
+
+    // RC-40.1 fix — `.catch(() => null)` used to swallow every rejection
+    // from findOwnedLocation(), including a genuine internal failure, and
+    // reinterpret it as a plain 404. Only a NotFoundException may collapse
+    // into "not found"; anything else (a Prisma error, a timeout) must
+    // surface as-is.
+    it('linkLocation propagates an internal error instead of masking it as a 404', async () => {
+      const dbError = new Error('Connection terminated unexpectedly');
+      prisma.googleBusinessProfileLocation.findFirst.mockRejectedValue(dbError);
+      prisma.location.findFirst.mockResolvedValue({ id: 'robia-1' });
+      await expect(
+        service.linkLocation('org-1', 'loc-1', 'robia-1'),
+      ).rejects.toBe(dbError);
       expect(
         prisma.googleBusinessProfileLocation.update,
       ).not.toHaveBeenCalled();

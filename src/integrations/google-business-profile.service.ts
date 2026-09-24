@@ -247,10 +247,13 @@ export class GoogleBusinessProfileService implements OnModuleInit {
   // fiche sits in the database unpurged; every read path independently
   // filters it out (defense in depth), but running the purge once at boot
   // closes that window immediately after a deploy/restart instead of
-  // waiting for the next tick. Safe to call any time: purgeExpiredLocations
-  // is a plain, idempotent DELETE keyed only on lastSyncedAt age, so calling
-  // it twice in quick succession (e.g. a fast restart loop) just no-ops the
-  // second time. Never allowed to block or fail startup.
+  // waiting for the next tick. Awaited so the purge completes before the
+  // service goes live, but best-effort, idempotent and non-fatal for
+  // startup: purgeExpiredLocations is a plain DELETE keyed only on
+  // lastSyncedAt age, so calling it twice in quick succession (e.g. a fast
+  // restart loop) just no-ops the second time, and a failure here (DB not
+  // ready yet, a transient error) is caught and logged, never thrown —
+  // module initialization must never fail because of this.
   async onModuleInit() {
     await this.purgeExpiredLocations().catch((error) => {
       this.logger.warn(
@@ -777,11 +780,11 @@ export class GoogleBusinessProfileService implements OnModuleInit {
   // keep sitting at rest in the database past the 30-day window until the
   // next boot's onModuleInit() purge or the next successful tick — a
   // storage-hygiene/compliance-posture gap, not a data-leak one. The
-  // gbp_location_max_age_hours metric below is the signal to alert on for
+  // gbp_location_retention heartbeat below is the signal to alert on for
   // this; because it is only emitted from within this same cron, a
-  // scheduler outage also silences the metric that would reveal it, so
-  // monitoring must alert on the metric's absence (no log line in the
-  // expected window), not only on its value.
+  // scheduler outage also silences the heartbeat that would reveal it, so
+  // monitoring must alert on the heartbeat's absence (no log line in the
+  // expected window), not only on its values.
   @Cron(CronExpression.EVERY_HOUR)
   async purgeExpiredLocations() {
     const expiredBefore = new Date(Date.now() - LOCATIONS_ABSOLUTE_EXPIRY_MS);
@@ -796,27 +799,35 @@ export class GoogleBusinessProfileService implements OnModuleInit {
     await this.logLocationsRetentionMetric();
   }
 
-  // RC-40.1 — operational visibility on the oldest still-present GBP
-  // location row, emitted right after a purge pass (so it reflects the
-  // ceiling actually in force, not a stale pre-purge value). No dedicated
-  // metrics backend is wired up yet (same approach as
+  // RC-40.1 fix — an unconditional heartbeat, not a conditional metric: it
+  // is emitted every single time this runs, zero rows included, so its own
+  // *absence* from the logs (rather than any particular value) is what
+  // reveals a dead scheduler — a metric that only logs when there's
+  // something to report is indistinguishable, from the outside, from a
+  // scheduler that stopped running entirely. Emitted right after a purge
+  // pass so it reflects the ceiling actually in force, not a stale
+  // pre-purge value. A single aggregate query (count + min(lastSyncedAt))
+  // rather than a separate count() and findFirst() — the same round trip
+  // that a count-then-oldest pair would cost, but as one query instead of
+  // two. No dedicated metrics backend is wired up yet (same approach as
   // NotificationDispatcherService's/N8nWebhookService's structured `metric`
   // log lines) — this is a plain, structured log line an external alert can
-  // match on. Under normal operation this should stay small (well under
-  // ceilingHours); a value climbing towards the ceiling means the scheduled
-  // refresh has itself been failing for a long time, undetected because
-  // nothing here has actually violated the ceiling yet.
+  // match on. Under normal operation maxAgeHours should stay small (well
+  // under ceilingHours); a value climbing towards the ceiling means the
+  // scheduled refresh has itself been failing for a long time, undetected
+  // because nothing here has actually violated the ceiling yet.
   private async logLocationsRetentionMetric() {
-    const oldest = await this.prisma.googleBusinessProfileLocation.findFirst({
-      orderBy: { lastSyncedAt: 'asc' },
-      select: { lastSyncedAt: true },
+    const result = await this.prisma.googleBusinessProfileLocation.aggregate({
+      _count: true,
+      _min: { lastSyncedAt: true },
     });
-    if (!oldest) return;
+    const oldest = result._min.lastSyncedAt;
     this.logger.log({
-      metric: 'gbp_location_max_age_hours',
-      ageHours: Math.round(
-        (Date.now() - oldest.lastSyncedAt.getTime()) / (60 * 60 * 1000),
-      ),
+      metric: 'gbp_location_retention',
+      rowCount: result._count,
+      maxAgeHours: oldest
+        ? Math.round((Date.now() - oldest.getTime()) / (60 * 60 * 1000))
+        : null,
       ceilingHours: Math.round(LOCATIONS_ABSOLUTE_EXPIRY_MS / (60 * 60 * 1000)),
     });
   }
@@ -838,9 +849,12 @@ export class GoogleBusinessProfileService implements OnModuleInit {
 
   // RC-40.1 fix — routed through findOwnedLocation() (rather than a
   // standalone findFirst) so an expired fiche is exactly as unreachable
-  // here as it is for reviews/performance: `.catch(() => null)` preserves
-  // the original behavior of resolving both lookups in parallel and
-  // collapsing either miss into the same NotFoundException.
+  // here as it is for reviews/performance. The two lookups still resolve
+  // in parallel and a missing/expired fiche still collapses into the same
+  // NotFoundException as a missing ROBIA location — but only a
+  // NotFoundException is caught here. Anything else (a Prisma error, a
+  // timeout, a genuine internal failure) is rethrown as-is: it must surface
+  // as a server error, never be silently reinterpreted as "not found".
   async linkLocation(
     organizationId: string,
     googleLocationId: string,
@@ -848,7 +862,10 @@ export class GoogleBusinessProfileService implements OnModuleInit {
   ) {
     const [googleLocation, robiaLocation] = await Promise.all([
       this.findOwnedLocation(organizationId, googleLocationId).catch(
-        () => null,
+        (error: unknown) => {
+          if (error instanceof NotFoundException) return null;
+          throw error;
+        },
       ),
       this.prisma.location.findFirst({
         where: { id: robiaLocationId, organizationId },
