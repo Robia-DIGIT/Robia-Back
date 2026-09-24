@@ -191,6 +191,65 @@ garantir la conformité si une panne peut être permanente — c'est le plafond
 absolu + la purge qui la garantissent, indépendamment de l'état du jeton
 Google ou de la disponibilité de Google.
 
+### Correction — famine du dispatcher, signal Intelligence, expiration sur les routes par identifiant, première synchronisation
+
+Une relecture a identifié cinq défauts dans la version initiale de RC40.1
+ci-dessus, tous corrigés dans ce même lot :
+
+- **Famine du dispatcher** : trier uniquement par `lastSyncedAt` (comme la
+  version initiale le faisait) n'avance jamais pour une connexion bloquée en
+  échec — elle continuait donc à sortir en tête indéfiniment, au risque
+  d'empêcher une connexion jamais tentée d'être un jour sélectionnée. Le tri
+  est désormais **d'abord** `lastSyncAttemptAt asc nulls first` (toute
+  tentative, succès ou échec, avance ce champ à « maintenant », donc une
+  connexion qui échoue en boucle recule systématiquement dans la file après
+  chaque essai ; une connexion jamais tentée reste toujours en tête via
+  `nulls: 'first'`), puis `lastSyncedAt asc nulls first` comme
+  départage, puis `id asc`. Le backoff s'applique désormais à `failed`
+  **et** `partial` (pas seulement `failed`). Une connexion dont le bail est
+  encore actif est en outre exclue du scan lui-même (plutôt que de simplement
+  échouer sa tentative de bail une fois sélectionnée), pour ne jamais
+  consommer une place du lot de 50 à la place d'une autre connexion.
+- **Signal Intelligence/Command Center** : `getIntelligenceSignal()` ne
+  retourne plus jamais `'ok'` lorsque `expired` ou `stale` est vrai, même si
+  la dernière tentative enregistrée était un succès — les deux dégradent
+  désormais explicitement vers `'partial'`, avec `expired`/`stale` exposés
+  dans `data` pour que Command Center distingue la raison. Un connecteur
+  expiré à `locationCount: 0` n'est ainsi plus jamais présenté comme sain.
+- **Expiration sur les routes par identifiant** : `findOwnedLocation()` (le
+  point d'entrée commun à `link`/`unlink`, `listReviews`/`syncReviews` et
+  `getPerformanceMetrics`) filtre désormais aussi par le plafond absolu —
+  une fiche expirée est introuvable par ces routes exactement comme elle
+  l'est déjà par `listLocations()`, et aucun appel Google n'est possible sur
+  une fiche expirée puisque cette résolution a lieu avant tout appel Google.
+- **Première synchronisation** : une connexion tout juste créée
+  (`lastSyncedAt: null`) n'est plus immédiatement marquée `stale` — la
+  fraîcheur se mesure désormais depuis `lastSyncedAt` si présent, sinon
+  depuis `connectedAt`, et ne devient `stale` qu'après 24h sans premier
+  succès. L'expiration, elle, reste calculée uniquement à partir de
+  `lastSyncedAt` (une connexion sans aucune synchronisation n'a rien à
+  expirer).
+- **Purge opérationnelle renforcée** : `purgeExpiredLocations()` s'exécute
+  désormais aussi une fois au démarrage du backend (`onModuleInit()`),
+  idempotent et sans jamais bloquer ni faire échouer le démarrage, pour
+  réduire la fenêtre entre un redémarrage et la prochaine purge horaire.
+  Elle émet également une métrique structurée
+  (`metric: 'gbp_location_max_age_hours'`) sur l'âge de la fiche la plus
+  ancienne encore présente, à surveiller par une alerte externe.
+
+**Risque résiduel réel** (remplace toute affirmation antérieure d'absence de
+risque) : si le cron horaire de purge s'arrête pendant une durée prolongée
+(boucle d'événements bloquée, bug d'enregistrement du scheduler, panne
+étendue) sans que le processus ne redémarre, une fiche déjà expirée n'est
+jamais servie (chaque chemin de lecture filtre indépendamment), mais elle
+reste physiquement en base au-delà des 30 jours jusqu'au prochain démarrage
+ou au prochain passage réussi du cron — un problème d'hygiène de stockage/
+posture de conformité, pas de fuite de donnée. La métrique
+`gbp_location_max_age_hours` n'étant émise que par ce même cron, une panne
+du scheduler la fait taire aussi : la surveillance doit donc alerter sur
+l'**absence** de cette métrique dans la fenêtre attendue, pas seulement sur
+sa valeur.
+
 ## Hors périmètre explicite
 
 - création ou modification d'une fiche Google ;
