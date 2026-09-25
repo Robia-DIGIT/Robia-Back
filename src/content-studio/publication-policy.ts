@@ -55,7 +55,7 @@ function validBinding(binding: PublicationBinding): boolean {
 /** Must hash the complete, canonical adapter payload (including media/CTA).
  * JSON array avoids separator collisions in user-provided identifiers.
  */
-function operationKey(binding: PublicationBinding): string {
+export function publicationOperationKey(binding: PublicationBinding): string {
   const digest = createHash('sha256')
     .update(
       JSON.stringify([
@@ -98,7 +98,7 @@ export function evaluatePublication(input: {
   }
   if (
     !validBinding(approval) ||
-    operationKey(current) !== operationKey(approval)
+    publicationOperationKey(current) !== publicationOperationKey(approval)
   ) {
     return { allowed: false, reason: 'approval_stale' };
   }
@@ -108,5 +108,5 @@ export function evaluatePublication(input: {
   if (input.previousAttempt !== null) {
     return { allowed: false, reason: 'reconciliation_required' };
   }
-  return { allowed: true, operationKey: operationKey(current) };
+  return { allowed: true, operationKey: publicationOperationKey(current) };
 }

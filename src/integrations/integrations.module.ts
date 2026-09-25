@@ -6,6 +6,9 @@ import { MetaController } from './meta.controller';
 import { MetaService } from './meta.service';
 import { GoogleBusinessProfileController } from './google-business-profile.controller';
 import { GoogleBusinessProfileService } from './google-business-profile.service';
+import { WordPressController } from './wordpress.controller';
+import { WordPressSafeHttpService } from './wordpress-safe-http.service';
+import { WordPressService } from './wordpress.service';
 
 @Global()
 @Module({
@@ -13,18 +16,22 @@ import { GoogleBusinessProfileService } from './google-business-profile.service'
     GoogleSearchConsoleController,
     GoogleBusinessProfileController,
     MetaController,
+    WordPressController,
   ],
   providers: [
     N8nWebhookService,
     GoogleSearchConsoleService,
     GoogleBusinessProfileService,
     MetaService,
+    WordPressSafeHttpService,
+    WordPressService,
   ],
   exports: [
     N8nWebhookService,
     GoogleSearchConsoleService,
     GoogleBusinessProfileService,
     MetaService,
+    WordPressService,
   ],
 })
 export class IntegrationsModule {}

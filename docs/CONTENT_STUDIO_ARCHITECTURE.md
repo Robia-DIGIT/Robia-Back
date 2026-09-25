@@ -1,7 +1,7 @@
 # ROBIA Content Studio — contrat de conception v0.1
 
 Date : 22 septembre 2026. Base backend inspectée : `2773c19`.
-Statut : lot 1 backend ajouté à la PR draft ; aucune publication externe.
+Statut : lot 1 livré ; RC42 ajoute la création de brouillons WordPress uniquement.
 
 ## Objectif produit
 
@@ -41,15 +41,15 @@ Ne promettre ni classement Google garanti ni causalité entre publication et gai
 0. Fondation : politique pure de publication + tests + ce contrat (présente PR).
 1. Studio : génération libre tenant/site-scopée, brief réel, révision optimiste,
    bibliothèque par site et liaison optionnelle à une Action (présente PR).
-2. WordPress : connexion sécurisée, import de contenus borné, création d'un
-   brouillon WordPress et preuve distante ; publication avec validation explicite.
+2. WordPress : RC42 livre la connexion sécurisée et la création d'un brouillon
+   avec preuve distante. Import et publication restent hors périmètre.
 3. GBP : post standard approuvé, publication puis vérification du statut Google.
    Description de fiche = autre type d'action, diff et consentement distincts.
 4. Planification : publication d'une révision approuvée à une date/fuseau précis,
    notifications, annulation, reprise contrôlée, rapport opérationnel.
 5. Mesure : GSC, performance GBP et découverte de mots-clés autorisée.
 
-## Modèle cible (migration additive à concevoir, pas encore implémentée)
+## Modèle cible et première implémentation RC42
 
 Étendre `Document` au lieu de créer un second stockage de contenus :
 
@@ -171,7 +171,8 @@ redirections et hôtes ; épingler la destination validée au transport, jamais
 transmettre Authorization vers une autre origine. Limites timeout/taille/pages.
 Ne jamais interpoler l'URL utilisateur dans une commande shell.
 
-V1 écrit des articles en brouillon et publie après consentement distinct.
+RC42 écrit seulement des articles/pages en brouillon. Une future publication
+publique exigera un consentement distinct et n'est appelée par aucune route RC42.
 Pages existantes, Elementor/Divi et autres builders : export/guide manuel tant
 qu'un adaptateur compatible n'est pas testé. Pas d'écrasement de blocs builder.
 Les meta SEO ne sont pas universellement éditables via le REST core ; Yoast

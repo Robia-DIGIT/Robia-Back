@@ -42,6 +42,7 @@ model User {
   // ODC spec's own Prisma sketch.
   odcApplicationsDecided  OdcApplication[]
   odcOutreachesApproved   OdcOutreach[]
+  approvedWordPressDrafts WordPressDraftApproval[]
 
   @@map("users")
 }
@@ -91,6 +92,9 @@ model Organization {
   odcApplicants     OdcApplicant[]
   odcApplications   OdcApplication[]
   odcOutreaches     OdcOutreach[]
+  wordPressConnections WordPressConnection[]
+  wordPressDraftApprovals WordPressDraftApproval[]
+  wordPressDraftAttempts WordPressDraftAttempt[]
   createdAt DateTime @default(now()) @map("created_at")
 
   @@map("organizations")
@@ -314,6 +318,7 @@ model Website {
   pages WebPage[]
   competitors Competitor[]
   documents Document[]
+  wordPressConnection WordPressConnection?
 
   @@unique([organizationId, url])
   @@map("websites")
@@ -462,6 +467,8 @@ model Document {
 
   validationLogs ValidationLog[]
   actionItems    ActionItem[]
+  wordPressDraftApprovals WordPressDraftApproval[]
+  wordPressDraftAttempts WordPressDraftAttempt[]
 
   @@index([organizationId, websiteId, updatedAt])
   @@map("documents")
@@ -506,8 +513,104 @@ model ActionItem {
   createdAt           DateTime  @default(now()) @map("created_at")
   updatedAt           DateTime  @updatedAt @map("updated_at")
   executionEvents     ActionExecutionEvent[]
+  wordPressDraftApprovals WordPressDraftApproval[]
+  wordPressDraftAttempts WordPressDraftAttempt[]
 
   @@map("action_items")
+}
+
+// RC-42 — credentials for one WordPress installation attached to one ROBIA
+// website. The application password is write-only at the API boundary and is
+// encrypted with a dedicated key. Disconnect is local and keeps audit rows.
+model WordPressConnection {
+  id                           String   @id @default(cuid())
+  organizationId               String   @map("organization_id")
+  organization                 Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  websiteId                    String   @unique @map("website_id")
+  website                      Website  @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  siteUrl                      String   @map("site_url")
+  apiBaseUrl                   String   @map("api_base_url")
+  username                     String
+  encryptedApplicationPassword String?  @map("encrypted_application_password")
+  remoteUserId                 String?  @map("remote_user_id")
+  remoteUserName               String?  @map("remote_user_name")
+  canCreatePosts               Boolean  @default(false) @map("can_create_posts")
+  canCreatePages               Boolean  @default(false) @map("can_create_pages")
+  status                       String   @default("ready") // ready | failed | disconnected
+  connectionVersion            Int      @default(1) @map("connection_version")
+  lastVerifiedAt               DateTime? @map("last_verified_at")
+  disconnectedAt               DateTime? @map("disconnected_at")
+  createdAt                    DateTime @default(now()) @map("created_at")
+  updatedAt                    DateTime @updatedAt @map("updated_at")
+  approvals                    WordPressDraftApproval[]
+  attempts                     WordPressDraftAttempt[]
+
+  @@unique([organizationId, websiteId])
+  @@index([organizationId, status])
+  @@map("wordpress_connections")
+}
+
+// Approval binds the exact canonical WordPress draft payload. A later document
+// edit, target change or credential rotation invalidates it automatically.
+model WordPressDraftApproval {
+  id                String   @id @default(cuid())
+  organizationId    String   @map("organization_id")
+  organization      Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  connectionId      String   @map("connection_id")
+  connection        WordPressConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  documentId        String   @map("document_id")
+  document          Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  actionItemId      String   @map("action_item_id")
+  actionItem        ActionItem @relation(fields: [actionItemId], references: [id], onDelete: Cascade)
+  approvedById      String   @map("approved_by_id")
+  approvedBy        User     @relation(fields: [approvedById], references: [id])
+  documentRevision  Int      @map("document_revision")
+  contentDigest     String   @map("content_digest")
+  postType          String   @map("post_type") // post | page
+  targetId          String   @map("target_id")
+  connectionVersion Int      @map("connection_version")
+  operationKey      String   @unique @map("operation_key")
+  canonicalPayload  Json     @map("canonical_payload")
+  revokedAt         DateTime? @map("revoked_at")
+  createdAt         DateTime @default(now()) @map("created_at")
+  attempt           WordPressDraftAttempt?
+
+  @@index([organizationId, documentId, createdAt])
+  @@index([organizationId, actionItemId])
+  @@map("wordpress_draft_approvals")
+}
+
+// One durable attempt per approved binding. An ambiguous remote POST remains
+// unknown until reconciliation; it is never replayed by a generic retry loop.
+model WordPressDraftAttempt {
+  id               String   @id @default(cuid())
+  organizationId   String   @map("organization_id")
+  organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  connectionId     String   @map("connection_id")
+  connection       WordPressConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  approvalId       String   @unique @map("approval_id")
+  approval         WordPressDraftApproval @relation(fields: [approvalId], references: [id], onDelete: Cascade)
+  documentId       String   @map("document_id")
+  document         Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  actionItemId     String   @map("action_item_id")
+  actionItem       ActionItem @relation(fields: [actionItemId], references: [id], onDelete: Cascade)
+  idempotencyKey   String   @map("idempotency_key")
+  operationKey     String   @unique @map("operation_key")
+  status           String   @default("in_flight") // in_flight | unknown | confirmed | failed
+  claimToken       String?  @map("claim_token")
+  claimedAt        DateTime? @map("claimed_at")
+  remotePostId     String?  @map("remote_post_id")
+  remoteUrl        String?  @map("remote_url")
+  remoteEditorUrl  String?  @map("remote_editor_url")
+  errorCode        String?  @map("error_code")
+  errorMessage     String?  @map("error_message")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+  confirmedAt      DateTime? @map("confirmed_at")
+
+  @@unique([organizationId, idempotencyKey])
+  @@index([organizationId, status, updatedAt])
+  @@map("wordpress_draft_attempts")
 }
 
 model ActionExecutionEvent {
