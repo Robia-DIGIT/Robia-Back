@@ -51,6 +51,7 @@ export class FakeOdcPrisma {
   historyEvents = new Map<string, FakeRecord>();
   actionItems = new Map<string, FakeRecord>();
   outreaches = new Map<string, FakeRecord>();
+  applicantSessions = new Map<string, FakeRecord>();
   private seq = 0;
 
   private id(prefix: string): string {
@@ -186,6 +187,9 @@ export class FakeOdcPrisma {
       const { fields, criteria, docTypes, ...rest } = data;
       const record: FakeRecord = {
         id,
+        // RC-49 — mirrors the real schema's @default(cuid()): every program
+        // gets one whether the caller supplies it or not, exactly like `id`.
+        publicKey: this.id('publicKey'),
         status: 'draft',
         description: null,
         opensAt: null,
@@ -237,14 +241,15 @@ export class FakeOdcPrisma {
       where,
       include,
     }: {
-      where: { id?: string; organizationId?: string };
+      where: { id?: string; organizationId?: string; publicKey?: string };
       include?: { fields?: unknown; criteria?: unknown; docTypes?: unknown };
     }) => {
       const record = Array.from(this.programs.values()).find(
         (p) =>
           (where.id === undefined || p.id === where.id) &&
           (where.organizationId === undefined ||
-            p.organizationId === where.organizationId),
+            p.organizationId === where.organizationId) &&
+          (where.publicKey === undefined || p.publicKey === where.publicKey),
       );
       return record ? this.programWithRelations(record, include) : null;
     },
@@ -693,6 +698,63 @@ export class FakeOdcPrisma {
         updatedAt: new Date(),
       });
       return this.outreachWithRelations(record, include);
+    },
+  };
+
+  // RC-49 — magic-link sessions for the public portal.
+  odcApplicantSession = {
+    create: ({ data }: { data: FakeRecord }) => {
+      const id = this.id('session');
+      const record: FakeRecord = { id, createdAt: new Date(), ...data };
+      this.applicantSessions.set(id, record);
+      return record;
+    },
+    findFirst: ({
+      where,
+    }: {
+      where: {
+        tokenHash?: string;
+        applicationId?: string;
+        createdAt?: { gte?: Date };
+      };
+    }) => {
+      return (
+        Array.from(this.applicantSessions.values()).find((s) => {
+          if (where.tokenHash !== undefined && s.tokenHash !== where.tokenHash)
+            return false;
+          if (
+            where.applicationId !== undefined &&
+            s.applicationId !== where.applicationId
+          )
+            return false;
+          if (
+            where.createdAt?.gte !== undefined &&
+            (s.createdAt as Date).getTime() < where.createdAt.gte.getTime()
+          )
+            return false;
+          return true;
+        }) ?? null
+      );
+    },
+    deleteMany: ({
+      where,
+    }: {
+      where: { applicationId?: string; expiresAt?: { gt?: Date } };
+    }) => {
+      let count = 0;
+      for (const [id, session] of this.applicantSessions) {
+        const matchesApplication =
+          where.applicationId === undefined ||
+          session.applicationId === where.applicationId;
+        const matchesExpiry =
+          where.expiresAt?.gt === undefined ||
+          (session.expiresAt as Date).getTime() > where.expiresAt.gt.getTime();
+        if (matchesApplication && matchesExpiry) {
+          this.applicantSessions.delete(id);
+          count += 1;
+        }
+      }
+      return { count };
     },
   };
 

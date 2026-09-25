@@ -453,9 +453,13 @@ export class OdcApplicationsService {
   // Submission & deterministic screening
   // ---------------------------------------------------------------------
 
+  // RC-49 — `userId` is nullable so the public portal (no RobIA account) can
+  // call the exact same submit() a staff caller does, rather than forking
+  // the state machine. A real id always means a staff actor; null always
+  // means the applicant themself — see resolveActor().
   async submit(
     organizationId: string,
-    userId: string,
+    userId: string | null,
     id: string,
   ): Promise<OdcApplicationWithRelations> {
     const application = await this.getApplication(organizationId, id);
@@ -465,13 +469,15 @@ export class OdcApplicationsService {
       );
     }
 
+    const actor = resolveActor(userId);
     const now = new Date();
     await this.prisma.odcApplication.update({
       where: { id },
       data: { status: 'submitted', submittedAt: now },
     });
     await this.recordHistory(organizationId, id, {
-      actorUserId: userId,
+      actorUserId: actor.actorUserId,
+      actorType: actor.actorType,
       eventType: 'submitted',
       fromStatus: 'draft',
       toStatus: 'submitted',
@@ -488,6 +494,7 @@ export class OdcApplicationsService {
       data: { status: 'screening' },
     });
     await this.recordHistory(organizationId, id, {
+      actorType: 'system',
       eventType: 'screening_started',
       fromStatus: 'submitted',
       toStatus: 'screening',
@@ -522,6 +529,7 @@ export class OdcApplicationsService {
         data: { status: 'in_review', missing: Prisma.JsonNull },
       });
       await this.recordHistory(organizationId, id, {
+        actorType: 'system',
         eventType: 'screening_passed',
         fromStatus,
         toStatus: 'in_review',
@@ -540,6 +548,7 @@ export class OdcApplicationsService {
         },
       });
       await this.recordHistory(organizationId, id, {
+        actorType: 'system',
         eventType: 'screening_failed',
         fromStatus,
         toStatus: 'incomplete',
@@ -801,6 +810,7 @@ export class OdcApplicationsService {
     });
     await this.recordHistory(organizationId, id, {
       actorUserId: userId,
+      actorType: 'staff',
       eventType: 'decided',
       fromStatus,
       toStatus: dto.decision,
@@ -817,9 +827,13 @@ export class OdcApplicationsService {
     return this.getApplication(organizationId, id);
   }
 
+  // RC-49 — same nullable-actor treatment as submit() above: the public
+  // portal calls this exact method with userId=null so a candidate can
+  // withdraw their own dossier without a RobIA account, never a forked
+  // withdrawal path.
   async withdraw(
     organizationId: string,
-    userId: string,
+    userId: string | null,
     id: string,
     dto: WithdrawApplicationDto,
   ): Promise<OdcApplicationWithRelations> {
@@ -829,13 +843,15 @@ export class OdcApplicationsService {
         `An application already "${application.status}" cannot be withdrawn.`,
       );
     }
+    const actor = resolveActor(userId);
     const fromStatus = application.status;
     await this.prisma.odcApplication.update({
       where: { id },
       data: { status: 'withdrawn' },
     });
     await this.recordHistory(organizationId, id, {
-      actorUserId: userId,
+      actorUserId: actor.actorUserId,
+      actorType: actor.actorType,
       eventType: 'withdrawn',
       fromStatus,
       toStatus: 'withdrawn',
@@ -885,7 +901,8 @@ export class OdcApplicationsService {
     organizationId: string,
     applicationId: string,
     entry: {
-      actorUserId?: string;
+      actorUserId?: string | null;
+      actorType: OdcHistoryActorType;
       eventType: string;
       fromStatus: string | null;
       toStatus: string | null;
@@ -897,6 +914,7 @@ export class OdcApplicationsService {
         organizationId,
         applicationId,
         actorUserId: entry.actorUserId ?? null,
+        actorType: entry.actorType,
         eventType: entry.eventType,
         fromStatus: entry.fromStatus,
         toStatus: entry.toStatus,
@@ -904,6 +922,21 @@ export class OdcApplicationsService {
       },
     });
   }
+}
+
+type OdcHistoryActorType = 'staff' | 'system' | 'applicant';
+
+// A real id always means the staff-only, JWT-guarded controller called in —
+// null always means the public portal did (see OdcPublicService), which has
+// no RobIA account/userId to attribute the action to at all. There is no
+// third caller of submit()/withdraw(), so this mapping is exhaustive.
+function resolveActor(userId: string | null): {
+  actorUserId: string | null;
+  actorType: OdcHistoryActorType;
+} {
+  return userId
+    ? { actorUserId: userId, actorType: 'staff' }
+    : { actorUserId: null, actorType: 'applicant' };
 }
 
 function rankApplicationsByScore<

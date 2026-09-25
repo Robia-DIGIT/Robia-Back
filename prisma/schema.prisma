@@ -91,6 +91,7 @@ model Organization {
   odcApplicants     OdcApplicant[]
   odcApplications   OdcApplication[]
   odcOutreaches     OdcOutreach[]
+  odcApplicantSessions OdcApplicantSession[]
   createdAt DateTime @default(now()) @map("created_at")
 
   @@map("organizations")
@@ -850,6 +851,11 @@ model OdcProgram {
   organizationId   String   @map("organization_id")
   organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   slug             String
+  // RC-49 — the public portal's URL identifier (never the internal `slug`,
+  // which is staff-facing and never exposed on an unauthenticated route).
+  // Globally unique (not per-organization) so a bare publicKey alone is
+  // enough to resolve a program with no other context.
+  publicKey        String   @unique @default(cuid()) @map("public_key")
   name             String
   description      String?
   status           String   @default("draft") // draft | open | closed | archived
@@ -987,6 +993,7 @@ model OdcApplication {
   scoreLines OdcScoreLine[]
   events     OdcHistoryEvent[]
   outreaches OdcOutreach[]
+  applicantSessions OdcApplicantSession[]
 
   @@unique([programId, applicantId])
   @@index([organizationId, status])
@@ -1059,6 +1066,14 @@ model OdcHistoryEvent {
   applicationId  String @map("application_id")
   application    OdcApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
   actorUserId    String? @map("actor_user_id")
+  // RC-49 — who actually acted: 'staff' (a real authenticated User, via
+  // actorUserId), 'system' (a deterministic internal transition — screening,
+  // never a human), or 'applicant' (the public portal, no RobIA account, so
+  // actorUserId is always null for this one). Existing rows predate the
+  // public portal entirely, so every one of them is either 'staff' or
+  // 'system' — never 'applicant' — backfilled from the only signal
+  // available: whether actor_user_id was recorded at all.
+  actorType      String @default("staff") @map("actor_type")
   eventType      String @map("event_type")
   fromStatus     String? @map("from_status")
   toStatus       String? @map("to_status")
@@ -1067,6 +1082,27 @@ model OdcHistoryEvent {
 
   @@index([organizationId, applicationId, createdAt])
   @@map("odc_history_events")
+}
+
+// RC-49 — a public-portal magic-link session: the only way an applicant
+// without a RobIA account authenticates to read/edit *their own* dossier.
+// One row = one issued token, hashed the same way PasswordResetToken hashes
+// its own (sha256 hex, never the raw token at rest). start() invalidates
+// every non-expired session for the same applicationId before issuing a new
+// one, so at most one usable token exists per application at a time.
+model OdcApplicantSession {
+  id             String   @id @default(cuid())
+  organizationId String   @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  applicationId  String   @map("application_id")
+  application    OdcApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  tokenHash      String   @unique @map("token_hash")
+  expiresAt      DateTime @map("expires_at")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@index([expiresAt])
+  @@index([organizationId, applicationId])
+  @@map("odc_applicant_sessions")
 }
 
 // RC-31 — sequential, human-approved candidate emails. Recipient address
