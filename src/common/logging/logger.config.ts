@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { IncomingMessage } from 'node:http';
+import { IncomingMessage, ServerResponse } from 'node:http';
 import { REQUEST_ID_HEADER } from './request-id.interceptor';
 import { REDACTED, redactSensitive } from './redact';
 
@@ -31,8 +31,9 @@ interface RequestWithContext extends IncomingMessage {
  *   application-shaped objects and is the same redactor Sentry runs its
  *   events through (sentry.ts) - see redact.spec.ts for what it catches.
  *
- *   `req`/`res` are deliberately excluded from that walk (see below) and
- *   left for pino-http/pino to handle on their own:
+ *   A genuine Node `req`/`res` (an IncomingMessage/ServerResponse instance
+ *   - what pino-http itself always attaches) is deliberately excluded from
+ *   that walk, and left for pino-http/pino to handle on their own:
  *   - `req` never reaches formatters.log at all - pino-http attaches it
  *     once per request via `logger.child({ req })`, and child bindings are
  *     stringified through pino's own req serializer at that point, a path
@@ -52,6 +53,17 @@ interface RequestWithContext extends IncomingMessage {
  *   on the fully serialized object at the final JSON-stringify stage -
  *   after both the req/res serializers and formatters.log have run - which
  *   is the only place these headers can be caught.
+ *
+ *   This exclusion is gated on `instanceof IncomingMessage`/`ServerResponse`,
+ *   never on the key name alone: an ORDINARY application object that
+ *   happens to be logged under a `req`/`res` key (e.g.
+ *   `logger.info({ req: someUpstreamPayload })`) is not a real HTTP
+ *   object, carries none of the serializer's prototype dependencies, and
+ *   must still go through redactSensitive() like any other application
+ *   value - otherwise a `req.body.password` or `res.body.accessToken` in
+ *   such a payload would be reinjected verbatim, unprotected by either
+ *   redactSensitive() (skipped) or `redact` (whose paths are scoped to the
+ *   real HTTP header shape, not arbitrary application payloads).
  */
 export function buildPinoHttpOptions() {
   return {
@@ -72,11 +84,19 @@ export function buildPinoHttpOptions() {
     },
     formatters: {
       log(object: Record<string, unknown>) {
-        // req/res are excluded on purpose - see doc comment above.
+        // Only a genuine Node HTTP req/res is excluded here - see doc
+        // comment above. An application object merely named req/res still
+        // goes through redactSensitive() like everything else.
         const { req, res, ...rest } = object;
         const redactedRest = redactSensitive(rest) as Record<string, unknown>;
-        if (req !== undefined) redactedRest.req = req;
-        if (res !== undefined) redactedRest.res = res;
+        if (req !== undefined) {
+          redactedRest.req =
+            req instanceof IncomingMessage ? req : redactSensitive(req);
+        }
+        if (res !== undefined) {
+          redactedRest.res =
+            res instanceof ServerResponse ? res : redactSensitive(res);
+        }
         return redactedRest;
       },
     },

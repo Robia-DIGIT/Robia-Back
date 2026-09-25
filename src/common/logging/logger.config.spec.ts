@@ -2,8 +2,21 @@ import { createServer } from 'node:http';
 import { request as httpRequest } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { Writable } from 'node:stream';
+import pino from 'pino';
 import pinoHttp from 'pino-http';
 import { buildPinoHttpOptions } from './logger.config';
+
+function createCapturingLogger() {
+  const chunks: string[] = [];
+  const sink = new Writable({
+    write(chunk: Buffer, _enc, callback) {
+      chunks.push(chunk.toString('utf8'));
+      callback();
+    },
+  });
+  const logger = pino(buildPinoHttpOptions(), sink);
+  return { logger, getSerialized: () => chunks.join('') };
+}
 
 /**
  * This exercises the real pipeline - a real pino-http instance wrapping a
@@ -108,5 +121,66 @@ describe('buildPinoHttpOptions - real pino-http serialized log line', () => {
     expect(res.headers?.['set-cookie']).toBe('[REDACTED]');
     // requestId must survive on the log line itself, not just in raw text.
     expect(req.headers?.['x-request-id']).toBe(FAKE_REQUEST_ID);
+  });
+});
+
+/**
+ * The req/res bypass in formatters.log exists only so a genuine Node
+ * IncomingMessage/ServerResponse reaches pino-http's own serializer intact
+ * (see logger.config.ts's doc comment). It must not become a blanket
+ * "anything named req or res skips redaction" rule: application code can
+ * perfectly well log an arbitrary payload under a `req`/`res` key that has
+ * nothing to do with pino-http (e.g. forwarding an upstream webhook body).
+ * Such a plain object carries none of the real HTTP object's prototype, so
+ * it must still go through redactSensitive() like any other application
+ * value.
+ */
+describe('buildPinoHttpOptions - application logs using req/res as ordinary object keys', () => {
+  it('redacts req.body.password and req.headers["x-auth-token"] when req is a plain application object, not a real HTTP request', () => {
+    const FAKE_PASSWORD = 'app-level-fake-password-abc123';
+    const FAKE_AUTH_TOKEN = 'app-level-fake-x-auth-token-xyz789';
+    const { logger, getSerialized } = createCapturingLogger();
+
+    logger.info(
+      {
+        req: {
+          body: { password: FAKE_PASSWORD },
+          headers: { 'x-auth-token': FAKE_AUTH_TOKEN },
+        },
+      },
+      'application log carrying a plain req-named object',
+    );
+
+    const serialized = getSerialized();
+    expect(serialized).not.toContain(FAKE_PASSWORD);
+    expect(serialized).not.toContain(FAKE_AUTH_TOKEN);
+
+    const parsed = JSON.parse(serialized.trim()) as {
+      req: { body: { password: string }; headers: { 'x-auth-token': string } };
+    };
+    expect(parsed.req.body.password).toBe('[REDACTED]');
+    expect(parsed.req.headers['x-auth-token']).toBe('[REDACTED]');
+  });
+
+  it('redacts res.body.accessToken when res is a plain application object, not a real HTTP response', () => {
+    const FAKE_ACCESS_TOKEN = 'app-level-fake-access-token-def456';
+    const { logger, getSerialized } = createCapturingLogger();
+
+    logger.info(
+      {
+        res: {
+          body: { accessToken: FAKE_ACCESS_TOKEN },
+        },
+      },
+      'application log carrying a plain res-named object',
+    );
+
+    const serialized = getSerialized();
+    expect(serialized).not.toContain(FAKE_ACCESS_TOKEN);
+
+    const parsed = JSON.parse(serialized.trim()) as {
+      res: { body: { accessToken: string } };
+    };
+    expect(parsed.res.body.accessToken).toBe('[REDACTED]');
   });
 });
