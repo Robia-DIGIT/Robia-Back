@@ -25,7 +25,7 @@
 const SENSITIVE_KEY_PATTERN =
   /(password|passwd|secret|token|api[-_]?key|authorization|cookie|email)/i;
 
-const REDACTED = '[REDACTED]';
+export const REDACTED = '[REDACTED]';
 
 // Fake-looking on purpose everywhere they appear in this file's comments
 // and in redact.spec.ts / sentry.spec.ts — never a real credential.
