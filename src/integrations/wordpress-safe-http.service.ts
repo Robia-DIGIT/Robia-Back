@@ -6,6 +6,7 @@ import {
 import { lookup } from 'node:dns/promises';
 import { request as httpsRequest } from 'node:https';
 import { isIP } from 'node:net';
+import type { LookupFunction } from 'node:net';
 
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const MAX_REQUEST_BYTES = 1024 * 1024;
@@ -83,6 +84,33 @@ function isPrivateIpv6(address: string) {
   );
 }
 
+/**
+ * Node's http/https client always invokes a custom `options.lookup` with
+ * (hostname, options, callback) - but `options.all` decides which of two
+ * incompatible callback shapes it expects: an array of {address, family}
+ * when `all` is true, or the legacy positional (address, family) form
+ * otherwise. Since Node 20/22 enable Happy Eyeballs (autoSelectFamily) by
+ * default, `all: true` is in practice the shape used on every request -
+ * calling back with the positional form in that case makes Node try to
+ * read an address off a string as if it were an array, surfacing as
+ * "Invalid IP address: undefined" deep inside net.js, unrelated to the
+ * actual (valid, pinned) address. Only ever return the already-resolved,
+ * already-validated `selected` address - never perform a fresh lookup here,
+ * which is what pins the connection against DNS rebinding/SSRF.
+ */
+export function createPinnedLookup(selected: {
+  address: string;
+  family: number;
+}): LookupFunction {
+  return (_hostname, options, callback) => {
+    if (typeof options === 'object' && options !== null && options.all) {
+      callback(null, [{ address: selected.address, family: selected.family }]);
+    } else {
+      callback(null, selected.address, selected.family);
+    }
+  };
+}
+
 export function isPublicWordPressAddress(address: string) {
   const family = isIP(address);
   if (family === 4) return !isPrivateIpv4(address);
@@ -144,9 +172,7 @@ export class WordPressSafeHttpService {
                 }
               : {}),
           },
-          lookup: (_hostname, _options, callback) => {
-            callback(null, selected.address, selected.family);
-          },
+          lookup: createPinnedLookup(selected),
           timeout: REQUEST_TIMEOUT_MS,
         },
         (response) => {
