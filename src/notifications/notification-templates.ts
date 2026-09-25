@@ -12,7 +12,8 @@ export type NotificationTemplateKey =
   | 'audit_completed'
   | 'automation_failed'
   | 'weekly_opportunities_summary'
-  | 'odc_candidate_invite';
+  | 'odc_candidate_invite'
+  | 'odc_applicant_magic_link';
 
 export class UnknownNotificationTemplateError extends Error {
   constructor(templateKey: string) {
@@ -98,6 +99,24 @@ const NOTIFICATION_TEMPLATES: Record<
         '',
         `Votre dossier pour « ${data.programName} » a été présélectionné.`,
         'Nous vous recontactons pour la suite du processus.',
+        '',
+        '— Orange Digital Center',
+      ].join('\n'),
+  },
+  // RC-49 — the public portal's magic-link email. `magicLinkUrl` is always
+  // built server-side (OdcPublicService.start(), from a config'd base URL +
+  // the freshly generated token) — never anything a client supplies.
+  odc_applicant_magic_link: {
+    variables: ['applicantName', 'programName', 'magicLinkUrl'],
+    subject: (data) => `Votre candidature « ${data.programName} »`,
+    text: (data) =>
+      [
+        `Bonjour ${data.applicantName},`,
+        '',
+        `Accédez à votre dossier de candidature pour « ${data.programName} » :`,
+        data.magicLinkUrl,
+        '',
+        'Ce lien est personnel et expire dans 14 jours.',
         '',
         '— Orange Digital Center',
       ].join('\n'),
